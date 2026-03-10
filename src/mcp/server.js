@@ -244,8 +244,9 @@ Examples:
     },
   },
   async ({ task_id, worktree, files, agent, force }) => {
+    let db;
     try {
-      const { db } = getContext();
+      ({ db } = getContext());
 
       // Check for conflicts first
       const conflicts = checkFileConflicts(db, files, worktree);
@@ -269,7 +270,6 @@ Examples:
       }
 
       claimFiles(db, task_id, worktree, files, agent ?? null);
-      db.close();
 
       const result = {
         claimed: files,
@@ -286,6 +286,8 @@ Examples:
       );
     } catch (err) {
       return toolError(err.message);
+    } finally {
+      db?.close();
     }
   },
 );

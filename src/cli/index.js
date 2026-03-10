@@ -412,23 +412,27 @@ program
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
 
-    // Check for existing claims
-    const conflicts = checkFileConflicts(db, files, worktree);
+    try {
+      const conflicts = checkFileConflicts(db, files, worktree);
 
-    if (conflicts.length > 0 && !opts.force) {
-      console.log(chalk.red(`\n⚠ Claim conflicts detected:`));
-      for (const c of conflicts) {
-        console.log(`  ${chalk.yellow(c.file)} → already claimed by worktree ${chalk.cyan(c.claimedBy.worktree)} (task: ${c.claimedBy.task_title})`);
+      if (conflicts.length > 0 && !opts.force) {
+        console.log(chalk.red(`\n⚠ Claim conflicts detected:`));
+        for (const c of conflicts) {
+          console.log(`  ${chalk.yellow(c.file)} → already claimed by worktree ${chalk.cyan(c.claimedBy.worktree)} (task: ${c.claimedBy.task_title})`);
+        }
+        console.log(chalk.dim('\nUse --force to claim anyway, or resolve conflicts first.'));
+        return;
       }
-      console.log(chalk.dim('\nUse --force to claim anyway, or resolve conflicts first.'));
-      db.close();
-      return;
-    }
 
-    claimFiles(db, taskId, worktree, files, opts.agent);
-    db.close();
-    console.log(`${chalk.green('✓')} Claimed ${files.length} file(s) for task ${chalk.cyan(taskId)}`);
-    files.forEach(f => console.log(`  ${chalk.dim(f)}`));
+      claimFiles(db, taskId, worktree, files, opts.agent);
+      console.log(`${chalk.green('✓')} Claimed ${files.length} file(s) for task ${chalk.cyan(taskId)}`);
+      files.forEach(f => console.log(`  ${chalk.dim(f)}`));
+    } catch (err) {
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    } finally {
+      db.close();
+    }
   });
 
 program

@@ -114,9 +114,16 @@ export function getWorktreeChangedFiles(worktreePath, repoRoot) {
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
 
+    const untracked = execSync('git ls-files --others --exclude-standard', {
+      cwd: worktreePath,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+
     const allFiles = [
       ...staged.split('\n'),
       ...unstaged.split('\n'),
+      ...untracked.split('\n'),
     ].filter(Boolean);
 
     return [...new Set(allFiles)];
