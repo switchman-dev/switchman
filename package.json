@@ -1,6 +1,6 @@
 {
   "name": "switchman-dev",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Route your AI agents so they don't collide",
   "type": "module",
   "main": "src/index.js",
