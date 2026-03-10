@@ -7,6 +7,7 @@ import { execSync } from 'child_process';
 import { mkdirSync, rmSync, existsSync, realpathSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { DatabaseSync } from 'node:sqlite';
 
 import { findRepoRoot } from '../src/core/git.js';
 import { getWorktreeChangedFiles } from '../src/core/git.js';
@@ -16,11 +17,20 @@ const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 // Import modules
 import {
   initDb,
+  openDb,
   createTask,
   assignTask,
+  startTaskLease,
   completeTask,
   listTasks,
+  getTask,
   getNextPendingTask,
+  listLeases,
+  getLease,
+  getActiveLeaseForTask,
+  heartbeatLease,
+  getStaleLeases,
+  reapStaleLeases,
   registerWorktree,
   listWorktrees,
   claimFiles,
@@ -86,8 +96,9 @@ test('Task assignment and status flow', () => {
   const next = getNextPendingTask(db);
   assert(next.title === 'Fix authentication bug', 'Next task is highest priority');
 
-  const ok = assignTask(db, next.id, 'worktree-feature-auth', 'claude-code');
-  assert(ok, 'Task assigned successfully');
+  const lease = startTaskLease(db, next.id, 'worktree-feature-auth', 'claude-code');
+  assert(Boolean(lease), 'Lease acquired successfully');
+  assert(lease.worktree === 'worktree-feature-auth', 'Lease stores the assigned worktree');
 
   const tasks = listTasks(db, 'in_progress');
   assert(tasks.length === 1, 'One task in progress');
@@ -97,9 +108,14 @@ test('Task assignment and status flow', () => {
   const fail = assignTask(db, next.id, 'worktree-other');
   assert(!fail, 'Cannot re-assign in-progress task');
 
+  const activeLease = getActiveLeaseForTask(db, next.id);
+  assert(activeLease?.id === lease.id, 'Task exposes its active lease');
+
   completeTask(db, next.id);
   const doneTasks = listTasks(db, 'done');
   assert(doneTasks.length === 1, 'Task marked as done');
+  const completedLease = getLease(db, lease.id);
+  assert(completedLease?.status === 'completed', 'Completing a task closes its active lease');
 });
 
 test('Worktree registration', () => {
@@ -121,7 +137,7 @@ test('File claims - happy path', () => {
   const taskId = createTask(db, { title: 'Refactor auth module' });
   assignTask(db, taskId, 'feature-auth');
 
-  claimFiles(db, taskId, 'feature-auth', [
+  const lease = claimFiles(db, taskId, 'feature-auth', [
     'src/auth/login.js',
     'src/auth/token.js',
     'tests/auth.test.js',
@@ -130,6 +146,7 @@ test('File claims - happy path', () => {
   const claims = getActiveFileClaims(db);
   assert(claims.length === 3, 'Three files claimed');
   assert(claims[0].worktree === 'feature-auth', 'Claims associated with correct worktree');
+  assert(claims.every((claim) => claim.lease_id === lease.id), 'Claims are attached to the active lease');
 });
 
 test('File claims - conflict detection', () => {
@@ -251,6 +268,114 @@ test('Fix 3c: claiming a nonexistent task is rejected', () => {
   }
   assert(threw, 'Nonexistent task cannot claim files');
   guardDb.close();
+});
+
+test('Lease heartbeat refreshes the active session timestamp', () => {
+  const leaseDb = initDb(join(tmpdir(), `sw-lease-hb-${Date.now()}`));
+  const taskId = createTask(leaseDb, { title: 'heartbeat task' });
+  const lease = startTaskLease(leaseDb, taskId, 'lease-hb-worktree', 'codex');
+
+  leaseDb.prepare(`
+    UPDATE leases
+    SET heartbeat_at=datetime('now', '-45 minutes')
+    WHERE id=?
+  `).run(lease.id);
+
+  const staleBefore = getStaleLeases(leaseDb, 15);
+  assert(staleBefore.some((staleLease) => staleLease.id === lease.id), 'Lease is stale before heartbeat refresh');
+
+  const refreshed = heartbeatLease(leaseDb, lease.id, 'codex');
+  const staleAfter = getStaleLeases(leaseDb, 15);
+  assert(refreshed?.id === lease.id, 'Heartbeat refresh returns the active lease');
+  assert(!staleAfter.some((staleLease) => staleLease.id === lease.id), 'Heartbeat refresh removes the lease from the stale set');
+  leaseDb.close();
+});
+
+test('Stale lease reaping releases claims and re-queues the task', () => {
+  const reapDb = initDb(join(tmpdir(), `sw-lease-reap-${Date.now()}`));
+  const taskId = createTask(reapDb, { title: 'reap task' });
+  const lease = startTaskLease(reapDb, taskId, 'lease-reap-worktree', 'codex');
+  claimFiles(reapDb, taskId, 'lease-reap-worktree', ['src/reap.js']);
+
+  reapDb.prepare(`
+    UPDATE leases
+    SET heartbeat_at=datetime('now', '-30 minutes')
+    WHERE id=?
+  `).run(lease.id);
+
+  const expired = reapStaleLeases(reapDb, 15);
+  const task = getTask(reapDb, taskId);
+  const activeClaims = getActiveFileClaims(reapDb);
+  const leaseAfter = getLease(reapDb, lease.id);
+
+  assert(expired.length === 1, 'One stale lease was reaped');
+  assert(task.status === 'pending', 'Stale lease returns the task to pending');
+  assert(task.worktree === null, 'Re-queued task clears its assigned worktree');
+  assert(activeClaims.length === 0, 'Reaping a stale lease releases active claims');
+  assert(leaseAfter.status === 'expired', 'Stale lease is marked expired');
+  reapDb.close();
+});
+
+test('openDb migrates legacy in-progress tasks into leases and backfills claims', () => {
+  const legacyRepo = join(tmpdir(), `sw-legacy-${Date.now()}`);
+  mkdirSync(join(legacyRepo, '.switchman'), { recursive: true });
+
+  const legacyDb = new DatabaseSync(join(legacyRepo, '.switchman', 'switchman.db'));
+  legacyDb.exec(`
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE tasks (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      worktree TEXT,
+      agent TEXT,
+      priority INTEGER DEFAULT 5,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT
+    );
+    CREATE TABLE file_claims (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      worktree TEXT NOT NULL,
+      agent TEXT,
+      claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      released_at TEXT
+    );
+    CREATE TABLE worktrees (
+      name TEXT PRIMARY KEY,
+      path TEXT NOT NULL,
+      branch TEXT NOT NULL,
+      agent TEXT,
+      status TEXT NOT NULL DEFAULT 'idle',
+      registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE conflict_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+      worktree_a TEXT NOT NULL,
+      worktree_b TEXT NOT NULL,
+      conflicting_files TEXT NOT NULL,
+      resolved INTEGER DEFAULT 0
+    );
+    INSERT INTO tasks (id, title, status, worktree, agent)
+    VALUES ('legacy-task', 'Legacy task', 'in_progress', 'legacy-wt', 'legacy-agent');
+    INSERT INTO file_claims (task_id, file_path, worktree, agent)
+    VALUES ('legacy-task', 'src/legacy.js', 'legacy-wt', 'legacy-agent');
+  `);
+  legacyDb.close();
+
+  const migratedDb = openDb(legacyRepo);
+  const lease = getActiveLeaseForTask(migratedDb, 'legacy-task');
+  const claims = getActiveFileClaims(migratedDb);
+  migratedDb.close();
+
+  assert(Boolean(lease), 'Legacy in-progress task receives an active lease on openDb');
+  assert(claims[0].lease_id === lease.id, 'Legacy active claims are backfilled onto the migrated lease');
+  rmSync(legacyRepo, { recursive: true, force: true });
 });
 
 test('Fix 4: findRepoRoot resolves main repo root from worktree dir', () => {

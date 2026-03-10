@@ -11,6 +11,7 @@
  *   switchman_task_claim   — claim files for a task (conflict-safe)
  *   switchman_task_done    — mark a task complete + release file claims
  *   switchman_task_fail    — mark a task failed + release file claims
+ *   switchman_lease_heartbeat — refresh a lease heartbeat
  *   switchman_scan         — scan all worktrees for conflicts right now
  *   switchman_status       — full system overview (tasks, claims, worktrees)
  */
@@ -23,12 +24,15 @@ import { findRepoRoot } from '../core/git.js';
 import {
   openDb,
   createTask,
-  assignTask,
+  startTaskLease,
   completeTask,
   failTask,
   listTasks,
-  getTask,
   getNextPendingTask,
+  listLeases,
+  getActiveLeaseForTask,
+  heartbeatLease,
+  getStaleLeases,
   claimFiles,
   releaseFileClaims,
   getActiveFileClaims,
@@ -95,7 +99,10 @@ Returns JSON:
       "description": string | null,
       "priority": number,    // 1-10, higher = more urgent
       "worktree": string,
-      "status": "in_progress"
+      "status": "in_progress",
+      "lease_id": string,    // Active lease/session ID for the task
+      "lease_status": "active",
+      "heartbeat_at": string
     } | null                 // null when queue is empty
   }
 
@@ -124,17 +131,27 @@ Examples:
         return toolOk(JSON.stringify({ task: null }), { task: null });
       }
 
-      const assigned = assignTask(db, task.id, worktree, agent ?? null);
-      db.close();
+      const lease = startTaskLease(db, task.id, worktree, agent ?? null);
 
-      if (!assigned) {
+      if (!lease) {
+        db.close();
         // Race condition: another agent grabbed it first — try again
         return toolOk(
           JSON.stringify({ task: null, message: 'Task was claimed by another agent. Call switchman_task_next again.' }),
         );
       }
 
-      const result = { task: { ...task, worktree, status: 'in_progress' } };
+      db.close();
+      const result = {
+        task: {
+          ...task,
+          worktree,
+          status: 'in_progress',
+          lease_id: lease.id,
+          lease_status: lease.status,
+          heartbeat_at: lease.heartbeat_at,
+        },
+      };
       return toolOk(JSON.stringify(result, null, 2), result);
     } catch (err) {
       return toolError(`${err.message}. Make sure switchman is initialised in this repo (run 'switchman init').`);
@@ -210,16 +227,20 @@ Args:
   - worktree (string): Your git worktree name
   - files (array of strings): File paths you plan to edit, relative to repo root (e.g. ["src/auth/login.js", "tests/auth.test.js"])
   - agent (string, optional): Agent identifier for logging
+  - lease_id (string, optional): Active lease ID returned by switchman_task_next
   - force (boolean, optional): If true, claim even if conflicts exist (default: false)
 
 Returns JSON:
   {
+    "lease_id": string,
     "claimed": string[],     // Files successfully claimed
     "conflicts": [           // Files already claimed by other worktrees
       {
         "file": string,
+        "claimed_by_task_id": string,
         "claimed_by_worktree": string,
-        "claimed_by_task": string
+        "claimed_by_task": string,
+        "claimed_by_lease_id": string | null
       }
     ],
     "safe_to_proceed": boolean   // true if no conflicts (or force=true)
@@ -234,6 +255,7 @@ Examples:
       worktree: z.string().min(1).describe('Your git worktree name'),
       files: z.array(z.string().min(1)).min(1).max(500).describe('File paths to claim, relative to repo root'),
       agent: z.string().optional().describe('Agent identifier for logging'),
+      lease_id: z.string().optional().describe('Optional lease ID returned by switchman_task_next'),
       force: z.boolean().default(false).describe('Claim even if conflicts exist (use with caution)'),
     }),
     annotations: {
@@ -243,7 +265,7 @@ Examples:
       openWorldHint: false,
     },
   },
-  async ({ task_id, worktree, files, agent, force }) => {
+  async ({ task_id, worktree, files, agent, lease_id, force }) => {
     let db;
     try {
       ({ db } = getContext());
@@ -257,8 +279,10 @@ Examples:
           claimed: [],
           conflicts: conflicts.map((c) => ({
             file: c.file,
+            claimed_by_task_id: c.claimedBy.task_id,
             claimed_by_worktree: c.claimedBy.worktree,
             claimed_by_task: c.claimedBy.task_title,
+            claimed_by_lease_id: c.claimedBy.lease_id ?? null,
           })),
           safe_to_proceed: false,
         };
@@ -269,14 +293,20 @@ Examples:
         );
       }
 
-      claimFiles(db, task_id, worktree, files, agent ?? null);
+      const lease = claimFiles(db, task_id, worktree, files, agent ?? null);
+      if (lease_id && lease.id !== lease_id) {
+        return toolError(`Task ${task_id} is active under lease ${lease.id}, not ${lease_id}.`);
+      }
 
       const result = {
+        lease_id: lease.id,
         claimed: files,
         conflicts: conflicts.map((c) => ({
           file: c.file,
+          claimed_by_task_id: c.claimedBy.task_id,
           claimed_by_worktree: c.claimedBy.worktree,
           claimed_by_task: c.claimedBy.task_title,
+          claimed_by_lease_id: c.claimedBy.lease_id ?? null,
         })),
         safe_to_proceed: true,
       };
@@ -304,15 +334,18 @@ Call this when you have finished your implementation and committed your changes.
 
 Args:
   - task_id (string): The task ID to complete
+  - lease_id (string, optional): Active lease ID returned by switchman_task_next
 
 Returns JSON:
   {
     "task_id": string,
+    "lease_id": string | null,
     "status": "done",
     "files_released": true
   }`,
     inputSchema: z.object({
       task_id: z.string().min(1).describe('The task ID to mark complete'),
+      lease_id: z.string().optional().describe('Optional lease ID returned by switchman_task_next'),
     }),
     annotations: {
       readOnlyHint: false,
@@ -321,14 +354,19 @@ Returns JSON:
       openWorldHint: false,
     },
   },
-  async ({ task_id }) => {
+  async ({ task_id, lease_id }) => {
     try {
       const { db } = getContext();
+      const activeLease = getActiveLeaseForTask(db, task_id);
+      if (lease_id && activeLease && activeLease.id !== lease_id) {
+        db.close();
+        return toolError(`Task ${task_id} is active under lease ${activeLease.id}, not ${lease_id}.`);
+      }
       completeTask(db, task_id);
       releaseFileClaims(db, task_id);
       db.close();
 
-      const result = { task_id, status: 'done', files_released: true };
+      const result = { task_id, lease_id: activeLease?.id ?? lease_id ?? null, status: 'done', files_released: true };
       return toolOk(JSON.stringify(result, null, 2), result);
     } catch (err) {
       return toolError(err.message);
@@ -348,17 +386,20 @@ Call this if you cannot complete the task — the task will be visible in the qu
 
 Args:
   - task_id (string): The task ID to mark as failed
+  - lease_id (string, optional): Active lease ID returned by switchman_task_next
   - reason (string): Brief explanation of why the task failed
 
 Returns JSON:
   {
     "task_id": string,
+    "lease_id": string | null,
     "status": "failed",
     "reason": string,
     "files_released": true
   }`,
     inputSchema: z.object({
       task_id: z.string().min(1).describe('The task ID to mark as failed'),
+      lease_id: z.string().optional().describe('Optional lease ID returned by switchman_task_next'),
       reason: z.string().min(1).max(500).describe('Brief explanation of why the task failed'),
     }),
     annotations: {
@@ -368,14 +409,74 @@ Returns JSON:
       openWorldHint: false,
     },
   },
-  async ({ task_id, reason }) => {
+  async ({ task_id, lease_id, reason }) => {
     try {
       const { db } = getContext();
+      const activeLease = getActiveLeaseForTask(db, task_id);
+      if (lease_id && activeLease && activeLease.id !== lease_id) {
+        db.close();
+        return toolError(`Task ${task_id} is active under lease ${activeLease.id}, not ${lease_id}.`);
+      }
       failTask(db, task_id, reason);
       releaseFileClaims(db, task_id);
       db.close();
 
-      const result = { task_id, status: 'failed', reason, files_released: true };
+      const result = { task_id, lease_id: activeLease?.id ?? lease_id ?? null, status: 'failed', reason, files_released: true };
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(err.message);
+    }
+  },
+);
+
+// ── switchman_lease_heartbeat ─────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_lease_heartbeat',
+  {
+    title: 'Refresh Lease Heartbeat',
+    description: `Refreshes the heartbeat timestamp for an active lease.
+
+Call this periodically while an agent is still working on a task so stale-session reaping does not recycle the task prematurely.
+
+Args:
+  - lease_id (string): Active lease ID returned by switchman_task_next
+  - agent (string, optional): Agent identifier to attach to the refreshed lease
+
+Returns JSON:
+  {
+    "lease_id": string,
+    "task_id": string,
+    "worktree": string,
+    "heartbeat_at": string
+  }`,
+    inputSchema: z.object({
+      lease_id: z.string().min(1).describe('Active lease ID returned by switchman_task_next'),
+      agent: z.string().optional().describe('Agent identifier for logging'),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ lease_id, agent }) => {
+    try {
+      const { db } = getContext();
+      const lease = heartbeatLease(db, lease_id, agent ?? null);
+      db.close();
+
+      if (!lease) {
+        return toolError(`Lease ${lease_id} was not found or is no longer active.`);
+      }
+
+      const result = {
+        lease_id: lease.id,
+        task_id: lease.task_id,
+        worktree: lease.worktree,
+        heartbeat_at: lease.heartbeat_at,
+      };
       return toolOk(JSON.stringify(result, null, 2), result);
     } catch (err) {
       return toolError(err.message);
@@ -481,13 +582,17 @@ Returns JSON:
       "in_progress": number,
       "done": number,
       "failed": number,
-      "active": [{ "id": string, "title": string, "worktree": string, "priority": number }]
+      "active": [{ "id": string, "title": string, "worktree": string, "priority": number, "lease_id": string | null }]
     },
     "file_claims": {
       "total_active": number,
-      "by_worktree": { [worktree: string]: string[] }   // worktree -> files
+      "by_worktree": { [worktree: string]: { "file_path": string, "task_id": string, "lease_id": string | null }[] }
     },
-    "worktrees": [{ "name": string, "branch": string, "agent": string | null, "status": string }],
+    "leases": {
+      "active": [{ "id": string, "task_id": string, "worktree": string, "agent": string | null, "heartbeat_at": string }],
+      "stale": [{ "id": string, "task_id": string, "worktree": string, "heartbeat_at": string }]
+    },
+    "worktrees": [{ "name": string, "branch": string, "agent": string | null, "status": string, "active_lease_id": string | null }],
     "repo_root": string
   }`,
     inputSchema: z.object({}),
@@ -505,13 +610,26 @@ Returns JSON:
       const tasks = listTasks(db);
       const claims = getActiveFileClaims(db);
       const worktrees = listWorktrees(db);
+      const leases = listLeases(db);
+      const staleLeases = getStaleLeases(db);
       db.close();
 
       const byWorktree = {};
       for (const c of claims) {
         if (!byWorktree[c.worktree]) byWorktree[c.worktree] = [];
-        byWorktree[c.worktree].push(c.file_path);
+        byWorktree[c.worktree].push({
+          file_path: c.file_path,
+          task_id: c.task_id,
+          lease_id: c.lease_id ?? null,
+        });
       }
+
+      const activeLeaseByTask = new Map(
+        leases.filter((lease) => lease.status === 'active').map((lease) => [lease.task_id, lease]),
+      );
+      const activeLeaseByWorktree = new Map(
+        leases.filter((lease) => lease.status === 'active').map((lease) => [lease.worktree, lease]),
+      );
 
       const result = {
         tasks: {
@@ -521,17 +639,45 @@ Returns JSON:
           failed: tasks.filter((t) => t.status === 'failed').length,
           active: tasks
             .filter((t) => t.status === 'in_progress')
-            .map((t) => ({ id: t.id, title: t.title, worktree: t.worktree, priority: t.priority })),
+            .map((t) => ({
+              id: t.id,
+              title: t.title,
+              worktree: t.worktree,
+              priority: t.priority,
+              lease_id: activeLeaseByTask.get(t.id)?.id ?? null,
+            })),
         },
         file_claims: {
           total_active: claims.length,
           by_worktree: byWorktree,
+          claims: claims.map((claim) => ({
+            file_path: claim.file_path,
+            worktree: claim.worktree,
+            task_id: claim.task_id,
+            lease_id: claim.lease_id ?? null,
+          })),
+        },
+        leases: {
+          active: leases.filter((lease) => lease.status === 'active').map((lease) => ({
+            id: lease.id,
+            task_id: lease.task_id,
+            worktree: lease.worktree,
+            agent: lease.agent ?? null,
+            heartbeat_at: lease.heartbeat_at,
+          })),
+          stale: staleLeases.map((lease) => ({
+            id: lease.id,
+            task_id: lease.task_id,
+            worktree: lease.worktree,
+            heartbeat_at: lease.heartbeat_at,
+          })),
         },
         worktrees: worktrees.map((wt) => ({
           name: wt.name,
           branch: wt.branch,
           agent: wt.agent ?? null,
           status: wt.status,
+          active_lease_id: activeLeaseByWorktree.get(wt.name)?.id ?? null,
         })),
         repo_root: repoRoot,
       };
