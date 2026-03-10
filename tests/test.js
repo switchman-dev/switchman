@@ -9,6 +9,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 import { findRepoRoot } from '../src/core/git.js';
+import { getWorktreeChangedFiles } from '../src/core/git.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 
@@ -216,6 +217,42 @@ test('Fix 3: claimFiles transaction is atomic (partial failure rolls back)', () 
   txDb.close();
 });
 
+test('Fix 3b: active file claims are unique across tasks', () => {
+  const uniqueDb = initDb(join(tmpdir(), `sw-unique-${Date.now()}`));
+  const taskA = createTask(uniqueDb, { title: 'task A' });
+  const taskB = createTask(uniqueDb, { title: 'task B' });
+  assignTask(uniqueDb, taskA, 'agent-a');
+  assignTask(uniqueDb, taskB, 'agent-b');
+
+  claimFiles(uniqueDb, taskA, 'agent-a', ['src/shared.js']);
+
+  let threw = false;
+  try {
+    claimFiles(uniqueDb, taskB, 'agent-b', ['src/shared.js']);
+  } catch {
+    threw = true;
+  }
+
+  assert(threw, 'Second active claim for the same file throws');
+  const claims = uniqueDb.prepare(
+    `SELECT * FROM file_claims WHERE file_path=? AND released_at IS NULL`,
+  ).all('src/shared.js');
+  assert(claims.length === 1, 'Only one active claim exists for the file');
+  uniqueDb.close();
+});
+
+test('Fix 3c: claiming a nonexistent task is rejected', () => {
+  const guardDb = initDb(join(tmpdir(), `sw-guard-${Date.now()}`));
+  let threw = false;
+  try {
+    claimFiles(guardDb, 'missing-task', 'agent-a', ['src/missing.js']);
+  } catch {
+    threw = true;
+  }
+  assert(threw, 'Nonexistent task cannot claim files');
+  guardDb.close();
+});
+
 test('Fix 4: findRepoRoot resolves main repo root from worktree dir', () => {
   // Set up a mini repo with a linked worktree, then verify findRepoRoot()
   // returns the main repo root from inside the linked worktree path.
@@ -241,6 +278,21 @@ test('Fix 4: findRepoRoot resolves main repo root from worktree dir', () => {
   // Cleanup
   execSync(`git worktree remove "${wtPath}" --force`, { cwd: mainRepo });
   rmSync(mainRepo, { recursive: true, force: true });
+});
+
+test('Fix 5: getWorktreeChangedFiles includes untracked files', () => {
+  const repoDir = join(tmpdir(), `sw-untracked-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  execSync('mkdir -p src && printf "hello\\n" > src/new-file.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const changed = getWorktreeChangedFiles(repoDir, repoDir);
+  assert(changed.includes('src/new-file.js'), 'Untracked file appears in changed-files scan');
+
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 // ─── Cleanup & Results ────────────────────────────────────────────────────────

@@ -4,8 +4,8 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
 
 const SWITCHMAN_DIR = '.switchman';
 const DB_FILE = 'switchman.db';
@@ -13,6 +13,17 @@ const DB_FILE = 'switchman.db';
 // How long (ms) a writer will wait for a lock before giving up.
 // 5 seconds is generous for a CLI tool with 3-10 concurrent agents.
 const BUSY_TIMEOUT_MS = 5000;
+const CLAIM_RETRY_DELAY_MS = 100;
+const CLAIM_RETRY_ATTEMPTS = 5;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function isBusyError(err) {
+  const message = String(err?.message || '').toLowerCase();
+  return message.includes('database is locked') || message.includes('sqlite_busy');
+}
 
 export function getSwitchmanDir(repoRoot) {
   return join(repoRoot, SWITCHMAN_DIR);
@@ -29,6 +40,7 @@ export function initDb(repoRoot) {
   const db = new DatabaseSync(getDbPath(repoRoot));
 
   db.exec(`
+    PRAGMA foreign_keys=ON;
     PRAGMA journal_mode=WAL;
     PRAGMA synchronous=NORMAL;
     PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};
@@ -79,6 +91,9 @@ export function initDb(repoRoot) {
     CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_file_claims_path ON file_claims(file_path);
     CREATE INDEX IF NOT EXISTS idx_file_claims_active ON file_claims(released_at) WHERE released_at IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_file_claims_unique_active
+      ON file_claims(file_path)
+      WHERE released_at IS NULL;
   `);
 
   return db;
@@ -90,7 +105,12 @@ export function openDb(repoRoot) {
     throw new Error(`No switchman database found. Run 'switchman init' first.`);
   }
   const db = new DatabaseSync(dbPath);
-  db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
+  db.exec(`
+    PRAGMA foreign_keys=ON;
+    PRAGMA journal_mode=WAL;
+    PRAGMA synchronous=NORMAL;
+    PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};
+  `);
   return db;
 }
 
@@ -151,23 +171,49 @@ export function getNextPendingTask(db) {
 // ─── File Claims ──────────────────────────────────────────────────────────────
 
 export function claimFiles(db, taskId, worktree, filePaths, agent) {
+  const task = getTask(db, taskId);
+  if (!task) {
+    throw new Error(`Task ${taskId} does not exist.`);
+  }
+  if (task.status !== 'in_progress') {
+    throw new Error(`Task ${taskId} is not in progress.`);
+  }
+  if (task.worktree && task.worktree !== worktree) {
+    throw new Error(`Task ${taskId} is assigned to worktree ${task.worktree}, not ${worktree}.`);
+  }
+
   const insert = db.prepare(`
     INSERT INTO file_claims (task_id, file_path, worktree, agent)
     VALUES (?, ?, ?, ?)
   `);
-  // node:sqlite's DatabaseSync doesn't have .transaction() like better-sqlite3.
-  // We use explicit BEGIN/COMMIT/ROLLBACK. The key correctness fix vs. the old
-  // code: we only ROLLBACK if we're actually inside a transaction (i.e. after
-  // BEGIN succeeded), and we re-throw so callers can handle failures.
-  db.exec('BEGIN');
-  try {
-    for (const fp of filePaths) {
-      insert.run(taskId, fp, worktree, agent || null);
+  for (let attempt = 1; attempt <= CLAIM_RETRY_ATTEMPTS; attempt++) {
+    let beganTransaction = false;
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      beganTransaction = true;
+
+      for (const fp of filePaths) {
+        insert.run(taskId, fp, worktree, agent || null);
+      }
+
+      db.exec('COMMIT');
+      return;
+    } catch (err) {
+      if (beganTransaction) {
+        try { db.exec('ROLLBACK'); } catch { /* no-op */ }
+      }
+
+      if (isBusyError(err) && attempt < CLAIM_RETRY_ATTEMPTS) {
+        sleepSync(CLAIM_RETRY_DELAY_MS * attempt);
+        continue;
+      }
+
+      if (String(err?.message || '').toLowerCase().includes('unique')) {
+        throw new Error('One or more files are already actively claimed by another task.');
+      }
+
+      throw err;
     }
-    db.exec('COMMIT');
-  } catch (err) {
-    try { db.exec('ROLLBACK'); } catch { /* already rolled back */ }
-    throw err;
   }
 }
 
