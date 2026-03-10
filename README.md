@@ -107,10 +107,11 @@ Paste this into your agent at the start of each session:
 
 ```
 Before starting any work:
-1. Run `switchman task next --json` to get your assigned task
+1. Run `switchman lease next --json` to get your assigned task and lease
 2. Run `switchman claim <taskId> <worktreeName> <files...>` to lock the files you'll edit
    - If a file is already claimed, pick a different approach or different files
-3. When finished, run `switchman task done <taskId>`
+3. If the task runs for a while, refresh the lease with `switchman lease heartbeat <leaseId>`
+4. When finished, run `switchman task done <taskId>`
 
 Never edit a file you haven't claimed. If a claim fails, do not use --force.
 ```
@@ -129,16 +130,16 @@ Here's what a normal session looks like with Switchman running:
 
 ```
 # Agent 1 picks up a task
-switchman task next
-✓  Assigned: "Add rate limiting to all routes"  [task-abc-123]
+switchman lease next
+✓  Lease acquired: "Add rate limiting to all routes"  [task-abc-123 / lease-xyz-123]
 
 # Agent 1 locks its files
 switchman claim task-abc-123 agent1 src/middleware/auth.js src/server.js
 ✓  2 files locked — no conflicts
 
 # Agent 2 picks up a different task
-switchman task next
-✓  Assigned: "Add validation to POST /tasks"  [task-def-456]
+switchman lease next
+✓  Lease acquired: "Add validation to POST /tasks"  [task-def-456 / lease-xyz-456]
 
 # Agent 2 tries to claim a file already locked by Agent 1
 switchman claim task-def-456 agent2 src/middleware/auth.js
@@ -175,9 +176,24 @@ Add a task to the queue.
 List all tasks. Filter with `--status pending|in_progress|done|failed`.
 
 ### `switchman task next`
-Get and assign the next pending task. Use `--json` for agent automation.
+Get and assign the next pending task. This is a compatibility shim over the lease workflow. Use `--json` for agent automation.
 - `--worktree <name>` — worktree to assign to (defaults to current folder name)
 - `--agent <name>` — agent identifier for logging
+
+### `switchman lease next`
+Acquire the next pending task as a first-class lease. Use `--json` for agent automation.
+- `--worktree <name>` — worktree to assign to (defaults to current folder name)
+- `--agent <name>` — agent identifier for logging
+
+### `switchman lease list`
+List active and historical leases. Filter with `--status active|completed|failed|expired`.
+
+### `switchman lease heartbeat <leaseId>`
+Refresh the heartbeat timestamp for a long-running lease so it does not get treated as stale.
+
+### `switchman lease reap`
+Expire stale leases, release their claims, and return their tasks to `pending`.
+- `--stale-after-minutes <n>` — staleness threshold (default: 15)
 
 ### `switchman task done <taskId>`
 Mark a task complete and release all file claims.
@@ -195,7 +211,7 @@ Release all file claims for a task.
 Check all worktrees for conflicts — both uncommitted file overlaps and branch-level merge conflicts. Run this before merging.
 
 ### `switchman status`
-Full overview: task counts, active tasks, locked files, and a quick conflict scan.
+Full overview: task counts, active leases, stale leases, locked files, and a quick conflict scan.
 
 ### `switchman worktree list`
 List all git worktrees with their registered agents and status.
@@ -214,6 +230,7 @@ Re-sync git worktrees into the Switchman database (useful if you add worktrees a
 | `switchman_task_claim` | Claim files before editing (conflict check) |
 | `switchman_task_done` | Mark task complete, release file claims |
 | `switchman_task_fail` | Mark task failed, release file claims |
+| `switchman_lease_heartbeat` | Refresh a long-running lease heartbeat |
 | `switchman_scan` | Scan all worktrees for conflicts |
 | `switchman_status` | Full system overview |
 
@@ -222,7 +239,7 @@ Re-sync git worktrees into the Switchman database (useful if you add worktrees a
 ## Roadmap
 
 - [ ] Merge queue — serialize worktree→main merges with auto-retry
-- [ ] Agent health monitoring — reclaim tasks from dead/stalled agents
+- [ ] Automatic stale-lease policies — configurable heartbeat/reap behaviour
 - [ ] Cursor and Windsurf native MCP integration
 - [ ] Web dashboard
 - [ ] `brew install switchman`

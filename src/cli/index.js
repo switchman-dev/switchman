@@ -27,10 +27,11 @@ import { execSync } from 'child_process';
 import { findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.js';
 import {
   initDb, openDb,
-  createTask, assignTask, completeTask, failTask, listTasks, getTask, getNextPendingTask,
+  DEFAULT_STALE_LEASE_MINUTES,
+  createTask, startTaskLease, completeTask, failTask, listTasks, getTask, getNextPendingTask,
+  listLeases, heartbeatLease, getStaleLeases, reapStaleLeases,
   registerWorktree, listWorktrees,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts,
-  logConflict,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 
@@ -60,12 +61,32 @@ function statusBadge(status) {
   const colors = {
     pending: chalk.yellow,
     in_progress: chalk.blue,
+    active: chalk.blue,
+    completed: chalk.green,
     done: chalk.green,
     failed: chalk.red,
+    expired: chalk.red,
     idle: chalk.gray,
     busy: chalk.blue,
   };
   return (colors[status] || chalk.white)(status.toUpperCase().padEnd(11));
+}
+
+function getCurrentWorktreeName(explicitWorktree) {
+  return explicitWorktree || process.cwd().split('/').pop();
+}
+
+function taskJsonWithLease(task, worktree, lease) {
+  return {
+    task: {
+      ...task,
+      worktree,
+      status: 'in_progress',
+      lease_id: lease?.id ?? null,
+      lease_status: lease?.status ?? null,
+      heartbeat_at: lease?.heartbeat_at ?? null,
+    },
+  };
 }
 
 function printTable(rows, columns) {
@@ -263,15 +284,15 @@ taskCmd
 
 taskCmd
   .command('assign <taskId> <worktree>')
-  .description('Assign a task to a worktree')
+  .description('Assign a task to a worktree (compatibility shim for lease acquire)')
   .option('--agent <name>', 'Agent name (e.g. claude-code)')
   .action((taskId, worktree, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
-    const ok = assignTask(db, taskId, worktree, opts.agent);
+    const lease = startTaskLease(db, taskId, worktree, opts.agent);
     db.close();
-    if (ok) {
-      console.log(`${chalk.green('✓')} Assigned ${chalk.cyan(taskId)} → ${chalk.cyan(worktree)}`);
+    if (lease) {
+      console.log(`${chalk.green('✓')} Assigned ${chalk.cyan(taskId)} → ${chalk.cyan(worktree)} (${chalk.dim(lease.id)})`);
     } else {
       console.log(chalk.red(`Could not assign task. It may not exist or is not in 'pending' status.`));
     }
@@ -303,7 +324,7 @@ taskCmd
 
 taskCmd
   .command('next')
-  .description('Get and assign the next pending task (for agent automation)')
+  .description('Get and assign the next pending task (compatibility shim for lease next)')
   .option('--json', 'Output as JSON')
   .option('--worktree <name>', 'Worktree to assign the task to (defaults to current worktree name)')
   .option('--agent <name>', 'Agent identifier for logging (e.g. claude-code)')
@@ -320,11 +341,11 @@ taskCmd
     }
 
     // Determine worktree name: explicit flag, or derive from cwd
-    const worktreeName = opts.worktree || process.cwd().split('/').pop();
-    const assigned = assignTask(db, task.id, worktreeName, opts.agent || null);
+    const worktreeName = getCurrentWorktreeName(opts.worktree);
+    const lease = startTaskLease(db, task.id, worktreeName, opts.agent || null);
     db.close();
 
-    if (!assigned) {
+    if (!lease) {
       // Race condition: another agent grabbed it between get and assign
       if (opts.json) console.log(JSON.stringify({ task: null, message: 'Task claimed by another agent — try again' }));
       else console.log(chalk.yellow('Task was just claimed by another agent. Run again to get the next one.'));
@@ -332,10 +353,168 @@ taskCmd
     }
 
     if (opts.json) {
-      console.log(JSON.stringify({ task: { ...task, worktree: worktreeName, status: 'in_progress' } }, null, 2));
+      console.log(JSON.stringify(taskJsonWithLease(task, worktreeName, lease), null, 2));
     } else {
       console.log(`${chalk.green('✓')} Assigned: ${chalk.bold(task.title)}`);
-      console.log(`  ${chalk.dim('id:')} ${task.id}  ${chalk.dim('worktree:')} ${chalk.cyan(worktreeName)}  ${chalk.dim('priority:')} ${task.priority}`);
+      console.log(`  ${chalk.dim('id:')} ${task.id}  ${chalk.dim('worktree:')} ${chalk.cyan(worktreeName)}  ${chalk.dim('lease:')} ${chalk.dim(lease.id)}  ${chalk.dim('priority:')} ${task.priority}`);
+    }
+  });
+
+// ── lease ────────────────────────────────────────────────────────────────────
+
+const leaseCmd = program.command('lease').description('Manage active work leases');
+
+leaseCmd
+  .command('acquire <taskId> <worktree>')
+  .description('Acquire a lease for a pending task')
+  .option('--agent <name>', 'Agent identifier for logging')
+  .option('--json', 'Output as JSON')
+  .action((taskId, worktree, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const task = getTask(db, taskId);
+    const lease = startTaskLease(db, taskId, worktree, opts.agent || null);
+    db.close();
+
+    if (!lease || !task) {
+      if (opts.json) console.log(JSON.stringify({ lease: null, task: null }));
+      else console.log(chalk.red(`Could not acquire lease. The task may not exist or is not pending.`));
+      process.exitCode = 1;
+      return;
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        lease,
+        task: taskJsonWithLease(task, worktree, lease).task,
+      }, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Lease acquired ${chalk.dim(lease.id)}`);
+    console.log(`  ${chalk.dim('task:')} ${chalk.bold(task.title)}`);
+    console.log(`  ${chalk.dim('worktree:')} ${chalk.cyan(worktree)}`);
+  });
+
+leaseCmd
+  .command('next')
+  .description('Claim the next pending task and acquire its lease')
+  .option('--json', 'Output as JSON')
+  .option('--worktree <name>', 'Worktree to assign the task to (defaults to current worktree name)')
+  .option('--agent <name>', 'Agent identifier for logging')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const task = getNextPendingTask(db);
+
+    if (!task) {
+      db.close();
+      if (opts.json) console.log(JSON.stringify({ task: null, lease: null }));
+      else console.log(chalk.dim('No pending tasks.'));
+      return;
+    }
+
+    const worktreeName = getCurrentWorktreeName(opts.worktree);
+    const lease = startTaskLease(db, task.id, worktreeName, opts.agent || null);
+    db.close();
+
+    if (!lease) {
+      if (opts.json) console.log(JSON.stringify({ task: null, lease: null, message: 'Task claimed by another agent — try again' }));
+      else console.log(chalk.yellow('Task was just claimed by another agent. Run again to get the next one.'));
+      return;
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        lease,
+        ...taskJsonWithLease(task, worktreeName, lease),
+      }, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Lease acquired: ${chalk.bold(task.title)}`);
+    console.log(`  ${chalk.dim('task:')} ${task.id}  ${chalk.dim('lease:')} ${lease.id}`);
+    console.log(`  ${chalk.dim('worktree:')} ${chalk.cyan(worktreeName)}  ${chalk.dim('priority:')} ${task.priority}`);
+  });
+
+leaseCmd
+  .command('list')
+  .description('List leases, newest first')
+  .option('-s, --status <status>', 'Filter by status (active|completed|failed|expired)')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const leases = listLeases(db, opts.status);
+    db.close();
+
+    if (!leases.length) {
+      console.log(chalk.dim('No leases found.'));
+      return;
+    }
+
+    console.log('');
+    for (const lease of leases) {
+      console.log(`${statusBadge(lease.status)} ${chalk.bold(lease.task_title)}`);
+      console.log(`  ${chalk.dim('lease:')} ${lease.id}  ${chalk.dim('task:')} ${lease.task_id}`);
+      console.log(`  ${chalk.dim('worktree:')} ${chalk.cyan(lease.worktree)}  ${chalk.dim('agent:')} ${lease.agent || 'unknown'}`);
+      console.log(`  ${chalk.dim('started:')} ${lease.started_at}  ${chalk.dim('heartbeat:')} ${lease.heartbeat_at}`);
+      if (lease.failure_reason) console.log(`  ${chalk.red(lease.failure_reason)}`);
+      console.log('');
+    }
+  });
+
+leaseCmd
+  .command('heartbeat <leaseId>')
+  .description('Refresh the heartbeat timestamp for an active lease')
+  .option('--agent <name>', 'Agent identifier for logging')
+  .option('--json', 'Output as JSON')
+  .action((leaseId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const lease = heartbeatLease(db, leaseId, opts.agent || null);
+    db.close();
+
+    if (!lease) {
+      if (opts.json) console.log(JSON.stringify({ lease: null }));
+      else console.log(chalk.red(`No active lease found for ${leaseId}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify({ lease }, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Heartbeat refreshed for ${chalk.dim(lease.id)}`);
+    console.log(`  ${chalk.dim('task:')} ${lease.task_title}  ${chalk.dim('worktree:')} ${chalk.cyan(lease.worktree)}`);
+  });
+
+leaseCmd
+  .command('reap')
+  .description('Expire stale leases, release their claims, and return their tasks to pending')
+  .option('--stale-after-minutes <minutes>', 'Age threshold for staleness', String(DEFAULT_STALE_LEASE_MINUTES))
+  .option('--json', 'Output as JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const staleAfterMinutes = Number.parseInt(opts.staleAfterMinutes, 10);
+    const expired = reapStaleLeases(db, staleAfterMinutes);
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify({ stale_after_minutes: staleAfterMinutes, expired }, null, 2));
+      return;
+    }
+
+    if (!expired.length) {
+      console.log(chalk.dim(`No stale leases older than ${staleAfterMinutes} minute(s).`));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Reaped ${expired.length} stale lease(s)`);
+    for (const lease of expired) {
+      console.log(`  ${chalk.dim(lease.id)}  ${chalk.cyan(lease.worktree)} → ${lease.task_title}`);
     }
   });
 
@@ -424,8 +603,8 @@ program
         return;
       }
 
-      claimFiles(db, taskId, worktree, files, opts.agent);
-      console.log(`${chalk.green('✓')} Claimed ${files.length} file(s) for task ${chalk.cyan(taskId)}`);
+      const lease = claimFiles(db, taskId, worktree, files, opts.agent);
+      console.log(`${chalk.green('✓')} Claimed ${files.length} file(s) for task ${chalk.cyan(taskId)} (${chalk.dim(lease.id)})`);
       files.forEach(f => console.log(`  ${chalk.dim(f)}`));
     } catch (err) {
       console.error(chalk.red(err.message));
@@ -540,6 +719,8 @@ program
     const inProgress = tasks.filter(t => t.status === 'in_progress');
     const done = tasks.filter(t => t.status === 'done');
     const failed = tasks.filter(t => t.status === 'failed');
+    const activeLeases = listLeases(db, 'active');
+    const staleLeases = getStaleLeases(db);
 
     console.log(chalk.bold('Tasks:'));
     console.log(`  ${chalk.yellow('Pending')}     ${pending.length}`);
@@ -547,11 +728,25 @@ program
     console.log(`  ${chalk.green('Done')}        ${done.length}`);
     console.log(`  ${chalk.red('Failed')}      ${failed.length}`);
 
-    if (inProgress.length > 0) {
+    if (activeLeases.length > 0) {
       console.log('');
-      console.log(chalk.bold('Active Tasks:'));
+      console.log(chalk.bold('Active Leases:'));
+      for (const lease of activeLeases) {
+        console.log(`  ${chalk.cyan(lease.worktree)} → ${lease.task_title} ${chalk.dim(lease.id)}`);
+      }
+    } else if (inProgress.length > 0) {
+      console.log('');
+      console.log(chalk.bold('In-Progress Tasks Without Lease:'));
       for (const t of inProgress) {
         console.log(`  ${chalk.cyan(t.worktree || 'unassigned')} → ${t.title}`);
+      }
+    }
+
+    if (staleLeases.length > 0) {
+      console.log('');
+      console.log(chalk.bold('Stale Leases:'));
+      for (const lease of staleLeases) {
+        console.log(`  ${chalk.red(lease.worktree)} → ${lease.task_title} ${chalk.dim(lease.id)} ${chalk.dim(lease.heartbeat_at)}`);
       }
     }
 
