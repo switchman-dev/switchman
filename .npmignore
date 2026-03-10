@@ -1,0 +1,8 @@
+examples/worktrees/
+examples/taskapi/package-lock.json
+tests/
+.switchman/
+landing/
+logo/
+*.md
+!README.md

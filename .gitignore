@@ -1,0 +1,4 @@
+node_modules/
+.switchman/switchman.db
+*.log
+.DS_Store
