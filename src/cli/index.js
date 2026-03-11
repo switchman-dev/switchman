@@ -37,6 +37,7 @@ import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemove
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
 import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
+import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus } from '../core/ci.js';
 
 function installMcpConfig(targetDirs) {
   return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
@@ -1366,6 +1367,9 @@ gateCmd
 gateCmd
   .command('ci')
   .description('Run a repo-level enforcement gate suitable for CI, merges, or PR validation')
+  .option('--github', 'Write GitHub Actions step summary/output when GITHUB_* env vars are present')
+  .option('--github-step-summary <path>', 'Path to write GitHub Actions step summary markdown')
+  .option('--github-output <path>', 'Path to write GitHub Actions outputs')
   .option('--json', 'Output raw JSON')
   .action(async (opts) => {
     const repoRoot = getRepo();
@@ -1389,6 +1393,15 @@ gateCmd
       file_conflicts: report.fileConflicts,
       branch_conflicts: report.conflicts,
     };
+
+    const githubTargets = resolveGitHubOutputTargets(opts);
+    if (githubTargets.stepSummaryPath || githubTargets.outputPath) {
+      writeGitHubCiStatus({
+        result,
+        stepSummaryPath: githubTargets.stepSummaryPath,
+        outputPath: githubTargets.outputPath,
+      });
+    }
 
     if (opts.json) {
       console.log(JSON.stringify(result, null, 2));
@@ -1417,6 +1430,16 @@ gateCmd
     }
 
     if (!ok) process.exitCode = 1;
+  });
+
+gateCmd
+  .command('install-ci')
+  .description('Install a GitHub Actions workflow that runs the Switchman CI gate on PRs and pushes')
+  .option('--workflow-name <name>', 'Workflow file name', 'switchman-gate.yml')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const workflowPath = installGitHubActionsWorkflow(repoRoot, opts.workflowName);
+    console.log(`${chalk.green('✓')} Installed GitHub Actions workflow at ${chalk.cyan(workflowPath)}`);
   });
 
 gateCmd

@@ -1014,6 +1014,60 @@ test('Fix 22: repo CI gate rejects unmanaged changes across worktrees', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 22b: gate ci writes GitHub Actions summary and outputs', () => {
+  const repoDir = join(tmpdir(), `sw-ci-github-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  initDb(repoDir).close();
+  const stepSummaryPath = join(repoDir, 'github-step-summary.md');
+  const outputPath = join(repoDir, 'github-output.txt');
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'gate',
+    'ci',
+    '--github-step-summary',
+    stepSummaryPath,
+    '--github-output',
+    outputPath,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const stepSummary = readFileSync(stepSummaryPath, 'utf8');
+  const output = readFileSync(outputPath, 'utf8');
+  assert(stepSummary.includes('# Switchman CI Gate'), 'gate ci writes a GitHub step summary markdown file');
+  assert(output.includes('switchman_ok=true'), 'gate ci writes GitHub Actions outputs');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 22c: gate install-ci writes a GitHub Actions workflow', () => {
+  const repoDir = join(tmpdir(), `sw-ci-install-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'gate',
+    'install-ci',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const workflowPath = join(repoDir, '.github', 'workflows', 'switchman-gate.yml');
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert(existsSync(workflowPath), 'gate install-ci writes the GitHub Actions workflow file');
+  assert(workflow.includes('switchman gate ci --github'), 'Installed workflow runs the Switchman CI gate in GitHub Actions');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 23: monitor state helpers persist and clear background monitor state', () => {
   const repoDir = join(tmpdir(), `sw-monitor-state-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
