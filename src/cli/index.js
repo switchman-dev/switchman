@@ -115,6 +115,30 @@ function printTable(rows, columns) {
   }
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireNextTaskLease(db, worktreeName, agent, attempts = 5) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const task = getNextPendingTask(db);
+    if (!task) {
+      return { task: null, lease: null, exhausted: true };
+    }
+
+    const lease = startTaskLease(db, task.id, worktreeName, agent || null);
+    if (lease) {
+      return { task, lease, exhausted: false };
+    }
+
+    if (attempt < attempts) {
+      sleepSync(25 * attempt);
+    }
+  }
+
+  return { task: null, lease: null, exhausted: false };
+}
+
 // ─── Program ──────────────────────────────────────────────────────────────────
 
 program
@@ -353,22 +377,18 @@ taskCmd
   .action((opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
-    const task = getNextPendingTask(db);
+    const worktreeName = getCurrentWorktreeName(opts.worktree);
+    const { task, lease, exhausted } = acquireNextTaskLease(db, worktreeName, opts.agent || null);
+    db.close();
 
     if (!task) {
-      db.close();
       if (opts.json) console.log(JSON.stringify({ task: null }));
-      else console.log(chalk.dim('No pending tasks.'));
+      else if (exhausted) console.log(chalk.dim('No pending tasks.'));
+      else console.log(chalk.yellow('Tasks were claimed by other agents during assignment. Run again to get the next one.'));
       return;
     }
 
-    // Determine worktree name: explicit flag, or derive from cwd
-    const worktreeName = getCurrentWorktreeName(opts.worktree);
-    const lease = startTaskLease(db, task.id, worktreeName, opts.agent || null);
-    db.close();
-
     if (!lease) {
-      // Race condition: another agent grabbed it between get and assign
       if (opts.json) console.log(JSON.stringify({ task: null, message: 'Task claimed by another agent — try again' }));
       else console.log(chalk.yellow('Task was just claimed by another agent. Run again to get the next one.'));
       return;
@@ -714,18 +734,16 @@ leaseCmd
   .action((opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
-    const task = getNextPendingTask(db);
+    const worktreeName = getCurrentWorktreeName(opts.worktree);
+    const { task, lease, exhausted } = acquireNextTaskLease(db, worktreeName, opts.agent || null);
+    db.close();
 
     if (!task) {
-      db.close();
       if (opts.json) console.log(JSON.stringify({ task: null, lease: null }));
-      else console.log(chalk.dim('No pending tasks.'));
+      else if (exhausted) console.log(chalk.dim('No pending tasks.'));
+      else console.log(chalk.yellow('Tasks were claimed by other agents during assignment. Run again to get the next one.'));
       return;
     }
-
-    const worktreeName = getCurrentWorktreeName(opts.worktree);
-    const lease = startTaskLease(db, task.id, worktreeName, opts.agent || null);
-    db.close();
 
     if (!lease) {
       if (opts.json) console.log(JSON.stringify({ task: null, lease: null, message: 'Task claimed by another agent — try again' }));

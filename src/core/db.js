@@ -26,17 +26,36 @@ function isBusyError(err) {
   return message.includes('database is locked') || message.includes('sqlite_busy');
 }
 
+function withBusyRetry(fn, { attempts = CLAIM_RETRY_ATTEMPTS, delayMs = CLAIM_RETRY_DELAY_MS } = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return fn();
+    } catch (err) {
+      if (isBusyError(err) && attempt < attempts) {
+        sleepSync(delayMs * attempt);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 function makeId(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function configureDb(db) {
+function configureDb(db, { initialize = false } = {}) {
   db.exec(`
     PRAGMA foreign_keys=ON;
-    PRAGMA journal_mode=WAL;
     PRAGMA synchronous=NORMAL;
     PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};
   `);
+
+  if (initialize) {
+    withBusyRetry(() => {
+      db.exec(`PRAGMA journal_mode=WAL;`);
+    });
+  }
 }
 
 function getTableColumns(db, tableName) {
@@ -378,8 +397,8 @@ export function initDb(repoRoot) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
   const db = new DatabaseSync(getDbPath(repoRoot));
-  configureDb(db);
-  ensureSchema(db);
+  configureDb(db, { initialize: true });
+  withBusyRetry(() => ensureSchema(db));
   return db;
 }
 
@@ -390,7 +409,7 @@ export function openDb(repoRoot) {
   }
   const db = new DatabaseSync(dbPath);
   configureDb(db);
-  ensureSchema(db);
+  withBusyRetry(() => ensureSchema(db));
   return db;
 }
 
@@ -734,6 +753,27 @@ export function getActiveFileClaims(db) {
   `).all();
 }
 
+export function getCompletedFileClaims(db, worktree = null) {
+  if (worktree) {
+    return db.prepare(`
+      SELECT fc.*, t.title as task_title, t.status as task_status, t.completed_at
+      FROM file_claims fc
+      JOIN tasks t ON fc.task_id = t.id
+      WHERE fc.worktree=?
+        AND t.status='done'
+      ORDER BY COALESCE(fc.released_at, t.completed_at) DESC, fc.file_path
+    `).all(worktree);
+  }
+
+  return db.prepare(`
+    SELECT fc.*, t.title as task_title, t.status as task_status, t.completed_at
+    FROM file_claims fc
+    JOIN tasks t ON fc.task_id = t.id
+    WHERE t.status='done'
+    ORDER BY COALESCE(fc.released_at, t.completed_at) DESC, fc.file_path
+  `).all();
+}
+
 export function checkFileConflicts(db, filePaths, excludeWorktree) {
   const conflicts = [];
   const stmt = db.prepare(`
@@ -756,13 +796,15 @@ export function checkFileConflicts(db, filePaths, excludeWorktree) {
 // ─── Worktrees ────────────────────────────────────────────────────────────────
 
 export function registerWorktree(db, { name, path, branch, agent }) {
+  const existingByPath = db.prepare(`SELECT name FROM worktrees WHERE path=?`).get(path);
+  const canonicalName = existingByPath?.name || name;
   db.prepare(`
     INSERT INTO worktrees (name, path, branch, agent)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       path=excluded.path, branch=excluded.branch,
       agent=excluded.agent, last_seen=datetime('now'), status='idle'
-  `).run(name, path, branch, agent || null);
+  `).run(canonicalName, path, branch, agent || null);
 }
 
 export function listWorktrees(db) {

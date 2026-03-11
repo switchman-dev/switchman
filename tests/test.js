@@ -17,6 +17,7 @@ import { evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, ga
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
+import { buildTaskSpec } from '../src/core/planner.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 
@@ -168,6 +169,17 @@ test('Worktree registration', () => {
   assert(wts2.length === 3, 'Still 3 worktrees after upsert');
 });
 
+test('Worktree registration deduplicates repeated paths under one canonical name', () => {
+  const pathDb = initDb(join(tmpdir(), `sw-worktree-path-${Date.now()}`));
+  registerWorktree(pathDb, { name: 'agent1', path: '/tmp/repo-agent1', branch: 'switchman/agent1' });
+  registerWorktree(pathDb, { name: 'repo-agent1', path: '/tmp/repo-agent1', branch: 'switchman/agent1' });
+
+  const worktrees = listWorktrees(pathDb);
+  assert(worktrees.length === 1, 'Registering the same worktree path twice does not create duplicate worktrees');
+  assert(worktrees[0].name === 'agent1', 'The first registered worktree name remains canonical for that path');
+  pathDb.close();
+});
+
 test('File claims - happy path', () => {
   const taskId = createTask(db, { title: 'Refactor auth module' });
   assignTask(db, taskId, 'feature-auth');
@@ -247,6 +259,42 @@ test('Fix 1: busy_timeout is set on new connections', () => {
   const timeout = Object.values(row)[0];
   assert(timeout >= 5000, `busy_timeout is set to ${timeout}ms (expected ≥ 5000)`);
   freshDb.close();
+});
+
+test('Fix 1b: parallel CLI task acquisition avoids transient database lock failures', () => {
+  const repoDir = join(tmpdir(), `sw-parallel-cli-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  execFileSync(process.execPath, [cliPath, 'setup', '--agents', '3'], { cwd: repoDir, encoding: 'utf8' });
+  execFileSync(process.execPath, [cliPath, 'task', 'add', 'Task one', '--priority', '9'], { cwd: repoDir, encoding: 'utf8' });
+  execFileSync(process.execPath, [cliPath, 'task', 'add', 'Task two', '--priority', '8'], { cwd: repoDir, encoding: 'utf8' });
+  execFileSync(process.execPath, [cliPath, 'task', 'add', 'Task three', '--priority', '7'], { cwd: repoDir, encoding: 'utf8' });
+
+  const outputDir = join(repoDir, 'parallel-next');
+  mkdirSync(outputDir, { recursive: true });
+  execSync(`
+    "${process.execPath}" "${cliPath}" task next --json --worktree agent1 --agent parallel-agent1 > "${join(outputDir, 'agent1.json')}" &
+    pid1=$!
+    "${process.execPath}" "${cliPath}" task next --json --worktree agent2 --agent parallel-agent2 > "${join(outputDir, 'agent2.json')}" &
+    pid2=$!
+    "${process.execPath}" "${cliPath}" task next --json --worktree agent3 --agent parallel-agent3 > "${join(outputDir, 'agent3.json')}" &
+    pid3=$!
+    wait "$pid1" "$pid2" "$pid3"
+  `, { cwd: repoDir, shell: '/bin/zsh' });
+
+  const payloads = ['agent1', 'agent2', 'agent3'].map((name) => JSON.parse(readFileSync(join(outputDir, `${name}.json`), 'utf8')));
+  const taskIds = payloads.map((payload) => payload.task?.id).filter(Boolean);
+
+  assert(taskIds.length === 3, 'All parallel agents acquire a task without database lock failure');
+  assert(new Set(taskIds).size === 3, 'Parallel task acquisition still assigns distinct tasks');
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Fix 2: SWITCHMAN_DIR constant (no stale AGENTQ_DIR)', () => {
@@ -470,6 +518,7 @@ test('Fix 5: getWorktreeChangedFiles includes untracked files', () => {
 test('Fix 6: default ignore list drops node_modules and build output noise', () => {
   const filtered = filterIgnoredPaths([
     'src/app.js',
+    '.mcp.json',
     'node_modules/pkg/index.js',
     'coverage/lcov.info',
     'dist/app.js',
@@ -479,6 +528,7 @@ test('Fix 6: default ignore list drops node_modules and build output noise', () 
   assert(filtered.length === 1, 'Ignored paths are removed from conflict scans');
   assert(filtered[0] === 'src/app.js', 'Non-generated source files are preserved');
   assert(isIgnoredPath('examples/taskapi/node_modules/pkg/index.js'), 'Nested node_modules paths are ignored');
+  assert(isIgnoredPath('.mcp.json'), 'Project MCP config is ignored by default scans');
 });
 
 test('Fix 7: setup MCP config can be written locally without clobbering other servers', () => {
@@ -522,6 +572,29 @@ test('Fix 8: worktree compliance marks unmanaged changes as non-compliant', () =
 
   assert(compliance.compliance_state === 'non_compliant', 'Unmanaged changed files mark the worktree non-compliant');
   assert(compliance.unclaimed_changed_files.includes('src/unclaimed.js'), 'Unclaimed changed file is reported');
+  enforceDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 8b: completed claimed work remains governed for compliance checks', () => {
+  const repoDir = join(tmpdir(), `sw-enforce-completed-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const enforceDb = initDb(repoDir);
+  registerWorktree(enforceDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(enforceDb, { title: 'Implement: governed change' });
+  assignTask(enforceDb, taskId, 'main');
+  claimFiles(enforceDb, taskId, 'main', ['src/governed.js']);
+  execSync('mkdir -p src && printf "ok\\n" > src/governed.js', { cwd: repoDir, shell: '/bin/zsh' });
+  completeTask(enforceDb, taskId);
+
+  const compliance = evaluateWorktreeCompliance(enforceDb, repoDir, { name: 'main', path: repoDir, branch: 'main' });
+  assert(compliance.compliance_state === 'observed', 'Completed governed changes remain observed instead of non-compliant');
+  assert(compliance.unclaimed_changed_files.length === 0, 'Completed governed changes are not reported as unclaimed');
   enforceDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -1286,12 +1359,15 @@ test('Fix 28b: planner emits subsystem-aware specs for high-risk work', () => {
   assert(implementationTask.task_spec.risk_level === 'high', 'Planner marks auth/API/migration work as high risk');
   assert(implementationTask.task_spec.subsystem_tags.includes('auth'), 'Planner tags auth-related implementation tasks with auth subsystem metadata');
   assert(implementationTask.task_spec.allowed_paths.some((path) => path.includes('auth')), 'Planner narrows implementation scope to auth-related paths');
-  assert(implementationTask.task_spec.required_deliverables.includes('tests'), 'Planner requires tests for high-risk implementation work');
-  assert(implementationTask.task_spec.required_deliverables.includes('docs'), 'Planner requires docs deliverables for API/schema-related implementation work');
+  assert(implementationTask.task_spec.required_deliverables.includes('source'), 'Planner keeps source as the required deliverable for implementation work');
+  assert(implementationTask.task_spec.followup_deliverables.includes('tests'), 'Planner records tests as a follow-up deliverable for high-risk implementation work');
+  assert(implementationTask.task_spec.followup_deliverables.includes('docs'), 'Planner records docs as a follow-up deliverable for API/schema-related implementation work');
   assert(implementationTask.task_spec.execution_policy.timeout_ms === 90000, 'Planner gives high-risk implementation tasks a stricter execution timeout');
   assert(implementationTask.task_spec.execution_policy.max_retries === 1, 'Planner keeps high-risk implementation retries constrained');
   assert(testsTask.dependencies.includes(implementationTask.id), 'Planner keeps generated test work dependent on implementation');
   assert(governanceTask.task_spec.allowed_paths.includes('.github/**'), 'Planner gives safety-review tasks governance-oriented allowed paths');
+  assert(governanceTask.task_spec.primary_output_path === `docs/reviews/pipe-planner-risk/${governanceTask.id}.md`, 'Planner gives governance tasks a unique review artifact path');
+  assert(governanceTask.task_spec.allowed_paths.includes(governanceTask.task_spec.primary_output_path), 'Planner allows governance tasks to write their unique review artifact');
   pipelineDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -1471,6 +1547,65 @@ printf 'https://github.com/example/repo/pull/123\n'
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28f: pipeline publish prefers the implementation worktree branch in multi-worktree pipelines', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-publish-multi-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'switchman/agent1' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'switchman/agent2' });
+  startPipeline(pipelineDb, {
+    title: 'Harden auth API permissions',
+    description: 'Update login permissions for the public API and add migration checks',
+    pipelineId: 'pipe-publish-multi',
+    priority: 9,
+  });
+
+  const ghCapturePath = join(repoDir, 'gh-invocation-multi.json');
+  const fakeGhPath = join(repoDir, 'fake-gh-multi');
+  writeFileSync(fakeGhPath, `#!/bin/sh
+printf '%s\n' "$@" > /dev/null
+printf '{"args":[' > ${JSON.stringify(ghCapturePath)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(ghCapturePath)}; fi
+  first=0
+  printf '%s' "$(printf '%s' "$arg" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/$/\"/; s/^/\"/')" >> ${JSON.stringify(ghCapturePath)}
+done
+printf ']}' >> ${JSON.stringify(ghCapturePath)}
+printf 'https://github.com/example/repo/pull/456\n'
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'publish',
+    'pipe-publish-multi',
+    '--base',
+    'main',
+    '--gh-command',
+    fakeGhPath,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const invocation = JSON.parse(readFileSync(ghCapturePath, 'utf8'));
+  assert(result.head_branch === 'switchman/agent1', 'Pipeline publish infers the implementation worktree branch when multiple worktree branches exist');
+  assert(invocation.args.includes('switchman/agent1'), 'Pipeline publish passes the inferred implementation branch to gh');
+  pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 29: pipeline run dispatches pending tasks onto available worktrees', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-run-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -1516,7 +1651,7 @@ test('Fix 30: pipeline run launches agent commands with Switchman env', () => {
     priority: 5,
   });
   const outputPath = join(agentPath, 'pipeline-env.json');
-  const script = `require('node:fs').writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({ pipeline: process.env.SWITCHMAN_PIPELINE_ID, task: process.env.SWITCHMAN_TASK_ID, lease: process.env.SWITCHMAN_LEASE_ID, worktree: process.env.SWITCHMAN_WORKTREE, taskType: process.env.SWITCHMAN_TASK_TYPE, taskSpec: process.env.SWITCHMAN_TASK_SPEC, timeoutMs: process.env.SWITCHMAN_TASK_TIMEOUT_MS, maxRetries: process.env.SWITCHMAN_TASK_MAX_RETRIES, retryBackoffMs: process.env.SWITCHMAN_TASK_RETRY_BACKOFF_MS }));`;
+  const script = `require('node:fs').writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({ pipeline: process.env.SWITCHMAN_PIPELINE_ID, task: process.env.SWITCHMAN_TASK_ID, lease: process.env.SWITCHMAN_LEASE_ID, worktree: process.env.SWITCHMAN_WORKTREE, taskType: process.env.SWITCHMAN_TASK_TYPE, taskSpec: process.env.SWITCHMAN_TASK_SPEC, outputPath: process.env.SWITCHMAN_TASK_OUTPUT_PATH, timeoutMs: process.env.SWITCHMAN_TASK_TIMEOUT_MS, maxRetries: process.env.SWITCHMAN_TASK_MAX_RETRIES, retryBackoffMs: process.env.SWITCHMAN_TASK_RETRY_BACKOFF_MS }));`;
 
   const result = runPipeline(pipelineDb, repoDir, {
     pipelineId: 'pipe-launch',
@@ -1533,6 +1668,7 @@ test('Fix 30: pipeline run launches agent commands with Switchman env', () => {
   assert(envPayload.worktree === 'agent1', 'Launched pipeline command receives SWITCHMAN_WORKTREE');
   assert(envPayload.taskType === 'docs', 'Launched pipeline command receives the structured task type');
   assert(JSON.parse(envPayload.taskSpec).expected_output_types.includes('docs'), 'Launched pipeline command receives the structured task spec payload');
+  assert(envPayload.outputPath === '', 'Tasks without a primary output path get an empty SWITCHMAN_TASK_OUTPUT_PATH');
   assert(envPayload.timeoutMs === '15000', 'Launched pipeline command receives the task-specific timeout policy');
   assert(envPayload.maxRetries === '0', 'Launched pipeline command receives the task-specific retry policy');
   pipelineDb.close();
@@ -1540,7 +1676,59 @@ test('Fix 30: pipeline run launches agent commands with Switchman env', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Fix 31: pipeline review creates follow-up tasks from AI merge risk', () => {
+test('Fix 30b: pipeline run exposes governance artifact output paths to launched agents', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-launch-governance-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+  const agentPath = join(tmpdir(), `sw-pipeline-launch-governance-agent-${Date.now()}`);
+  execSync(`git worktree add -b pipeline-launch-governance "${agentPath}"`, { cwd: repoDir });
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: agentPath, branch: 'pipeline-launch-governance' });
+  const taskId = 'pipe-governance-launch-01';
+  createTask(pipelineDb, {
+    id: taskId,
+    title: 'Review blocked AI merge findings',
+    description: '[Pipeline pipe-governance-launch]\nSuggested worktree: agent1\nAudit auth API migration safety and document governance findings',
+    priority: 9,
+  });
+  upsertTaskSpec(pipelineDb, taskId, buildTaskSpec({
+    pipelineId: 'pipe-governance-launch',
+    taskId,
+    title: 'Review blocked AI merge findings',
+    issueTitle: 'Review blocked AI merge findings',
+    issueDescription: 'Audit auth API migration safety and document governance findings',
+    suggestedWorktree: 'agent1',
+    repoContext: null,
+  }));
+  const outputPath = join(agentPath, 'pipeline-governance-env.json');
+  const script = `require('node:fs').writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({ task: process.env.SWITCHMAN_TASK_ID, taskType: process.env.SWITCHMAN_TASK_TYPE, outputPath: process.env.SWITCHMAN_TASK_OUTPUT_PATH, taskSpec: process.env.SWITCHMAN_TASK_SPEC }));`;
+
+  const result = runPipeline(pipelineDb, repoDir, {
+    pipelineId: 'pipe-governance-launch',
+    agentCommand: [process.execPath, '-e', script],
+  });
+  for (let i = 0; i < 20 && !existsSync(outputPath); i++) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+  const envPayload = JSON.parse(readFileSync(outputPath, 'utf8'));
+  const taskSpec = JSON.parse(envPayload.taskSpec);
+
+  assert(result.launched.length === 1, 'Pipeline run launches the ready governance task command');
+  assert(envPayload.taskType === 'governance', 'Launched governance task receives the governance task type');
+  assert(envPayload.outputPath === `docs/reviews/pipe-governance-launch/${envPayload.task}.md`, 'Launched governance task receives a unique review artifact output path');
+  assert(taskSpec.primary_output_path === envPayload.outputPath, 'Structured task spec and env agree on the governance review artifact path');
+  pipelineDb.close();
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 31: pipeline review avoids duplicate governance tasks when merge risk is already covered', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-review-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   execSync('git init', { cwd: repoDir });
@@ -1580,8 +1768,8 @@ test('Fix 31: pipeline review creates follow-up tasks from AI merge risk', () =>
     encoding: 'utf8',
   }));
 
-  assert(result.created_count > 0, 'Pipeline review creates follow-up tasks for merge-risk findings');
-  assert(result.created.some((task) => task.title.includes('Review integration risk')), 'Pipeline review creates an integration-risk follow-up task');
+  assert(result.ai_gate_status === 'blocked', 'Pipeline review still reports blocked AI merge risk');
+  assert(!result.created.some((task) => task.title.includes('Review integration risk')), 'Pipeline review avoids creating duplicate governance follow-ups when governance work already exists');
   execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
   execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
@@ -1759,10 +1947,9 @@ test('Fix 36: task outcome evaluator flags successful no-op executions', () => {
   mkdirSync(worktreePath, { recursive: true });
   const db = initDb(repoDir);
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
-  registerWorktree(db, { name: 'agent1', path: repoDir, branch: 'main' });
   const taskId = createTask(db, { title: 'Implement: no-op task' });
-  assignTask(db, taskId, 'agent1');
-  claimFiles(db, taskId, 'agent1', ['src/example.js']);
+  assignTask(db, taskId, 'main');
+  claimFiles(db, taskId, 'main', ['src/example.js']);
 
   const result = evaluateTaskOutcome(db, repoDir, { taskId });
   assert(result.status === 'needs_followup', 'Outcome evaluator flags no-op command results');
@@ -1824,7 +2011,7 @@ test('Fix 37b: task outcome evaluator enforces structured task scope', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Fix 37c: task outcome evaluator requires high-risk implementation deliverables', () => {
+test('Fix 37c: task outcome evaluator allows implementation work when follow-up deliverables are split into separate tasks', () => {
   const repoDir = join(tmpdir(), `sw-outcome-deliverables-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   execSync('git init', { cwd: repoDir });
@@ -1843,16 +2030,17 @@ test('Fix 37c: task outcome evaluator requires high-risk implementation delivera
     task_type: 'implementation',
     allowed_paths: ['src/auth/**'],
     expected_output_types: ['source'],
-    required_deliverables: ['source', 'tests', 'docs'],
+    required_deliverables: ['source'],
+    followup_deliverables: ['tests', 'docs'],
     objective_keywords: ['auth', 'api', 'permissions'],
     risk_level: 'high',
-    success_criteria: ['change auth source and supporting deliverables'],
+    success_criteria: ['change auth source while tests/docs are handled by follow-up tasks'],
   });
   execSync('mkdir -p src/auth && printf "ok\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/zsh' });
 
   const result = evaluateTaskOutcome(db, repoDir, { taskId });
-  assert(result.status === 'needs_followup', 'Outcome evaluator rejects high-risk implementation work missing required deliverables');
-  assert(result.reason_code === 'missing_expected_tests', 'Outcome evaluator fails fast on missing required tests for high-risk work');
+  assert(result.status === 'accepted', 'Outcome evaluator accepts implementation work when only source is required for the current task');
+  assert(result.reason_code === null, 'Outcome evaluator does not force tests/docs onto the implementation task when they are follow-up deliverables');
   db.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
