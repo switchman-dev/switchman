@@ -4,7 +4,7 @@
  */
 
 import { execFileSync, execSync } from 'child_process';
-import { mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync, statSync } from 'fs';
+import { mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync, statSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { DatabaseSync } from 'node:sqlite';
@@ -1318,6 +1318,67 @@ test('Fix 28d: pipeline bundle exports reviewer-ready files to disk', () => {
   assert(existsSync(result.files.summary_markdown), 'Pipeline bundle writes the markdown summary file');
   assert(existsSync(result.files.pr_body_markdown), 'Pipeline bundle writes the PR body markdown file');
   assert(readFileSync(result.files.pr_body_markdown, 'utf8').includes('## Reviewer Checklist'), 'Pipeline bundle writes reviewer checklist content into the PR body file');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28e: pipeline publish creates a hosted PR through gh with bundle content', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-publish-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git checkout -b feature/docs-refresh', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'feature/docs-refresh' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-publish',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-publish-01');
+  pipelineDb.close();
+
+  const ghCapturePath = join(repoDir, 'gh-invocation.json');
+  const fakeGhPath = join(repoDir, 'fake-gh');
+  writeFileSync(fakeGhPath, `#!/bin/sh
+printf '%s\n' "$@" > /dev/null
+printf '{"args":[' > ${JSON.stringify(ghCapturePath)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(ghCapturePath)}; fi
+  first=0
+  printf '%s' "$(printf '%s' "$arg" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/$/\"/; s/^/\"/')" >> ${JSON.stringify(ghCapturePath)}
+done
+printf ']}' >> ${JSON.stringify(ghCapturePath)}
+printf 'https://github.com/example/repo/pull/123\n'
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'publish',
+    'pipe-publish',
+    '--base',
+    'main',
+    '--gh-command',
+    fakeGhPath,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const invocation = JSON.parse(readFileSync(ghCapturePath, 'utf8'));
+  assert(result.head_branch === 'feature/docs-refresh', 'Pipeline publish infers the head branch from the pipeline worktree when possible');
+  assert(invocation.args.includes('pr') && invocation.args.includes('create'), 'Pipeline publish invokes gh pr create');
+  assert(invocation.args.includes('--body-file'), 'Pipeline publish passes the generated PR body file to gh');
+  assert(invocation.args.includes('--title') && invocation.args.includes('Refresh docs'), 'Pipeline publish passes the generated PR title to gh');
   rmSync(repoDir, { recursive: true, force: true });
 });
 

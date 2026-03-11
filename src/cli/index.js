@@ -36,7 +36,7 @@ import { upsertProjectMcpConfig } from '../core/mcp.js';
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
-import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, runPipeline, startPipeline } from '../core/pipeline.js';
+import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
 
 function installMcpConfig(targetDirs) {
   return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
@@ -496,6 +496,46 @@ pipelineCmd
       console.log(`  ${chalk.dim('json:')} ${result.files.summary_json}`);
       console.log(`  ${chalk.dim('summary:')} ${result.files.summary_markdown}`);
       console.log(`  ${chalk.dim('body:')} ${result.files.pr_body_markdown}`);
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('publish <pipelineId> [outputDir]')
+  .description('Create a hosted GitHub pull request for a pipeline using gh')
+  .option('--base <branch>', 'Base branch for the pull request', 'main')
+  .option('--head <branch>', 'Head branch for the pull request (defaults to inferred pipeline branch)')
+  .option('--draft', 'Create the pull request as a draft')
+  .option('--gh-command <command>', 'Executable to use for GitHub CLI', 'gh')
+  .option('--json', 'Output raw JSON')
+  .action(async (pipelineId, outputDir, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = await publishPipelinePr(db, repoRoot, pipelineId, {
+        baseBranch: opts.base,
+        headBranch: opts.head || null,
+        draft: Boolean(opts.draft),
+        ghCommand: opts.ghCommand,
+        outputDir: outputDir || null,
+      });
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Published PR for ${chalk.cyan(result.pipeline_id)}`);
+      console.log(`  ${chalk.dim('base:')} ${result.base_branch}`);
+      console.log(`  ${chalk.dim('head:')} ${result.head_branch}`);
+      if (result.output) {
+        console.log(`  ${chalk.dim(result.output)}`);
+      }
     } catch (err) {
       db.close();
       console.error(chalk.red(err.message));

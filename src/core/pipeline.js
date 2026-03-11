@@ -7,6 +7,7 @@ import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
 import { buildTaskSpec, planPipelineTasks } from './planner.js';
+import { getWorktreeBranch } from './git.js';
 
 function sleepSync(ms) {
   if (ms > 0) {
@@ -716,6 +717,104 @@ export async function exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir
       pr_body_markdown: prBodyPath,
     },
     summary,
+  };
+}
+
+function resolvePipelineHeadBranch(db, repoRoot, pipelineStatus, explicitHeadBranch = null) {
+  if (explicitHeadBranch) return explicitHeadBranch;
+
+  const worktreesByName = new Map(listWorktrees(db).map((worktree) => [worktree.name, worktree]));
+  const candidateBranches = uniq(
+    pipelineStatus.tasks
+      .map((task) => task.worktree)
+      .filter(Boolean)
+      .map((worktreeName) => worktreesByName.get(worktreeName)?.branch || null)
+      .filter((branch) => branch && branch !== 'main' && branch !== 'unknown'),
+  );
+
+  if (candidateBranches.length === 1) {
+    return candidateBranches[0];
+  }
+
+  const currentBranch = getWorktreeBranch(repoRoot);
+  if (currentBranch && currentBranch !== 'main') {
+    return currentBranch;
+  }
+
+  return null;
+}
+
+export async function publishPipelinePr(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    baseBranch = 'main',
+    headBranch = null,
+    draft = false,
+    ghCommand = 'gh',
+    outputDir = null,
+  } = {},
+) {
+  const bundle = await exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir);
+  const status = getPipelineStatus(db, pipelineId);
+  const resolvedHeadBranch = resolvePipelineHeadBranch(db, repoRoot, status, headBranch);
+
+  if (!resolvedHeadBranch) {
+    throw new Error(`Could not determine a head branch for pipeline ${pipelineId}. Pass --head <branch>.`);
+  }
+
+  const args = [
+    'pr',
+    'create',
+    '--base',
+    baseBranch,
+    '--head',
+    resolvedHeadBranch,
+    '--title',
+    bundle.summary.pr_artifact.title,
+    '--body-file',
+    bundle.files.pr_body_markdown,
+  ];
+
+  if (draft) {
+    args.push('--draft');
+  }
+
+  const result = spawnSync(ghCommand, args, {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+
+  const ok = !result.error && result.status === 0;
+  const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+
+  logAuditEvent(db, {
+    eventType: 'pipeline_pr_published',
+    status: ok ? 'allowed' : 'denied',
+    reasonCode: ok ? null : 'pr_publish_failed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      base_branch: baseBranch,
+      head_branch: resolvedHeadBranch,
+      gh_command: ghCommand,
+      draft,
+      exit_code: result.status,
+      output: output.slice(0, 500),
+    }),
+  });
+
+  if (!ok) {
+    throw new Error(result.error?.message || output || `gh pr create failed with status ${result.status}`);
+  }
+
+  return {
+    pipeline_id: pipelineId,
+    base_branch: baseBranch,
+    head_branch: resolvedHeadBranch,
+    draft,
+    bundle,
+    output,
   };
 }
 
