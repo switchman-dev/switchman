@@ -1406,6 +1406,8 @@ test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () 
   assert(jsonOutput.health === 'warn', 'Doctor reports warning health when failed tasks need attention');
   assert(jsonOutput.attention.some((item) => item.title.includes('Update docs')), 'Doctor includes the failed task in the attention list');
   assert(jsonOutput.next_steps.some((step) => step.includes('allowed paths')), 'Doctor suggests a concrete next step for the failure');
+  assert(jsonOutput.suggested_commands.some((command) => command.includes('pipeline status')), 'Doctor suggests an exact follow-through command');
+  assert(jsonOutput.attention.some((item) => item.command && item.command.includes('pipeline status')), 'Doctor attention items include exact commands when available');
 
   const textOutput = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
@@ -1416,6 +1418,7 @@ test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () 
   });
   assert(textOutput.includes('Attention now:'), 'Doctor CLI prints an attention section');
   assert(textOutput.includes('next:'), 'Doctor CLI prints actionable next guidance');
+  assert(textOutput.includes('run:'), 'Doctor CLI prints exact follow-through commands');
   rmSync(repoDir, { recursive: true, force: true });
 });
 

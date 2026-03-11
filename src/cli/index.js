@@ -179,6 +179,21 @@ function latestTaskFailure(task) {
   };
 }
 
+function commandForFailedTask(task, failure) {
+  if (!task?.id) return null;
+  switch (failure?.reason_code) {
+    case 'changes_outside_task_scope':
+    case 'objective_not_evidenced':
+    case 'missing_expected_tests':
+    case 'missing_expected_docs':
+    case 'missing_expected_source_changes':
+    case 'no_changes_detected':
+      return `switchman pipeline status ${task.id.split('-').slice(0, -1).join('-')}`;
+    default:
+      return null;
+  }
+}
+
 function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanReport, aiGate }) {
   const failedTasks = tasks
     .filter((task) => task.status === 'failed')
@@ -191,6 +206,7 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
         reason_code: failure?.reason_code || null,
         summary: failure?.summary || 'task failed without a recorded summary',
         next_step: nextStepForReason(failure?.reason_code) || 'inspect the task output and rerun with a narrower scope',
+        command: commandForFailedTask(task, failure),
       };
     });
 
@@ -220,6 +236,7 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
       title: `${lease.worktree} lost its active heartbeat`,
       detail: lease.task_title,
       next_step: 'run `switchman lease reap` to return the task to pending',
+      command: 'switchman lease reap',
       severity: 'block',
     })),
     ...failedTasks.map((task) => ({
@@ -227,6 +244,7 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
       title: task.title,
       detail: task.summary,
       next_step: task.next_step,
+      command: task.command,
       severity: 'warn',
     })),
     ...blockedWorktrees.map((entry) => ({
@@ -234,6 +252,7 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
       title: `${entry.worktree} has unmanaged changed files`,
       detail: `${entry.files.slice(0, 3).join(', ')}${entry.files.length > 3 ? ` +${entry.files.length - 3} more` : ''}`,
       next_step: entry.next_step,
+      command: 'switchman scan',
       severity: 'block',
     })),
     ...fileConflicts.map((conflict) => ({
@@ -241,6 +260,7 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
       title: `${conflict.file} is being edited in multiple worktrees`,
       detail: conflict.worktrees.join(', '),
       next_step: conflict.next_step,
+      command: 'switchman scan',
       severity: 'block',
     })),
     ...branchConflicts.map((conflict) => ({
@@ -248,6 +268,7 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
       title: `${conflict.worktree_a} and ${conflict.worktree_b} have merge risk`,
       detail: `${conflict.files.slice(0, 3).join(', ')}${conflict.files.length > 3 ? ` +${conflict.files.length - 3} more` : ''}`,
       next_step: conflict.next_step,
+      command: 'switchman gate ai',
       severity: 'block',
     })),
   ];
@@ -258,6 +279,7 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
       title: aiGate.status === 'blocked' ? 'AI merge gate blocked the repo' : 'AI merge gate wants manual review',
       detail: aiGate.summary,
       next_step: 'run `switchman gate ai` and review the risky worktree pairs',
+      command: 'switchman gate ai',
       severity: aiGate.status === 'blocked' ? 'block' : 'warn',
     });
   }
@@ -303,6 +325,9 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
     next_steps: attention.length > 0
       ? [...new Set(attention.map((item) => item.next_step))].slice(0, 5)
       : ['run `switchman gate ci` before merge', 'run `switchman scan` after major parallel work'],
+    suggested_commands: attention.length > 0
+      ? [...new Set(attention.map((item) => item.command).filter(Boolean))].slice(0, 5)
+      : ['switchman gate ci', 'switchman scan'],
   };
 }
 
@@ -1598,6 +1623,7 @@ program
         console.log(`  ${itemBadge} ${item.title}`);
         if (item.detail) console.log(`        ${chalk.dim(item.detail)}`);
         console.log(`        ${chalk.yellow('next:')} ${item.next_step}`);
+        if (item.command) console.log(`        ${chalk.cyan('run:')} ${item.command}`);
       }
     }
 
@@ -1605,6 +1631,13 @@ program
     console.log(chalk.bold('Recommended next steps:'));
     for (const step of report.next_steps) {
       console.log(`  - ${step}`);
+    }
+    if (report.suggested_commands.length > 0) {
+      console.log('');
+      console.log(chalk.bold('Suggested commands:'));
+      for (const command of report.suggested_commands) {
+        console.log(`  ${chalk.cyan(command)}`);
+      }
     }
   });
 
