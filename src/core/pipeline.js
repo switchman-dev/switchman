@@ -69,13 +69,16 @@ function nextPipelineTaskId(tasks, pipelineId) {
 
 export function startPipeline(db, { title, description = null, priority = 5, pipelineId = null, maxTasks = 5 }) {
   const resolvedPipelineId = pipelineId || makePipelineId();
-  const suggestedWorktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
+  const registeredWorktrees = listWorktrees(db);
+  const suggestedWorktrees = registeredWorktrees.filter((worktree) => worktree.name !== 'main');
+  const repoRoot = registeredWorktrees.find((worktree) => worktree.name === 'main')?.path || process.cwd();
   const plannedTasks = planPipelineTasks({
     pipelineId: resolvedPipelineId,
     title,
     description,
     worktrees: suggestedWorktrees,
     maxTasks,
+    repoRoot,
   });
 
   const tasks = plannedTasks.map((plannedTask, index) => {

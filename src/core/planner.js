@@ -1,3 +1,7 @@
+import { execSync } from 'child_process';
+import { existsSync, readdirSync, statSync } from 'fs';
+import { basename, join } from 'path';
+
 const DOMAIN_RULES = [
   { key: 'auth', regex: /\b(auth|login|session|oauth|permission|rbac|token)\b/i, source: ['src/auth/**', 'app/auth/**', 'lib/auth/**', 'server/auth/**', 'client/auth/**'] },
   { key: 'api', regex: /\b(api|endpoint|route|graphql|rest|handler)\b/i, source: ['src/api/**', 'app/api/**', 'server/api/**', 'routes/**'] },
@@ -13,6 +17,22 @@ function uniq(values) {
   return [...new Set(values)];
 }
 
+function isTestPath(filePath) {
+  return /(^|\/)(__tests__|tests?|spec|specs)(\/|$)|\.(test|spec)\.[^.]+$/i.test(filePath);
+}
+
+function isDocsPath(filePath) {
+  return /(^|\/)(docs?|readme)(\/|$)|(^|\/)README(\.[^.]+)?$/i.test(filePath);
+}
+
+function isSourcePath(filePath) {
+  return !isTestPath(filePath) && !isDocsPath(filePath);
+}
+
+function stripGlobSuffix(pathPattern) {
+  return String(pathPattern || '').replace(/\/\*\*$/, '');
+}
+
 function extractChecklistItems(description) {
   if (!description) return [];
   return description
@@ -26,6 +46,103 @@ function detectDomains(text) {
     .filter((rule) => rule.regex.test(text))
     .map((rule) => rule.key);
   return matches.length > 0 ? matches : ['general'];
+}
+
+function safeReadDir(rootPath) {
+  try {
+    return readdirSync(rootPath);
+  } catch {
+    return [];
+  }
+}
+
+function walkRepoFiles(rootPath, currentPath = '', depth = 0, maxDepth = 4) {
+  if (!rootPath || depth > maxDepth) return [];
+  const absolutePath = currentPath ? join(rootPath, currentPath) : rootPath;
+  let entries;
+  try {
+    entries = readdirSync(absolutePath);
+  } catch {
+    return [];
+  }
+
+  const files = [];
+  for (const entry of entries) {
+    if (entry === '.git' || entry === '.switchman' || entry === 'node_modules') continue;
+    const relativePath = currentPath ? join(currentPath, entry) : entry;
+    const entryPath = join(rootPath, relativePath);
+    let stats;
+    try {
+      stats = statSync(entryPath);
+    } catch {
+      continue;
+    }
+
+    if (stats.isDirectory()) {
+      files.push(...walkRepoFiles(rootPath, relativePath, depth + 1, maxDepth));
+    } else if (stats.isFile()) {
+      files.push(relativePath);
+    }
+  }
+
+  return files;
+}
+
+function listRepoFiles(repoRoot) {
+  if (!repoRoot) return [];
+  try {
+    const output = execSync('git ls-files', {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    const trackedFiles = output.split('\n').filter(Boolean);
+    if (trackedFiles.length > 0) return trackedFiles;
+  } catch {
+    // Fall back to a shallow filesystem walk for non-git fixtures.
+  }
+  return walkRepoFiles(repoRoot);
+}
+
+function buildRepoContext(repoRoot) {
+  if (!repoRoot) {
+    return {
+      repo_root: null,
+      files: [],
+      lower_files: [],
+      test_roots: [],
+      docs_roots: [],
+      domain_roots: {},
+      package_roots: [],
+    };
+  }
+
+  const files = listRepoFiles(repoRoot);
+  const lowerFiles = files.map((filePath) => filePath.toLowerCase());
+  const testRoots = ['tests', '__tests__', 'test', 'spec', 'specs'].filter((root) => existsSync(join(repoRoot, root)));
+  const docsRoots = uniq([
+    ...(existsSync(join(repoRoot, 'docs')) ? ['docs'] : []),
+    ...(existsSync(join(repoRoot, 'README.md')) ? ['README.md'] : []),
+  ]);
+  const domainRoots = Object.fromEntries(DOMAIN_RULES.map((rule) => {
+    const existingRoots = uniq(rule.source
+      .map(stripGlobSuffix)
+      .filter((root) => existsSync(join(repoRoot, root))));
+    return [rule.key, existingRoots];
+  }));
+  const packageRoots = safeReadDir(join(repoRoot, 'packages'))
+    .map((name) => `packages/${name}`)
+    .filter((packagePath) => existsSync(join(repoRoot, packagePath)));
+
+  return {
+    repo_root: repoRoot,
+    files,
+    lower_files: lowerFiles,
+    test_roots: testRoots,
+    docs_roots: docsRoots,
+    domain_roots: domainRoots,
+    package_roots: packageRoots,
+  };
 }
 
 function deriveSubtaskTitles(title, description) {
@@ -67,34 +184,97 @@ function inferRiskLevel(text) {
   return 'low';
 }
 
-function inferAllowedPaths(taskType, domains = ['general']) {
+function summarizeRelevantPaths(filePaths = []) {
+  const summarized = [];
+  for (const filePath of filePaths) {
+    const segments = filePath.split('/');
+    if (segments.length >= 2) {
+      summarized.push(`${segments[0]}/${segments[1]}/**`);
+    } else {
+      summarized.push(filePath);
+    }
+  }
+  return uniq(summarized);
+}
+
+function inferRelevantRepoFiles(repoContext, objectiveKeywords = [], domains = [], taskType = 'implementation') {
+  if (!repoContext || objectiveKeywords.length === 0) return [];
+
+  const candidates = repoContext.files
+    .filter((filePath) => {
+      if (taskType === 'tests') return isTestPath(filePath);
+      if (taskType === 'docs') return isDocsPath(filePath);
+      if (taskType === 'governance') return isDocsPath(filePath) || /^\.github\//.test(filePath) || /^\.switchman\//.test(filePath);
+      return isSourcePath(filePath);
+    })
+    .map((filePath) => {
+      const lower = filePath.toLowerCase();
+      const basenameLower = basename(filePath).toLowerCase();
+      const keywordHits = objectiveKeywords.filter((keyword) => lower.includes(keyword) || basenameLower.includes(keyword));
+      const domainHits = domains.filter((domain) => domain !== 'general' && lower.includes(domain));
+      return {
+        filePath,
+        score: (keywordHits.length * 3) + (domainHits.length * 2),
+      };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.filePath.localeCompare(b.filePath))
+    .slice(0, 8);
+
+  return candidates.map((entry) => entry.filePath);
+}
+
+function inferAllowedPaths(taskType, domains = ['general'], repoContext = null, objectiveKeywords = []) {
   const sourceRoots = uniq(domains.flatMap((domain) =>
-    DOMAIN_RULES.find((rule) => rule.key === domain)?.source || [],
+    repoContext?.domain_roots?.[domain]?.length > 0
+      ? repoContext.domain_roots[domain].map((root) => `${root}/**`)
+      : (DOMAIN_RULES.find((rule) => rule.key === domain)?.source || []),
   ));
+  const relevantPaths = summarizeRelevantPaths(inferRelevantRepoFiles(repoContext, objectiveKeywords, domains, taskType));
 
   if (taskType === 'tests') {
     return uniq([
-      'tests/**',
-      '__tests__/**',
-      'spec/**',
-      'specs/**',
-      'test/**',
+      ...(repoContext?.test_roots?.length > 0 ? repoContext.test_roots.map((root) => `${root}/**`) : ['tests/**', '__tests__/**', 'spec/**', 'specs/**', 'test/**']),
       ...domains.filter((domain) => domain !== 'general').flatMap((domain) => [
         `tests/${domain}/**`,
         `__tests__/${domain}/**`,
         `spec/${domain}/**`,
       ]),
+      ...relevantPaths,
     ]);
   }
   if (taskType === 'docs') {
-    return uniq(['docs/**', 'README.md', 'README/**', ...domains.map((domain) => `docs/${domain}/**`)]);
+    return uniq([
+      ...(repoContext?.docs_roots?.length > 0
+        ? repoContext.docs_roots.flatMap((root) => root === 'README.md' ? ['README.md'] : [`${root}/**`])
+        : ['docs/**', 'README.md', 'README/**']),
+      ...domains.map((domain) => `docs/${domain}/**`),
+      ...relevantPaths,
+    ]);
   }
   if (taskType === 'governance') {
-    return uniq(['.switchman/**', '.github/**', 'docs/**', 'README.md', ...sourceRoots, 'tests/**']);
+    return uniq([
+      '.switchman/**',
+      '.github/**',
+      'docs/**',
+      'README.md',
+      ...sourceRoots,
+      ...(repoContext?.test_roots?.length > 0 ? repoContext.test_roots.map((root) => `${root}/**`) : ['tests/**']),
+    ]);
+  }
+  if (relevantPaths.length > 0) {
+    return uniq([...relevantPaths, ...sourceRoots]);
   }
   return sourceRoots.length > 0
     ? sourceRoots
-    : ['src/**', 'app/**', 'lib/**', 'server/**', 'client/**', 'packages/**'];
+    : [
+      'src/**',
+      'app/**',
+      'lib/**',
+      'server/**',
+      'client/**',
+      ...(repoContext?.package_roots?.length > 0 ? repoContext.package_roots.map((root) => `${root}/**`) : ['packages/**']),
+    ];
 }
 
 function inferExpectedOutputTypes(taskType) {
@@ -196,13 +376,14 @@ function extractObjectiveKeywords(title, domains = []) {
   ]).slice(0, 8);
 }
 
-export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDescription = null, suggestedWorktree = null, dependencies = [] }) {
+export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDescription = null, suggestedWorktree = null, dependencies = [], repoContext = null }) {
   const taskType = inferTaskType(title);
   const text = `${issueTitle}\n${issueDescription || ''}\n${title}`.toLowerCase();
   const domains = detectDomains(text);
-  const allowedPaths = inferAllowedPaths(taskType, domains);
-  const expectedOutputTypes = inferExpectedOutputTypes(taskType);
+  const objectiveKeywords = extractObjectiveKeywords(title, domains);
   const riskLevel = inferRiskLevel(text);
+  const allowedPaths = inferAllowedPaths(taskType, domains, repoContext, objectiveKeywords);
+  const expectedOutputTypes = inferExpectedOutputTypes(taskType);
 
   return {
     pipeline_id: pipelineId,
@@ -213,7 +394,7 @@ export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDesc
     suggested_worktree: suggestedWorktree,
     dependencies,
     subsystem_tags: domains,
-    objective_keywords: extractObjectiveKeywords(title, domains),
+    objective_keywords: objectiveKeywords,
     allowed_paths: allowedPaths,
     expected_output_types: expectedOutputTypes,
     required_deliverables: buildRequiredDeliverables({ taskType, riskLevel, domains }),
@@ -223,8 +404,9 @@ export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDesc
   };
 }
 
-export function planPipelineTasks({ pipelineId, title, description = null, worktrees = [], maxTasks = 5 }) {
+export function planPipelineTasks({ pipelineId, title, description = null, worktrees = [], maxTasks = 5, repoRoot = null }) {
   const subtaskTitles = deriveSubtaskTitles(title, description).slice(0, maxTasks);
+  const repoContext = buildRepoContext(repoRoot);
   let implementationTaskId = null;
 
   return subtaskTitles.map((subtaskTitle, index) => {
@@ -245,6 +427,7 @@ export function planPipelineTasks({ pipelineId, title, description = null, workt
       issueDescription: description,
       suggestedWorktree,
       dependencies,
+      repoContext,
     });
 
     const task = {

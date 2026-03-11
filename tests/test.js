@@ -1296,6 +1296,41 @@ test('Fix 28b: planner emits subsystem-aware specs for high-risk work', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28bb: planner uses repo structure to narrow task scope', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-planner-scope-${Date.now()}`);
+  mkdirSync(join(repoDir, 'src', 'auth'), { recursive: true });
+  mkdirSync(join(repoDir, 'src', 'payments'), { recursive: true });
+  mkdirSync(join(repoDir, 'tests', 'auth'), { recursive: true });
+  mkdirSync(join(repoDir, 'docs'), { recursive: true });
+  writeFileSync(join(repoDir, 'src', 'auth', 'login.js'), 'export function login() {}\n');
+  writeFileSync(join(repoDir, 'src', 'payments', 'charge.js'), 'export function charge() {}\n');
+  writeFileSync(join(repoDir, 'tests', 'auth', 'login.test.js'), 'test("login", () => {});\n');
+  writeFileSync(join(repoDir, 'docs', 'auth.md'), '# Auth\n');
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'feature/agent1' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'feature/agent2' });
+
+  const result = startPipeline(pipelineDb, {
+    title: 'Improve login retries',
+    description: 'Tighten login retry behavior and refresh docs for the auth flow',
+    pipelineId: 'pipe-planner-scope',
+    priority: 7,
+  });
+
+  const implementationTask = result.tasks.find((task) => task.task_spec?.task_type === 'implementation');
+  const testsTask = result.tasks.find((task) => task.task_spec?.task_type === 'tests');
+  const docsTask = result.tasks.find((task) => task.task_spec?.task_type === 'docs');
+
+  assert(implementationTask.task_spec.allowed_paths.includes('src/auth/**'), 'Planner narrows implementation scope to the relevant auth area in the repo');
+  assert(!implementationTask.task_spec.allowed_paths.includes('src/payments/**'), 'Planner avoids unrelated repo areas when narrowing task scope');
+  assert(testsTask.task_spec.allowed_paths.includes('tests/auth/**'), 'Planner narrows generated test work to the relevant test subtree');
+  assert(docsTask.task_spec.allowed_paths.includes('docs/auth/**') || docsTask.task_spec.allowed_paths.includes('docs/**'), 'Planner narrows docs work using the repo docs layout');
+  pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 28c: pipeline PR summary includes reviewer risk notes for high-risk work', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-pr-risk-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
