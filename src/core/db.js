@@ -125,6 +125,13 @@ function ensureSchema(db) {
       observed_at  TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (worktree, file_path)
     );
+
+    CREATE TABLE IF NOT EXISTS task_specs (
+      task_id      TEXT PRIMARY KEY,
+      spec_json    TEXT NOT NULL,
+      updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
   `);
 
   const fileClaimColumns = getTableColumns(db, 'file_claims');
@@ -157,6 +164,7 @@ function ensureSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log(event_type);
     CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);
     CREATE INDEX IF NOT EXISTS idx_worktree_snapshots_worktree ON worktree_snapshots(worktree);
+    CREATE INDEX IF NOT EXISTS idx_task_specs_updated_at ON task_specs(updated_at);
   `);
 
   migrateLegacyActiveTasks(db);
@@ -497,6 +505,26 @@ export function listTasks(db, statusFilter) {
 
 export function getTask(db, taskId) {
   return db.prepare(`SELECT * FROM tasks WHERE id=?`).get(taskId);
+}
+
+export function upsertTaskSpec(db, taskId, spec) {
+  db.prepare(`
+    INSERT INTO task_specs (task_id, spec_json, updated_at)
+    VALUES (?, ?, datetime('now'))
+    ON CONFLICT(task_id) DO UPDATE SET
+      spec_json=excluded.spec_json,
+      updated_at=datetime('now')
+  `).run(taskId, JSON.stringify(spec || {}));
+}
+
+export function getTaskSpec(db, taskId) {
+  const row = db.prepare(`SELECT spec_json FROM task_specs WHERE task_id=?`).get(taskId);
+  if (!row) return null;
+  try {
+    return JSON.parse(row.spec_json);
+  } catch {
+    return null;
+  }
 }
 
 export function getNextPendingTask(db) {

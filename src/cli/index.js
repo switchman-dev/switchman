@@ -36,7 +36,7 @@ import { upsertProjectMcpConfig } from '../core/mcp.js';
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
-import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, getPipelineStatus, runPipeline, startPipeline } from '../core/pipeline.js';
+import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, runPipeline, startPipeline } from '../core/pipeline.js';
 
 function installMcpConfig(targetDirs) {
   return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
@@ -412,7 +412,8 @@ pipelineCmd
     console.log(`  ${chalk.bold(result.title)}`);
     for (const task of result.tasks) {
       const suggested = task.suggested_worktree ? ` ${chalk.dim(`→ ${task.suggested_worktree}`)}` : '';
-      console.log(`  ${chalk.cyan(task.id)} ${task.title}${suggested}`);
+      const type = task.task_spec?.task_type ? ` ${chalk.dim(`[${task.task_spec.task_type}]`)}` : '';
+      console.log(`  ${chalk.cyan(task.id)} ${task.title}${type}${suggested}`);
     }
   });
 
@@ -438,7 +439,8 @@ pipelineCmd
       for (const task of result.tasks) {
         const worktree = task.worktree || task.suggested_worktree || 'unassigned';
         const blocked = task.blocked_by?.length ? ` ${chalk.dim(`blocked by ${task.blocked_by.join(', ')}`)}` : '';
-        console.log(`  ${statusBadge(task.status)} ${task.id} ${task.title} ${chalk.dim(worktree)}${blocked}`);
+        const type = task.task_spec?.task_type ? ` ${chalk.dim(`[${task.task_spec.task_type}]`)}` : '';
+        console.log(`  ${statusBadge(task.status)} ${task.id} ${task.title}${type} ${chalk.dim(worktree)}${blocked}`);
       }
     } catch (err) {
       db.close();
@@ -465,6 +467,35 @@ pipelineCmd
       }
 
       console.log(result.markdown);
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('bundle <pipelineId> [outputDir]')
+  .description('Export a reviewer-ready PR bundle for a pipeline to disk')
+  .option('--json', 'Output raw JSON')
+  .action(async (pipelineId, outputDir, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = await exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir || null);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Exported PR bundle for ${chalk.cyan(result.pipeline_id)}`);
+      console.log(`  ${chalk.dim(result.output_dir)}`);
+      console.log(`  ${chalk.dim('json:')} ${result.files.summary_json}`);
+      console.log(`  ${chalk.dim('summary:')} ${result.files.summary_markdown}`);
+      console.log(`  ${chalk.dim('body:')} ${result.files.pr_body_markdown}`);
     } catch (err) {
       db.close();
       console.error(chalk.red(err.message));
@@ -557,6 +588,7 @@ pipelineCmd
   .option('--max-iterations <n>', 'Maximum execution/review iterations', '3')
   .option('--max-retries <n>', 'Retry a failed pipeline task up to this many times', '1')
   .option('--retry-backoff-ms <ms>', 'Base backoff in milliseconds between retry attempts', '0')
+  .option('--timeout-ms <ms>', 'Default command timeout in milliseconds when a task spec does not provide one', '0')
   .option('--json', 'Output raw JSON')
   .action(async (pipelineId, agentCommand, opts) => {
     const repoRoot = getRepo();
@@ -570,6 +602,7 @@ pipelineCmd
         maxIterations: Number.parseInt(opts.maxIterations, 10),
         maxRetries: Number.parseInt(opts.maxRetries, 10),
         retryBackoffMs: Number.parseInt(opts.retryBackoffMs, 10),
+        timeoutMs: Number.parseInt(opts.timeoutMs, 10),
       });
       db.close();
 

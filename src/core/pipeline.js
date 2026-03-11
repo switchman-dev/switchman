@@ -1,9 +1,12 @@
 import { spawn, spawnSync } from 'child_process';
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
 
-import { completeTask, createTask, failTask, listAuditEvents, listLeases, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease } from './db.js';
+import { completeTask, createTask, failTask, getTaskSpec, listAuditEvents, listLeases, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease, upsertTaskSpec } from './db.js';
 import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
+import { buildTaskSpec, planPipelineTasks } from './planner.js';
 
 function sleepSync(ms) {
   if (ms > 0) {
@@ -11,43 +14,12 @@ function sleepSync(ms) {
   }
 }
 
+function uniq(values) {
+  return [...new Set(values)];
+}
+
 function makePipelineId() {
   return `pipe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function extractChecklistItems(description) {
-  if (!description) return [];
-  return description
-    .split('\n')
-    .map((line) => line.match(/^\s*(?:[-*]|\d+\.)\s+(?:\[[ xX]\]\s*)?(.*\S)\s*$/)?.[1] || null)
-    .filter(Boolean);
-}
-
-function deriveSubtaskTitles(title, description) {
-  const checklistItems = extractChecklistItems(description);
-  if (checklistItems.length > 0) return checklistItems;
-
-  const text = `${title}\n${description || ''}`.toLowerCase();
-  const subtasks = [];
-
-  const docsOnly = /\b(docs?|readme|documentation)\b/.test(text)
-    && !/\b(api|auth|bug|feature|fix|refactor|schema|migration|config|build|test)\b/.test(text);
-
-  if (docsOnly) {
-    return [`Update docs for: ${title}`];
-  }
-
-  subtasks.push(`Implement: ${title}`);
-
-  if (!/\b(test|spec)\b/.test(text)) {
-    subtasks.push(`Add or update tests for: ${title}`);
-  }
-
-  if (/\b(api|public|config|migration|schema|docs?|readme)\b/.test(text)) {
-    subtasks.push(`Update integration notes for: ${title}`);
-  }
-
-  return subtasks;
 }
 
 function parseSuggestedWorktree(description) {
@@ -79,6 +51,13 @@ function getPipelineMetadata(db, pipelineId) {
   return null;
 }
 
+function withTaskSpec(db, task) {
+  return {
+    ...task,
+    task_spec: getTaskSpec(db, task.id),
+  };
+}
+
 function nextPipelineTaskId(tasks, pipelineId) {
   const nextNumber = tasks
     .map((task) => Number.parseInt(task.id.slice(`${pipelineId}-`.length), 10))
@@ -89,45 +68,40 @@ function nextPipelineTaskId(tasks, pipelineId) {
 
 export function startPipeline(db, { title, description = null, priority = 5, pipelineId = null, maxTasks = 5 }) {
   const resolvedPipelineId = pipelineId || makePipelineId();
-  const subtaskTitles = deriveSubtaskTitles(title, description).slice(0, maxTasks);
   const suggestedWorktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
-  let implementationTaskId = null;
+  const plannedTasks = planPipelineTasks({
+    pipelineId: resolvedPipelineId,
+    title,
+    description,
+    worktrees: suggestedWorktrees,
+    maxTasks,
+  });
 
-  const tasks = subtaskTitles.map((subtaskTitle, index) => {
-    const suggestedWorktree = suggestedWorktrees.length > 0
-      ? suggestedWorktrees[index % suggestedWorktrees.length].name
-      : null;
-    const taskId = `${resolvedPipelineId}-${String(index + 1).padStart(2, '0')}`;
-    const dependencyIds = [];
-    if (implementationTaskId && /^(Add or update tests|Update integration notes)/.test(subtaskTitle)) {
-      dependencyIds.push(implementationTaskId);
-    }
+  const tasks = plannedTasks.map((plannedTask, index) => {
     const taskDescription = [
       `[Pipeline ${resolvedPipelineId}]`,
-      suggestedWorktree ? `Suggested worktree: ${suggestedWorktree}` : null,
-      dependencyIds.length > 0 ? `Depends on: ${dependencyIds.join(', ')}` : null,
+      plannedTask.suggested_worktree ? `Suggested worktree: ${plannedTask.suggested_worktree}` : null,
+      plannedTask.dependencies.length > 0 ? `Depends on: ${plannedTask.dependencies.join(', ')}` : null,
       index === 0 && description ? description : null,
     ].filter(Boolean).join('\n');
 
     createTask(db, {
-      id: taskId,
-      title: subtaskTitle,
+      id: plannedTask.id,
+      title: plannedTask.title,
       description: taskDescription,
       priority,
     });
+    upsertTaskSpec(db, plannedTask.id, plannedTask.task_spec);
 
     const taskRecord = {
-      id: taskId,
-      title: subtaskTitle,
+      id: plannedTask.id,
+      title: plannedTask.title,
       priority,
-      suggested_worktree: suggestedWorktree,
-      dependencies: dependencyIds,
+      suggested_worktree: plannedTask.suggested_worktree,
+      dependencies: plannedTask.dependencies,
+      task_spec: plannedTask.task_spec,
       status: 'pending',
     };
-
-    if (subtaskTitle.startsWith('Implement:')) {
-      implementationTaskId = taskId;
-    }
 
     return taskRecord;
   });
@@ -180,6 +154,7 @@ export function getPipelineStatus(db, pipelineId) {
       );
       return {
         ...task,
+        task_spec: getTaskSpec(db, task.id),
         suggested_worktree: parseSuggestedWorktree(task.description),
         dependencies,
         blocked_by: blockedBy,
@@ -203,11 +178,18 @@ function chooseWorktree(task, availableWorktrees) {
 }
 
 function buildLaunchEnv(repoRoot, task, lease, worktree) {
+  const taskSpec = task.task_spec || null;
+  const executionPolicy = taskSpec?.execution_policy || null;
   return {
     ...process.env,
     SWITCHMAN_PIPELINE_ID: task.id.split('-').slice(0, -1).join('-'),
     SWITCHMAN_TASK_ID: task.id,
     SWITCHMAN_TASK_TITLE: task.title,
+    SWITCHMAN_TASK_TYPE: taskSpec?.task_type || '',
+    SWITCHMAN_TASK_SPEC: taskSpec ? JSON.stringify(taskSpec) : '',
+    SWITCHMAN_TASK_TIMEOUT_MS: executionPolicy?.timeout_ms ? String(executionPolicy.timeout_ms) : '',
+    SWITCHMAN_TASK_MAX_RETRIES: Number.isInteger(executionPolicy?.max_retries) ? String(executionPolicy.max_retries) : '',
+    SWITCHMAN_TASK_RETRY_BACKOFF_MS: executionPolicy?.retry_backoff_ms ? String(executionPolicy.retry_backoff_ms) : '',
     SWITCHMAN_LEASE_ID: lease.id,
     SWITCHMAN_WORKTREE: worktree.name,
     SWITCHMAN_WORKTREE_PATH: worktree.path,
@@ -231,6 +213,19 @@ function getTaskRetryCount(db, taskId) {
     taskId,
     limit: 1000,
   }).length;
+}
+
+function resolveExecutionPolicy(taskSpec, defaults = {}) {
+  const policy = taskSpec?.execution_policy || {};
+  const timeoutMs = Number.isFinite(policy.timeout_ms) ? policy.timeout_ms : (defaults.timeoutMs ?? 0);
+  const maxRetries = Number.isInteger(policy.max_retries) ? policy.max_retries : (defaults.maxRetries ?? 1);
+  const retryBackoffMs = Number.isFinite(policy.retry_backoff_ms) ? policy.retry_backoff_ms : (defaults.retryBackoffMs ?? 0);
+
+  return {
+    timeout_ms: Math.max(0, timeoutMs),
+    max_retries: Math.max(0, maxRetries),
+    retry_backoff_ms: Math.max(0, retryBackoffMs),
+  };
 }
 
 function scheduleTaskRetry(db, { pipelineId, taskId, maxRetries, retryBackoffMs = 0 }) {
@@ -279,20 +274,21 @@ function scheduleTaskRetry(db, { pipelineId, taskId, maxRetries, retryBackoffMs 
   };
 }
 
-function resumeRetryablePipelineTasks(db, pipelineId, maxRetries) {
-  if (maxRetries <= 0) return [];
-
+function resumeRetryablePipelineTasks(db, pipelineId, defaults = {}) {
   const tasks = listTasks(db)
     .filter((task) => task.id.startsWith(`${pipelineId}-`) && task.status === 'failed')
+    .map((task) => withTaskSpec(db, task))
     .sort((a, b) => a.id.localeCompare(b.id));
   const resumed = [];
 
   for (const task of tasks) {
+    const executionPolicy = resolveExecutionPolicy(task.task_spec, defaults);
+    if (executionPolicy.max_retries <= 0) continue;
     const retriesUsed = getTaskRetryCount(db, task.id);
-    if (retriesUsed >= maxRetries) continue;
+    if (retriesUsed >= executionPolicy.max_retries) continue;
 
     const nextAttempt = retriesUsed + 1;
-    const resumedTask = retryTask(db, task.id, `resume retry attempt ${nextAttempt} of ${maxRetries}`);
+    const resumedTask = retryTask(db, task.id, `resume retry attempt ${nextAttempt} of ${executionPolicy.max_retries}`);
     if (!resumedTask) continue;
 
     logAuditEvent(db, {
@@ -303,7 +299,7 @@ function resumeRetryablePipelineTasks(db, pipelineId, maxRetries) {
       details: JSON.stringify({
         pipeline_id: pipelineId,
         retry_attempt: nextAttempt,
-        max_retries: maxRetries,
+        max_retries: executionPolicy.max_retries,
         resumed: true,
       }),
     });
@@ -311,7 +307,7 @@ function resumeRetryablePipelineTasks(db, pipelineId, maxRetries) {
     resumed.push({
       task_id: task.id,
       retry_attempt: nextAttempt,
-      retries_remaining: Math.max(0, maxRetries - nextAttempt),
+      retries_remaining: Math.max(0, executionPolicy.max_retries - nextAttempt),
     });
   }
 
@@ -331,6 +327,7 @@ export function runPipeline(
   const allPipelineTasks = listTasks(db).filter((task) => task.id.startsWith(`${pipelineId}-`));
   const taskStatusById = new Map(allPipelineTasks.map((task) => [task.id, task.status]));
   const tasks = allPipelineTasks
+    .map((task) => withTaskSpec(db, task))
     .filter((task) => task.status === 'pending')
     .filter((task) => parseDependencies(task.description).every((dependencyId) => taskStatusById.get(dependencyId) === 'done'))
     .sort((a, b) => a.id.localeCompare(b.id));
@@ -356,6 +353,7 @@ export function runPipeline(
     const assignment = {
       task_id: task.id,
       title: task.title,
+      task_spec: task.task_spec || null,
       worktree: worktree.name,
       worktree_path: worktree.path,
       lease_id: lease.id,
@@ -421,6 +419,7 @@ function runPipelineIteration(
     agentName = 'pipeline-runner',
     maxRetries = 1,
     retryBackoffMs = 0,
+    timeoutMs = 0,
   },
 ) {
   const dispatch = runPipeline(db, repoRoot, {
@@ -435,23 +434,26 @@ function runPipelineIteration(
   if (agentCommand.length > 0) {
     for (const assignment of dispatch.assigned) {
       const [command, ...args] = agentCommand;
+      const executionPolicy = resolveExecutionPolicy(assignment.task_spec, {
+        maxRetries,
+        retryBackoffMs,
+        timeoutMs,
+      });
       const beforeHead = getHeadRevision(assignment.worktree_path);
       const result = spawnSync(command, args, {
         cwd: assignment.worktree_path,
-        env: {
-          ...process.env,
-          SWITCHMAN_PIPELINE_ID: pipelineId,
-          SWITCHMAN_TASK_ID: assignment.task_id,
-          SWITCHMAN_TASK_TITLE: assignment.title,
-          SWITCHMAN_LEASE_ID: assignment.lease_id,
-          SWITCHMAN_WORKTREE: assignment.worktree,
-          SWITCHMAN_WORKTREE_PATH: assignment.worktree_path,
-          SWITCHMAN_REPO_ROOT: repoRoot,
-        },
+        env: buildLaunchEnv(
+          repoRoot,
+          { id: assignment.task_id, title: assignment.title, task_spec: assignment.task_spec },
+          { id: assignment.lease_id },
+          { name: assignment.worktree, path: assignment.worktree_path },
+        ),
         encoding: 'utf8',
+        timeout: executionPolicy.timeout_ms > 0 ? executionPolicy.timeout_ms : undefined,
       });
       const afterHead = getHeadRevision(assignment.worktree_path);
 
+      const timedOut = result.error?.code === 'ETIMEDOUT';
       const commandOk = !result.error && result.status === 0;
       let evaluation = commandOk
         ? evaluateTaskOutcome(db, repoRoot, { taskId: assignment.task_id })
@@ -469,21 +471,23 @@ function runPipelineIteration(
       let retry = {
         retried: false,
         retry_attempt: getTaskRetryCount(db, assignment.task_id),
-        retries_remaining: Math.max(0, maxRetries - getTaskRetryCount(db, assignment.task_id)),
+        retries_remaining: Math.max(0, executionPolicy.max_retries - getTaskRetryCount(db, assignment.task_id)),
         retry_delay_ms: 0,
       };
       if (ok) {
         completeTask(db, assignment.task_id);
       } else {
         const failureReason = !commandOk
-          ? (result.error?.message || `agent command exited with status ${result.status}`)
+          ? (timedOut
+            ? `agent command timed out after ${executionPolicy.timeout_ms}ms`
+            : (result.error?.message || `agent command exited with status ${result.status}`))
           : `${evaluation.reason_code}: ${evaluation.findings.join('; ')}`;
         failTask(db, assignment.task_id, failureReason);
         retry = scheduleTaskRetry(db, {
           pipelineId,
           taskId: assignment.task_id,
-          maxRetries,
-          retryBackoffMs,
+          maxRetries: executionPolicy.max_retries,
+          retryBackoffMs: executionPolicy.retry_backoff_ms,
         });
       }
 
@@ -497,6 +501,8 @@ function runPipelineIteration(
         retry_attempt: retry.retry_attempt,
         retries_remaining: retry.retries_remaining,
         retry_delay_ms: retry.retry_delay_ms,
+        execution_policy: executionPolicy,
+        timed_out: timedOut,
         exit_code: result.status,
         stdout: result.stdout || '',
         stderr: result.stderr || '',
@@ -505,7 +511,7 @@ function runPipelineIteration(
       logAuditEvent(db, {
         eventType: 'pipeline_task_executed',
         status: ok ? 'allowed' : 'denied',
-        reasonCode: ok ? null : 'agent_command_failed',
+        reasonCode: ok ? null : (timedOut ? 'task_execution_timeout' : 'agent_command_failed'),
         worktree: assignment.worktree,
         taskId: assignment.task_id,
         leaseId: assignment.lease_id,
@@ -514,6 +520,8 @@ function runPipelineIteration(
           command,
           args,
           exit_code: result.status,
+          timed_out: timedOut,
+          execution_policy: executionPolicy,
           outcome_status: evaluation?.status ?? null,
           outcome_reason_code: evaluation?.reason_code ?? null,
           retried: retry.retried,
@@ -545,6 +553,56 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     worktree,
     files: report.fileMap?.[worktree] ?? [],
   }));
+  const completedTasks = status.tasks.filter((task) => task.status === 'done');
+  const remainingTasks = status.tasks.filter((task) => task.status !== 'done');
+  const provenance = completedTasks.map((task) => ({
+    task_id: task.id,
+    title: task.title,
+    task_type: task.task_spec?.task_type || null,
+    risk_level: task.task_spec?.risk_level || null,
+    worktree: task.worktree || task.suggested_worktree || null,
+    subsystem_tags: task.task_spec?.subsystem_tags || [],
+    required_deliverables: task.task_spec?.required_deliverables || [],
+  }));
+  const changedFiles = uniq(worktreeChanges.flatMap((entry) => entry.files));
+  const subsystemTags = uniq(completedTasks.flatMap((task) => task.task_spec?.subsystem_tags || []));
+  const riskNotes = [];
+  if (!ciGateOk) riskNotes.push('Repo gate is blocked by conflicts, unmanaged changes, or stale worktrees.');
+  if (aiGate.status !== 'pass') riskNotes.push(aiGate.summary);
+  if (completedTasks.some((task) => task.task_spec?.risk_level === 'high')) {
+    riskNotes.push('High-risk work is included in this PR and should receive explicit reviewer attention.');
+  }
+  if (changedFiles.some((file) => /(^|\/)(auth|payments|db|migrations?|schema|config)(\/|$)/i.test(file))) {
+    riskNotes.push('Changed files touch sensitive areas such as auth, payments, schema, or config.');
+  }
+  const reviewerChecklist = [
+    ciGateOk ? 'Repo gate passed' : 'Resolve repo gate failures before merge',
+    aiGate.status === 'pass' ? 'AI merge gate passed' : `Review AI merge gate findings: ${aiGate.summary}`,
+    completedTasks.some((task) => task.task_spec?.risk_level === 'high')
+      ? 'Confirm high-risk tasks have the expected tests and docs'
+      : 'Review changed files and task outcomes',
+  ];
+  const prTitle = status.title.startsWith('Implement:')
+    ? status.title.replace(/^Implement:\s*/i, '')
+    : status.title;
+  const prBody = [
+    '## Summary',
+    ...(completedTasks.length > 0
+      ? completedTasks.map((task) => `- ${task.title}`)
+      : ['- No completed tasks yet']),
+    '',
+    '## Validation',
+    `- Repo gate: ${ciGateOk ? 'pass' : 'blocked'}`,
+    `- AI merge gate: ${aiGate.status}`,
+    '',
+    '## Reviewer Checklist',
+    ...reviewerChecklist.map((item) => `- ${item}`),
+    '',
+    '## Provenance',
+    ...(provenance.length > 0
+      ? provenance.map((entry) => `- ${entry.task_id} (${entry.task_type || 'unknown'}) via ${entry.worktree || 'unassigned'}`)
+      : ['- No completed task provenance yet']),
+  ].join('\n');
   const ready = status.counts.failed === 0
     && status.counts.pending === 0
     && status.counts.in_progress === 0
@@ -561,24 +619,28 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     `- AI merge gate: ${aiGate.status}`,
     '',
     '## Completed Tasks',
-    ...status.tasks
-      .filter((task) => task.status === 'done')
-      .map((task) => `- ${task.title}`),
-    ...(status.tasks.filter((task) => task.status === 'done').length === 0 ? ['- None yet'] : []),
+    ...completedTasks.map((task) => `- ${task.title}`),
+    ...(completedTasks.length === 0 ? ['- None yet'] : []),
     '',
     '## Remaining Tasks',
-    ...status.tasks
-      .filter((task) => task.status !== 'done')
-      .map((task) => `- [${task.status}] ${task.title}`),
-    ...(status.tasks.filter((task) => task.status !== 'done').length === 0 ? ['- None'] : []),
+    ...remainingTasks.map((task) => `- [${task.status}] ${task.title}`),
+    ...(remainingTasks.length === 0 ? ['- None'] : []),
     '',
     '## Worktree Changes',
     ...worktreeChanges.map((entry) => `- ${entry.worktree}: ${entry.files.length ? entry.files.join(', ') : 'no active changes'}`),
     ...(worktreeChanges.length === 0 ? ['- No active worktree assignments yet'] : []),
     '',
+    '## Reviewer Notes',
+    ...reviewerChecklist.map((item) => `- ${item}`),
+    '',
+    '## Provenance',
+    ...provenance.map((entry) => `- ${entry.task_id}: ${entry.title} (${entry.task_type || 'unknown'}, ${entry.worktree || 'unassigned'})`),
+    ...(provenance.length === 0 ? ['- No completed task provenance yet'] : []),
+    '',
     '## Gate Notes',
     `- Repo gate summary: ${ciGateOk ? 'clear' : 'blocked by conflicts or unmanaged changes'}`,
     `- AI merge summary: ${aiGate.summary}`,
+    ...(riskNotes.length > 0 ? ['', '## Risk Notes', ...riskNotes.map((note) => `- ${note}`)] : []),
   ].join('\n');
 
   logAuditEvent(db, {
@@ -597,6 +659,15 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     ready,
     pipeline_id: pipelineId,
     title: status.title,
+    pr_artifact: {
+      title: prTitle,
+      body: prBody,
+      reviewer_checklist: reviewerChecklist,
+      provenance,
+      risk_notes: riskNotes,
+      changed_files: changedFiles,
+      subsystem_tags: subsystemTags,
+    },
     counts: status.counts,
     ci_gate: {
       ok: ciGateOk,
@@ -612,6 +683,42 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   };
 }
 
+export async function exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir = null) {
+  const summary = await buildPipelinePrSummary(db, repoRoot, pipelineId);
+  const bundleDir = outputDir || join(repoRoot, '.switchman', 'pipelines', pipelineId);
+  mkdirSync(bundleDir, { recursive: true });
+
+  const summaryJsonPath = join(bundleDir, 'pr-summary.json');
+  const summaryMarkdownPath = join(bundleDir, 'pr-summary.md');
+  const prBodyPath = join(bundleDir, 'pr-body.md');
+
+  writeFileSync(summaryJsonPath, `${JSON.stringify(summary, null, 2)}\n`);
+  writeFileSync(summaryMarkdownPath, `${summary.markdown}\n`);
+  writeFileSync(prBodyPath, `${summary.pr_artifact.body}\n`);
+
+  logAuditEvent(db, {
+    eventType: 'pipeline_pr_bundle_exported',
+    status: 'allowed',
+    reasonCode: null,
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      output_dir: bundleDir,
+      files: [summaryJsonPath, summaryMarkdownPath, prBodyPath],
+    }),
+  });
+
+  return {
+    pipeline_id: pipelineId,
+    output_dir: bundleDir,
+    files: {
+      summary_json: summaryJsonPath,
+      summary_markdown: summaryMarkdownPath,
+      pr_body_markdown: prBodyPath,
+    },
+    summary,
+  };
+}
+
 export async function createPipelineFollowupTasks(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
   const report = await scanAllWorktrees(db, repoRoot);
@@ -623,6 +730,14 @@ export async function createPipelineFollowupTasks(db, repoRoot, pipelineId) {
   function maybeCreateTask(title, description) {
     if (existingTitles.has(title)) return;
     const taskId = nextPipelineTaskId(pipelineTasks, pipelineId);
+    const taskSpec = buildTaskSpec({
+      pipelineId,
+      taskId,
+      title,
+      issueTitle: status.title,
+      issueDescription: status.description,
+      dependencies: [],
+    });
     createTask(db, {
       id: taskId,
       title,
@@ -632,9 +747,10 @@ export async function createPipelineFollowupTasks(db, repoRoot, pipelineId) {
       ].filter(Boolean).join('\n'),
       priority: status.priority,
     });
-    pipelineTasks.push({ id: taskId, title });
+    upsertTaskSpec(db, taskId, taskSpec);
+    pipelineTasks.push({ id: taskId, title, task_spec: taskSpec });
     existingTitles.add(title);
-    created.push({ id: taskId, title, description });
+    created.push({ id: taskId, title, description, task_spec: taskSpec });
   }
 
   for (const entry of report.unclaimedChanges) {
@@ -701,12 +817,17 @@ export async function executePipeline(
     maxIterations = 3,
     maxRetries = 1,
     retryBackoffMs = 0,
+    timeoutMs = 0,
   },
 ) {
   const iterations = [];
 
   for (let iteration = 1; iteration <= maxIterations; iteration++) {
-    const resumed = resumeRetryablePipelineTasks(db, pipelineId, maxRetries);
+    const resumed = resumeRetryablePipelineTasks(db, pipelineId, {
+      maxRetries,
+      retryBackoffMs,
+      timeoutMs,
+    });
     const before = getPipelineStatus(db, pipelineId);
     const run = before.counts.pending > 0
       ? runPipelineIteration(db, repoRoot, {
@@ -715,6 +836,7 @@ export async function executePipeline(
         agentName,
         maxRetries,
         retryBackoffMs,
+        timeoutMs,
       })
       : {
         pipeline_id: pipelineId,

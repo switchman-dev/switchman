@@ -29,6 +29,8 @@ import {
   startTaskLease,
   completeTask,
   failTask,
+  getTaskSpec,
+  upsertTaskSpec,
   listTasks,
   getTask,
   getNextPendingTask,
@@ -1162,6 +1164,12 @@ test('Fix 27: pipeline start creates grouped subtasks with suggested worktrees',
   assert(result.tasks.length === 3, 'Pipeline start creates one task per checklist item');
   assert(result.tasks[0].id === 'pipe-demo-01', 'Pipeline tasks use stable prefixed IDs');
   assert(status.tasks.some((task) => task.suggested_worktree === 'agent1'), 'Pipeline tasks capture suggested worktrees');
+  assert(result.tasks[0].task_spec?.task_type === 'implementation', 'Pipeline start attaches a structured implementation task spec');
+  assert(result.tasks[1].task_spec?.task_type === 'tests', 'Pipeline start attaches a structured test task spec');
+  assert(result.tasks[0].task_spec?.execution_policy?.timeout_ms >= 45000, 'Implementation tasks get a default execution policy');
+  assert(result.tasks[1].task_spec?.execution_policy?.timeout_ms === 30000, 'Test tasks get a test-specific execution policy');
+  assert(result.tasks[0].task_spec?.required_deliverables?.includes('source'), 'Implementation task specs include required deliverables');
+  assert(Array.isArray(getTaskSpec(pipelineDb, 'pipe-demo-01')?.success_criteria), 'Pipeline task specs are persisted in the database');
   pipelineDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -1195,6 +1203,121 @@ test('Fix 28: pipeline PR summary combines task status with gate results', () =>
   assert(result.pipeline_id === 'pipe-pr', 'Pipeline PR summary returns the requested pipeline ID');
   assert(typeof result.markdown === 'string' && result.markdown.includes('# PR Summary: Refresh docs'), 'Pipeline PR summary includes PR-ready markdown');
   assert(result.ci_gate.ok, 'Pipeline PR summary includes a passing repo gate for a clean repo');
+  assert(result.pr_artifact.title === 'Refresh docs', 'Pipeline PR summary generates a reviewer-facing PR title');
+  assert(result.pr_artifact.body.includes('## Reviewer Checklist'), 'Pipeline PR summary generates a structured PR body');
+  assert(Array.isArray(result.pr_artifact.provenance), 'Pipeline PR summary includes provenance entries for reviewers');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28b: planner emits subsystem-aware specs for high-risk work', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-planner-risk-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'feature/agent1' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'feature/agent2' });
+
+  const result = startPipeline(pipelineDb, {
+    title: 'Harden auth API permissions',
+    description: 'Update login permissions for the public API and add migration checks',
+    pipelineId: 'pipe-planner-risk',
+    priority: 9,
+  });
+
+  const implementationTask = result.tasks.find((task) => task.task_spec?.task_type === 'implementation');
+  const testsTask = result.tasks.find((task) => task.task_spec?.task_type === 'tests');
+  const governanceTask = result.tasks.find((task) => task.task_spec?.task_type === 'governance');
+
+  assert(result.tasks.length >= 4, 'High-risk work produces implementation, tests, docs, and safety review tasks');
+  assert(implementationTask.task_spec.risk_level === 'high', 'Planner marks auth/API/migration work as high risk');
+  assert(implementationTask.task_spec.subsystem_tags.includes('auth'), 'Planner tags auth-related implementation tasks with auth subsystem metadata');
+  assert(implementationTask.task_spec.allowed_paths.some((path) => path.includes('auth')), 'Planner narrows implementation scope to auth-related paths');
+  assert(implementationTask.task_spec.required_deliverables.includes('tests'), 'Planner requires tests for high-risk implementation work');
+  assert(implementationTask.task_spec.required_deliverables.includes('docs'), 'Planner requires docs deliverables for API/schema-related implementation work');
+  assert(implementationTask.task_spec.execution_policy.timeout_ms === 90000, 'Planner gives high-risk implementation tasks a stricter execution timeout');
+  assert(implementationTask.task_spec.execution_policy.max_retries === 1, 'Planner keeps high-risk implementation retries constrained');
+  assert(testsTask.dependencies.includes(implementationTask.id), 'Planner keeps generated test work dependent on implementation');
+  assert(governanceTask.task_spec.allowed_paths.includes('.github/**'), 'Planner gives safety-review tasks governance-oriented allowed paths');
+  pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28c: pipeline PR summary includes reviewer risk notes for high-risk work', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-pr-risk-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Harden auth API permissions',
+    description: 'Update login permissions for the public API and add migration checks',
+    pipelineId: 'pipe-pr-risk',
+    priority: 9,
+  });
+  completeTask(pipelineDb, 'pipe-pr-risk-01');
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'pr',
+    'pipe-pr-risk',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.pr_artifact.risk_notes.some((note) => note.toLowerCase().includes('high-risk work')), 'Pipeline PR summary includes reviewer risk notes for high-risk tasks');
+  assert(result.pr_artifact.subsystem_tags.includes('auth'), 'Pipeline PR summary carries subsystem tags into the reviewer artifact');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28d: pipeline bundle exports reviewer-ready files to disk', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-bundle-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-bundle',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-bundle-01');
+  pipelineDb.close();
+
+  const outputDir = join(repoDir, 'artifacts', 'pipe-bundle');
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'bundle',
+    'pipe-bundle',
+    outputDir,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.output_dir === outputDir, 'Pipeline bundle exports to the requested output directory');
+  assert(existsSync(result.files.summary_json), 'Pipeline bundle writes the JSON summary file');
+  assert(existsSync(result.files.summary_markdown), 'Pipeline bundle writes the markdown summary file');
+  assert(existsSync(result.files.pr_body_markdown), 'Pipeline bundle writes the PR body markdown file');
+  assert(readFileSync(result.files.pr_body_markdown, 'utf8').includes('## Reviewer Checklist'), 'Pipeline bundle writes reviewer checklist content into the PR body file');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -1215,9 +1338,9 @@ test('Fix 29: pipeline run dispatches pending tasks onto available worktrees', (
   const result = runPipeline(pipelineDb, repoDir, { pipelineId: 'pipe-run' });
   const status = getPipelineStatus(pipelineDb, 'pipe-run');
 
-  assert(result.assigned.length === 2, 'Pipeline run assigns pending tasks to available non-main worktrees');
-  assert(result.remaining_pending === 1, 'Pipeline run leaves excess tasks pending when worktrees run out');
-  assert(status.counts.in_progress === 2, 'Dispatched tasks are moved into in_progress');
+  assert(result.assigned.length === 1, 'Pipeline run dispatches only dependency-ready tasks');
+  assert(result.remaining_pending === 0, 'Pipeline run reports no additional ready tasks once dependent work is held back');
+  assert(status.counts.in_progress === 1, 'Only the dependency-free task moves into in_progress');
   pipelineDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -1243,7 +1366,7 @@ test('Fix 30: pipeline run launches agent commands with Switchman env', () => {
     priority: 5,
   });
   const outputPath = join(agentPath, 'pipeline-env.json');
-  const script = `require('node:fs').writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({ pipeline: process.env.SWITCHMAN_PIPELINE_ID, task: process.env.SWITCHMAN_TASK_ID, lease: process.env.SWITCHMAN_LEASE_ID, worktree: process.env.SWITCHMAN_WORKTREE }));`;
+  const script = `require('node:fs').writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({ pipeline: process.env.SWITCHMAN_PIPELINE_ID, task: process.env.SWITCHMAN_TASK_ID, lease: process.env.SWITCHMAN_LEASE_ID, worktree: process.env.SWITCHMAN_WORKTREE, taskType: process.env.SWITCHMAN_TASK_TYPE, taskSpec: process.env.SWITCHMAN_TASK_SPEC, timeoutMs: process.env.SWITCHMAN_TASK_TIMEOUT_MS, maxRetries: process.env.SWITCHMAN_TASK_MAX_RETRIES, retryBackoffMs: process.env.SWITCHMAN_TASK_RETRY_BACKOFF_MS }));`;
 
   const result = runPipeline(pipelineDb, repoDir, {
     pipelineId: 'pipe-launch',
@@ -1258,6 +1381,10 @@ test('Fix 30: pipeline run launches agent commands with Switchman env', () => {
   assert(envPayload.pipeline === 'pipe-launch', 'Launched pipeline command receives SWITCHMAN_PIPELINE_ID');
   assert(envPayload.task === 'pipe-launch-01', 'Launched pipeline command receives SWITCHMAN_TASK_ID');
   assert(envPayload.worktree === 'agent1', 'Launched pipeline command receives SWITCHMAN_WORKTREE');
+  assert(envPayload.taskType === 'docs', 'Launched pipeline command receives the structured task type');
+  assert(JSON.parse(envPayload.taskSpec).expected_output_types.includes('docs'), 'Launched pipeline command receives the structured task spec payload');
+  assert(envPayload.timeoutMs === '15000', 'Launched pipeline command receives the task-specific timeout policy');
+  assert(envPayload.maxRetries === '0', 'Launched pipeline command receives the task-specific retry policy');
   pipelineDb.close();
   execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
@@ -1517,6 +1644,104 @@ test('Fix 37: task outcome evaluator accepts in-scope claimed source changes', (
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 37b: task outcome evaluator enforces structured task scope', () => {
+  const repoDir = join(tmpdir(), `sw-outcome-scope-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Update docs for release notes' });
+  assignTask(db, taskId, 'main');
+  claimFiles(db, taskId, 'main', ['src/example.js']);
+  upsertTaskSpec(db, taskId, {
+    task_type: 'docs',
+    allowed_paths: ['docs/**', 'README.md'],
+    expected_output_types: ['docs'],
+    success_criteria: ['change a docs file'],
+  });
+  execSync('mkdir -p src && printf "oops\\n" > src/example.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  assert(result.status === 'needs_followup', 'Outcome evaluator flags changes outside the structured task scope');
+  assert(result.reason_code === 'changes_outside_task_scope', 'Outcome evaluator reports changes_outside_task_scope for out-of-scope edits');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 37c: task outcome evaluator requires high-risk implementation deliverables', () => {
+  const repoDir = join(tmpdir(), `sw-outcome-deliverables-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Implement: Harden auth API permissions' });
+  assignTask(db, taskId, 'main');
+  claimFiles(db, taskId, 'main', ['src/auth/login.js']);
+  upsertTaskSpec(db, taskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source', 'tests', 'docs'],
+    objective_keywords: ['auth', 'api', 'permissions'],
+    risk_level: 'high',
+    success_criteria: ['change auth source and supporting deliverables'],
+  });
+  execSync('mkdir -p src/auth && printf "ok\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  assert(result.status === 'needs_followup', 'Outcome evaluator rejects high-risk implementation work missing required deliverables');
+  assert(result.reason_code === 'missing_expected_tests', 'Outcome evaluator fails fast on missing required tests for high-risk work');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 37d: task outcome evaluator checks objective evidence beyond scope', () => {
+  const repoDir = join(tmpdir(), `sw-outcome-objective-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Implement: auth permissions flow' });
+  assignTask(db, taskId, 'main');
+  claimFiles(db, taskId, 'main', ['src/auth/login.js']);
+  upsertTaskSpec(db, taskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+    objective_keywords: ['auth', 'permissions'],
+    risk_level: 'medium',
+    success_criteria: ['change auth permission logic'],
+  });
+  releaseFileClaims(db, taskId);
+  claimFiles(db, taskId, 'main', ['src/general/handler.js']);
+  execSync('mkdir -p src/general && printf "ok\\n" > src/general/handler.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  assert(result.status === 'needs_followup', 'Outcome evaluator rejects in-scope changes that do not evidence the task objective strongly enough');
+  assert(result.reason_code === 'objective_not_evidenced', 'Outcome evaluator reports objective_not_evidenced when keywords are not reflected in changed outputs');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 38: pipeline exec retries transient failures and reaches ready', () => {
   const { repoDir, agentPath, db } = setupPipelineExecRepo('sw-pipeline-retry-ready', 'pipe-retry-ready-branch');
   startPipeline(db, {
@@ -1524,6 +1749,15 @@ test('Fix 38: pipeline exec retries transient failures and reaches ready', () =>
     description: '- update docs',
     pipelineId: 'pipe-retry-ready',
     priority: 5,
+  });
+  const retrySpec = getTaskSpec(db, 'pipe-retry-ready-01');
+  upsertTaskSpec(db, 'pipe-retry-ready-01', {
+    ...retrySpec,
+    execution_policy: {
+      ...retrySpec.execution_policy,
+      max_retries: 1,
+      retry_backoff_ms: 0,
+    },
   });
   db.close();
 
@@ -1560,6 +1794,15 @@ test('Fix 39: pipeline exec blocks after exhausting retry budget', () => {
     pipelineId: 'pipe-retry-blocked',
     priority: 5,
   });
+  const retrySpec = getTaskSpec(db, 'pipe-retry-blocked-01');
+  upsertTaskSpec(db, 'pipe-retry-blocked-01', {
+    ...retrySpec,
+    execution_policy: {
+      ...retrySpec.execution_policy,
+      max_retries: 1,
+      retry_backoff_ms: 0,
+    },
+  });
   db.close();
 
   const result = JSON.parse(execFileSync(process.execPath, [
@@ -1592,6 +1835,51 @@ test('Fix 39: pipeline exec blocks after exhausting retry budget', () => {
   cleanupPipelineExecRepo(repoDir, agentPath);
 });
 
+test('Fix 39b: pipeline exec enforces task-specific timeout policy', () => {
+  const { repoDir, agentPath, db } = setupPipelineExecRepo('sw-pipeline-timeout', 'pipe-timeout-branch');
+  startPipeline(db, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-timeout',
+    priority: 5,
+  });
+  const spec = getTaskSpec(db, 'pipe-timeout-01');
+  upsertTaskSpec(db, 'pipe-timeout-01', {
+    ...spec,
+    execution_policy: {
+      timeout_ms: 50,
+      max_retries: 0,
+      retry_backoff_ms: 0,
+    },
+  });
+  db.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'exec',
+    'pipe-timeout',
+    '--max-iterations',
+    '2',
+    '--json',
+    '--',
+    process.execPath,
+    '-e',
+    'setTimeout(() => process.exit(0), 500)',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.status === 'blocked', 'Pipeline exec blocks when a task exceeds its execution timeout');
+  assert(result.iterations[0].executed_failures === 1, 'Timed out execution is recorded as a failed task execution');
+  const timeoutDb = openDb(repoDir);
+  const timeoutEvents = listAuditEvents(timeoutDb, { eventType: 'pipeline_task_executed', limit: 10 });
+  timeoutDb.close();
+  assert(timeoutEvents.some((event) => event.reason_code === 'task_execution_timeout'), 'Timed out execution is logged with a timeout-specific reason code');
+  cleanupPipelineExecRepo(repoDir, agentPath);
+});
+
 test('Fix 40: pipeline exec resumes previously failed tasks when retries remain', () => {
   const { repoDir, agentPath, db } = setupPipelineExecRepo('sw-pipeline-retry-resume', 'pipe-retry-resume-branch');
   startPipeline(db, {
@@ -1599,6 +1887,15 @@ test('Fix 40: pipeline exec resumes previously failed tasks when retries remain'
     description: '- update docs',
     pipelineId: 'pipe-retry-resume',
     priority: 5,
+  });
+  const retrySpec = getTaskSpec(db, 'pipe-retry-resume-01');
+  upsertTaskSpec(db, 'pipe-retry-resume-01', {
+    ...retrySpec,
+    execution_policy: {
+      ...retrySpec.execution_policy,
+      max_retries: 1,
+      retry_backoff_ms: 0,
+    },
   });
   const lease = startTaskLease(db, 'pipe-retry-resume-01', 'agent1', 'pipeline-runner');
   assert(Boolean(lease), 'Fixture acquires a lease before simulating a previous failed run');
