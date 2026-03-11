@@ -246,6 +246,14 @@ function releaseClaimsForLeaseTx(db, leaseId) {
   `).run(leaseId);
 }
 
+function releaseClaimsForTaskTx(db, taskId) {
+  db.prepare(`
+    UPDATE file_claims
+    SET released_at=datetime('now')
+    WHERE task_id=? AND released_at IS NULL
+  `).run(taskId);
+}
+
 function closeActiveLeasesForTaskTx(db, taskId, status, failureReason = null) {
   const activeLeases = db.prepare(`
     SELECT * FROM leases
@@ -360,6 +368,7 @@ export function completeTask(db, taskId) {
       WHERE id=?
     `).run(taskId);
     closeActiveLeasesForTaskTx(db, taskId, 'completed');
+    releaseClaimsForTaskTx(db, taskId);
   });
 }
 
@@ -371,6 +380,7 @@ export function failTask(db, taskId, reason) {
       WHERE id=?
     `).run(reason || 'unknown', taskId);
     closeActiveLeasesForTaskTx(db, taskId, 'failed', reason || 'unknown');
+    releaseClaimsForTaskTx(db, taskId);
   });
 }
 
@@ -549,10 +559,7 @@ export function claimFiles(db, taskId, worktree, filePaths, agent) {
 }
 
 export function releaseFileClaims(db, taskId) {
-  db.prepare(`
-    UPDATE file_claims SET released_at=datetime('now')
-    WHERE task_id=? AND released_at IS NULL
-  `).run(taskId);
+  releaseClaimsForTaskTx(db, taskId);
 }
 
 export function releaseLeaseFileClaims(db, leaseId) {

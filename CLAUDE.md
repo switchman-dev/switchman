@@ -3,6 +3,8 @@
 This repository uses **Switchman** to coordinate parallel AI coding agents.
 You MUST follow these instructions every session to avoid conflicting with other agents.
 
+You must use the Switchman MCP tools for coordination. Do not read from or write to `.switchman/switchman.db` directly, and do not bypass Switchman by issuing raw SQLite queries.
+
 ---
 
 ## Your worktree
@@ -26,6 +28,7 @@ switchman_task_next({ worktree: "<your-worktree-name>", agent: "claude-code" })
 
 - If `task` is `null` — the queue is empty. Ask the user what to work on, or stop.
 - If you receive a task — note the `task.id`. You'll need it in the next steps.
+- If the `switchman_*` tools are unavailable, stop and tell the user the MCP server is not connected. Do not fall back to direct SQLite access.
 
 ### 2. Before editing any files — claim them
 
@@ -55,7 +58,7 @@ If you discover mid-task that you need to edit additional files, call `switchman
 
 **On success:**
 ```
-switchman_task_done({ task_id: "<task-id>", release_files: true })
+switchman_task_done({ task_id: "<task-id>" })
 ```
 
 **On failure (can't complete the task):**
@@ -96,3 +99,4 @@ This shows all pending and in-progress tasks, file claims per worktree, and work
 3. **If `safe_to_proceed` is false, do not edit the conflicting files** — coordinate first.
 4. **Do not claim files you don't need** — over-claiming blocks other agents unnecessarily.
 5. **One task per session** — complete or fail your current task before taking another.
+6. **Never query or mutate the Switchman SQLite database directly** — use MCP tools only.

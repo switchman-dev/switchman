@@ -9,6 +9,7 @@ import {
   getWorktreeChangedFiles,
   checkMergeConflicts,
 } from './git.js';
+import { filterIgnoredPaths } from './ignore.js';
 
 /**
  * Scan all worktrees for conflicts.
@@ -48,14 +49,15 @@ export async function scanAllWorktrees(db, repoRoot) {
   for (const [wtA, wtB] of pairs) {
     if (!wtA.branch || !wtB.branch) continue;
     const result = checkMergeConflicts(repoRoot, wtA.branch, wtB.branch);
-    if (result.hasConflicts) {
+    const conflictingFiles = filterIgnoredPaths(result.conflictingFiles || []);
+    if (result.hasConflicts && conflictingFiles.length > 0) {
       branchConflicts.push({
         type: result.isOverlapOnly ? 'file_overlap' : 'merge_conflict',
         worktreeA: wtA.name,
         worktreeB: wtB.name,
         branchA: wtA.branch,
         branchB: wtB.branch,
-        conflictingFiles: result.conflictingFiles,
+        conflictingFiles,
         details: result.details,
       });
     }

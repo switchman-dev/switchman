@@ -6,6 +6,7 @@
 import { execSync, spawnSync } from 'child_process';
 import { existsSync } from 'fs';
 import { join, relative, resolve, basename } from 'path';
+import { filterIgnoredPaths } from './ignore.js';
 
 /**
  * Find the switchman database root from cwd or a given path.
@@ -126,7 +127,7 @@ export function getWorktreeChangedFiles(worktreePath, repoRoot) {
       ...untracked.split('\n'),
     ].filter(Boolean);
 
-    return [...new Set(allFiles)];
+    return filterIgnoredPaths([...new Set(allFiles)]);
   } catch {
     return [];
   }

@@ -40,7 +40,9 @@ That's it. Switchman creates three isolated workspaces, one per agent, and initi
 
 **Step 2 — Add Switchman to Claude Code**
 
-Add this to `~/.claude/claude_desktop_config.json`:
+`switchman setup` now writes a project-local `.mcp.json` into the repo root and each generated worktree, so Claude Code can discover Switchman automatically when you open those folders.
+
+If you prefer a global fallback, add this to `~/.claude/claude_desktop_config.json`:
 
 ```json
 {
@@ -53,7 +55,7 @@ Add this to `~/.claude/claude_desktop_config.json`:
 }
 ```
 
-Then restart Claude Code.
+Then restart Claude Code. The project-local `.mcp.json` is the preferred path because it travels with the repo and the generated worktrees.
 
 **Step 3 — Copy CLAUDE.md into your repo root**
 
@@ -61,7 +63,7 @@ Then restart Claude Code.
 curl -O https://raw.githubusercontent.com/switchman-dev/switchman/main/CLAUDE.md
 ```
 
-This tells your agents how to use Switchman. Without it they won't know to coordinate.
+This tells your agents how to use Switchman. Without it they may bypass Switchman entirely, so keep it in the repo root and do not let agents talk to `.switchman/switchman.db` directly.
 
 **Step 4 — Add your tasks**
 
@@ -73,7 +75,7 @@ switchman task add "Update README" --priority 2
 
 **Step 5 — Open Claude Code in each workspace**
 
-Open a separate Claude Code window in each folder that `switchman setup` created. Each agent will automatically pick up a task, lock the files it needs, and release them when it's done.
+Open a separate Claude Code window in each folder that `switchman setup` created. Each agent should automatically see the local MCP config, pick up a task, lock the files it needs, and release them when it's done.
 
 **Step 6 — Check before merging**
 
@@ -163,6 +165,7 @@ switchman status
 One-command setup — creates agent workspaces and initialises the database.
 - `--agents 3` — number of workspaces to create (default: 3, max: 10)
 - `--prefix switchman` — branch name prefix (default: switchman)
+- Writes `.mcp.json` to the repo root and each generated worktree so Claude Code can attach the Switchman MCP server automatically
 
 ### `switchman init`
 Initialise in the current git repo without creating worktrees. Creates `.switchman/switchman.db` and auto-detects existing worktrees.
@@ -196,10 +199,10 @@ Expire stale leases, release their claims, and return their tasks to `pending`.
 - `--stale-after-minutes <n>` — staleness threshold (default: 15)
 
 ### `switchman task done <taskId>`
-Mark a task complete and release all file claims.
+Mark a task complete and automatically release all file claims.
 
 ### `switchman task fail <taskId>`
-Mark a task failed and release all file claims.
+Mark a task failed and automatically release all file claims.
 
 ### `switchman claim <taskId> <worktree> [files...]`
 Lock files before editing. Warns immediately if any file is already claimed by another agent.
@@ -209,6 +212,7 @@ Release all file claims for a task.
 
 ### `switchman scan`
 Check all worktrees for conflicts — both uncommitted file overlaps and branch-level merge conflicts. Run this before merging.
+By default, common generated paths such as `node_modules/`, `dist/`, `build/`, and `coverage/` are ignored.
 
 ### `switchman status`
 Full overview: task counts, active leases, stale leases, locked files, and a quick conflict scan.

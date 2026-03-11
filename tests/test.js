@@ -4,13 +4,15 @@
  */
 
 import { execSync } from 'child_process';
-import { mkdirSync, rmSync, existsSync, realpathSync } from 'fs';
+import { mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { DatabaseSync } from 'node:sqlite';
 
 import { findRepoRoot } from '../src/core/git.js';
 import { getWorktreeChangedFiles } from '../src/core/git.js';
+import { filterIgnoredPaths, isIgnoredPath } from '../src/core/ignore.js';
+import { upsertProjectMcpConfig } from '../src/core/mcp.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 
@@ -177,6 +179,18 @@ test('File claims - release', () => {
   } else {
     assert(true, 'Skipped (no in_progress tasks)');
   }
+});
+
+test('File claims auto-release when a task completes', () => {
+  const taskId = createTask(db, { title: 'Auto release on done' });
+  assignTask(db, taskId, 'feature-auto-release');
+  claimFiles(db, taskId, 'feature-auto-release', [
+    'src/auto-release.js',
+  ]);
+
+  completeTask(db, taskId);
+  const claims = getActiveFileClaims(db).filter((claim) => claim.task_id === taskId);
+  assert(claims.length === 0, 'Completing a task releases its active claims automatically');
 });
 
 test('Task queue ordering', () => {
@@ -416,6 +430,46 @@ test('Fix 5: getWorktreeChangedFiles includes untracked files', () => {
 
   const changed = getWorktreeChangedFiles(repoDir, repoDir);
   assert(changed.includes('src/new-file.js'), 'Untracked file appears in changed-files scan');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 6: default ignore list drops node_modules and build output noise', () => {
+  const filtered = filterIgnoredPaths([
+    'src/app.js',
+    'node_modules/pkg/index.js',
+    'coverage/lcov.info',
+    'dist/app.js',
+    'nested/node_modules/pkg/index.js',
+  ]);
+
+  assert(filtered.length === 1, 'Ignored paths are removed from conflict scans');
+  assert(filtered[0] === 'src/app.js', 'Non-generated source files are preserved');
+  assert(isIgnoredPath('examples/taskapi/node_modules/pkg/index.js'), 'Nested node_modules paths are ignored');
+});
+
+test('Fix 7: setup MCP config can be written locally without clobbering other servers', () => {
+  const repoDir = join(tmpdir(), `sw-mcp-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+
+  const first = upsertProjectMcpConfig(repoDir);
+  const firstConfig = JSON.parse(readFileSync(first.path, 'utf8'));
+  assert(first.created, 'Initial MCP config write reports creation');
+  assert(firstConfig.mcpServers.switchman.command === 'switchman-mcp', 'Switchman MCP server is registered');
+
+  writeFileSync(first.path, `${JSON.stringify({
+    mcpServers: {
+      other: {
+        command: 'other-mcp',
+        args: [],
+      },
+    },
+  }, null, 2)}\n`);
+  const second = upsertProjectMcpConfig(repoDir);
+  const secondConfig = JSON.parse(readFileSync(second.path, 'utf8'));
+
+  assert(secondConfig.mcpServers.other.command === 'other-mcp', 'Existing MCP servers are preserved');
+  assert(secondConfig.mcpServers.switchman.command === 'switchman-mcp', 'Switchman MCP server is merged into existing config');
 
   rmSync(repoDir, { recursive: true, force: true });
 });

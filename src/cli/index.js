@@ -19,9 +19,7 @@
 import { program } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { readFileSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { execSync } from 'child_process';
 
 import { findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.js';
@@ -34,8 +32,11 @@ import {
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
+import { upsertProjectMcpConfig } from '../core/mcp.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+function installMcpConfig(targetDirs) {
+  return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -129,10 +130,13 @@ program
         registerWorktree(db, { name: wt.name, path: wt.path, branch: wt.branch || 'unknown' });
       }
 
+      const mcpConfigWrites = installMcpConfig([...new Set([repoRoot, ...gitWorktrees.map((wt) => wt.path)])]);
+
       db.close();
       spinner.succeed(`Initialized in ${chalk.cyan(repoRoot)}`);
       console.log(chalk.dim(`  Found and registered ${gitWorktrees.length} git worktree(s)`));
       console.log(chalk.dim(`  Database: .switchman/switchman.db`));
+      console.log(chalk.dim(`  MCP config: ${mcpConfigWrites.filter((result) => result.changed).length} file(s) written`));
       console.log('');
       console.log(`Next steps:`);
       console.log(`  ${chalk.cyan('switchman task add "Fix the login bug"')}  — add a task`);
@@ -204,6 +208,8 @@ program
         registerWorktree(db, { name: wt.name, path: wt.path, branch: wt.branch || 'unknown' });
       }
 
+      const mcpConfigWrites = installMcpConfig([...new Set([repoRoot, ...created.map((wt) => wt.path)])]);
+
       db.close();
 
       const label = agentCount === 1 ? 'workspace' : 'workspaces';
@@ -217,10 +223,17 @@ program
       }
 
       console.log('');
+      console.log(chalk.bold('MCP config:'));
+      for (const result of mcpConfigWrites) {
+        const status = result.created ? 'created' : result.changed ? 'updated' : 'unchanged';
+        console.log(`  ${chalk.green('✓')} ${chalk.cyan(result.path)} ${chalk.dim(`(${status})`)}`);
+      }
+
+      console.log('');
       console.log(chalk.bold('Next steps:'));
       console.log(`  1. Add your tasks:`);
       console.log(`     ${chalk.cyan('switchman task add "Your first task" --priority 8')}`);
-      console.log(`  2. Open Claude Code in each folder above — agents will coordinate automatically`);
+      console.log(`  2. Open Claude Code in each folder above — the local .mcp.json will attach Switchman automatically`);
       console.log(`  3. Check status at any time:`);
       console.log(`     ${chalk.cyan('switchman status')}`);
       console.log('');
@@ -573,6 +586,7 @@ wtCmd
       registerWorktree(db, { name: wt.name, path: wt.path, branch: wt.branch || 'unknown' });
     }
     db.close();
+    installMcpConfig([...new Set([repoRoot, ...gitWorktrees.map((wt) => wt.path)])]);
     console.log(`${chalk.green('✓')} Synced ${gitWorktrees.length} worktree(s) from git`);
   });
 
