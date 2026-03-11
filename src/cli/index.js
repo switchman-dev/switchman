@@ -163,6 +163,149 @@ function nextStepForReason(reasonCode) {
   return actions[reasonCode] || null;
 }
 
+function latestTaskFailure(task) {
+  const failureLine = String(task.description || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse()
+    .find((line) => line.startsWith('FAILED: '));
+  if (!failureLine) return null;
+  const failureText = failureLine.slice('FAILED: '.length);
+  const reasonMatch = failureText.match(/^([a-z0-9_]+):\s*(.+)$/i);
+  return {
+    reason_code: reasonMatch ? reasonMatch[1] : null,
+    summary: reasonMatch ? reasonMatch[2] : failureText,
+  };
+}
+
+function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanReport, aiGate }) {
+  const failedTasks = tasks
+    .filter((task) => task.status === 'failed')
+    .map((task) => {
+      const failure = latestTaskFailure(task);
+      return {
+        id: task.id,
+        title: task.title,
+        worktree: task.worktree || null,
+        reason_code: failure?.reason_code || null,
+        summary: failure?.summary || 'task failed without a recorded summary',
+        next_step: nextStepForReason(failure?.reason_code) || 'inspect the task output and rerun with a narrower scope',
+      };
+    });
+
+  const blockedWorktrees = scanReport.unclaimedChanges.map((entry) => ({
+    worktree: entry.worktree,
+    files: entry.files,
+    reason_code: entry.reasons?.[0]?.reason_code || null,
+    next_step: nextStepForReason(entry.reasons?.[0]?.reason_code) || 'inspect the changed files and bring them back under Switchman claims',
+  }));
+
+  const fileConflicts = scanReport.fileConflicts.map((conflict) => ({
+    file: conflict.file,
+    worktrees: conflict.worktrees,
+    next_step: 'let one task finish first or re-scope the conflicting work',
+  }));
+
+  const branchConflicts = scanReport.conflicts.map((conflict) => ({
+    worktree_a: conflict.worktreeA,
+    worktree_b: conflict.worktreeB,
+    files: conflict.conflictingFiles,
+    next_step: 'review the overlapping branches before merge',
+  }));
+
+  const attention = [
+    ...staleLeases.map((lease) => ({
+      kind: 'stale_lease',
+      title: `${lease.worktree} lost its active heartbeat`,
+      detail: lease.task_title,
+      next_step: 'run `switchman lease reap` to return the task to pending',
+      severity: 'block',
+    })),
+    ...failedTasks.map((task) => ({
+      kind: 'failed_task',
+      title: task.title,
+      detail: task.summary,
+      next_step: task.next_step,
+      severity: 'warn',
+    })),
+    ...blockedWorktrees.map((entry) => ({
+      kind: 'unmanaged_changes',
+      title: `${entry.worktree} has unmanaged changed files`,
+      detail: `${entry.files.slice(0, 3).join(', ')}${entry.files.length > 3 ? ` +${entry.files.length - 3} more` : ''}`,
+      next_step: entry.next_step,
+      severity: 'block',
+    })),
+    ...fileConflicts.map((conflict) => ({
+      kind: 'file_conflict',
+      title: `${conflict.file} is being edited in multiple worktrees`,
+      detail: conflict.worktrees.join(', '),
+      next_step: conflict.next_step,
+      severity: 'block',
+    })),
+    ...branchConflicts.map((conflict) => ({
+      kind: 'branch_conflict',
+      title: `${conflict.worktree_a} and ${conflict.worktree_b} have merge risk`,
+      detail: `${conflict.files.slice(0, 3).join(', ')}${conflict.files.length > 3 ? ` +${conflict.files.length - 3} more` : ''}`,
+      next_step: conflict.next_step,
+      severity: 'block',
+    })),
+  ];
+
+  if (aiGate.status === 'warn' || aiGate.status === 'blocked') {
+    attention.push({
+      kind: 'ai_merge_gate',
+      title: aiGate.status === 'blocked' ? 'AI merge gate blocked the repo' : 'AI merge gate wants manual review',
+      detail: aiGate.summary,
+      next_step: 'run `switchman gate ai` and review the risky worktree pairs',
+      severity: aiGate.status === 'blocked' ? 'block' : 'warn',
+    });
+  }
+
+  const health = attention.some((item) => item.severity === 'block')
+    ? 'block'
+    : attention.some((item) => item.severity === 'warn')
+      ? 'warn'
+      : 'healthy';
+
+  return {
+    repo_root: repoRoot,
+    health,
+    summary: health === 'healthy'
+      ? 'Repo looks healthy. Agents are coordinated and merge checks are clear.'
+      : health === 'warn'
+        ? 'Repo is running, but there are issues that need review before merge.'
+        : 'Repo needs attention before more work or merge.',
+    counts: {
+      pending: tasks.filter((task) => task.status === 'pending').length,
+      in_progress: tasks.filter((task) => task.status === 'in_progress').length,
+      done: tasks.filter((task) => task.status === 'done').length,
+      failed: failedTasks.length,
+      active_leases: activeLeases.length,
+      stale_leases: staleLeases.length,
+    },
+    active_work: activeLeases.map((lease) => ({
+      worktree: lease.worktree,
+      task_id: lease.task_id,
+      task_title: lease.task_title,
+      heartbeat_at: lease.heartbeat_at,
+    })),
+    attention,
+    merge_readiness: {
+      ci_gate_ok: scanReport.conflicts.length === 0
+        && scanReport.fileConflicts.length === 0
+        && scanReport.unclaimedChanges.length === 0
+        && scanReport.complianceSummary.non_compliant === 0
+        && scanReport.complianceSummary.stale === 0,
+      ai_gate_status: aiGate.status,
+      compliance: scanReport.complianceSummary,
+    },
+    next_steps: attention.length > 0
+      ? [...new Set(attention.map((item) => item.next_step))].slice(0, 5)
+      : ['run `switchman gate ci` before merge', 'run `switchman scan` after major parallel work'],
+  };
+}
+
 function acquireNextTaskLease(db, worktreeName, agent, attempts = 5) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     const task = getNextPendingTask(db);
@@ -1394,6 +1537,75 @@ program
     console.log('');
     console.log(chalk.dim('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
     console.log('');
+  });
+
+program
+  .command('doctor')
+  .description('Show one operator-focused health view: what is running, what is blocked, and what to do next')
+  .option('--json', 'Output raw JSON')
+  .action(async (opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const tasks = listTasks(db);
+    const activeLeases = listLeases(db, 'active');
+    const staleLeases = getStaleLeases(db);
+    const scanReport = await scanAllWorktrees(db, repoRoot);
+    const aiGate = await runAiMergeGate(db, repoRoot);
+    const report = buildDoctorReport({
+      repoRoot,
+      tasks,
+      activeLeases,
+      staleLeases,
+      scanReport,
+      aiGate,
+    });
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+
+    const badge = report.health === 'healthy'
+      ? chalk.green('HEALTHY')
+      : report.health === 'warn'
+        ? chalk.yellow('ATTENTION')
+        : chalk.red('BLOCKED');
+    console.log(`${badge} ${report.summary}`);
+    console.log(chalk.dim(repoRoot));
+    console.log('');
+
+    console.log(chalk.bold('At a glance:'));
+    console.log(`  ${chalk.dim('tasks')} ${report.counts.pending} pending, ${report.counts.in_progress} in progress, ${report.counts.done} done, ${report.counts.failed} failed`);
+    console.log(`  ${chalk.dim('leases')} ${report.counts.active_leases} active, ${report.counts.stale_leases} stale`);
+    console.log(`  ${chalk.dim('merge')} CI ${report.merge_readiness.ci_gate_ok ? chalk.green('clear') : chalk.red('blocked')}  AI ${report.merge_readiness.ai_gate_status}`);
+
+    if (report.active_work.length > 0) {
+      console.log('');
+      console.log(chalk.bold('Running now:'));
+      for (const item of report.active_work.slice(0, 5)) {
+        console.log(`  ${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}`);
+      }
+    }
+
+    console.log('');
+    console.log(chalk.bold('Attention now:'));
+    if (report.attention.length === 0) {
+      console.log(`  ${chalk.green('Nothing urgent.')}`);
+    } else {
+      for (const item of report.attention.slice(0, 6)) {
+        const itemBadge = item.severity === 'block' ? chalk.red('block') : chalk.yellow('warn ');
+        console.log(`  ${itemBadge} ${item.title}`);
+        if (item.detail) console.log(`        ${chalk.dim(item.detail)}`);
+        console.log(`        ${chalk.yellow('next:')} ${item.next_step}`);
+      }
+    }
+
+    console.log('');
+    console.log(chalk.bold('Recommended next steps:'));
+    for (const step of report.next_steps) {
+      console.log(`  - ${step}`);
+    }
   });
 
 // ── gate ─────────────────────────────────────────────────────────────────────

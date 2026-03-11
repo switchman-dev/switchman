@@ -1378,6 +1378,47 @@ test('Fix 28a: pipeline status exposes readable failure context and next action'
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () => {
+  const repoDir = join(tmpdir(), `sw-doctor-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const doctorDb = initDb(repoDir);
+  registerWorktree(doctorDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(doctorDb, { title: 'Update docs' });
+  assignTask(doctorDb, taskId, 'main');
+  failTask(doctorDb, taskId, 'changes_outside_task_scope: changed files outside task scope: src/rogue.js');
+  doctorDb.close();
+
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  assert(jsonOutput.health === 'warn', 'Doctor reports warning health when failed tasks need attention');
+  assert(jsonOutput.attention.some((item) => item.title.includes('Update docs')), 'Doctor includes the failed task in the attention list');
+  assert(jsonOutput.next_steps.some((step) => step.includes('allowed paths')), 'Doctor suggests a concrete next step for the failure');
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  assert(textOutput.includes('Attention now:'), 'Doctor CLI prints an attention section');
+  assert(textOutput.includes('next:'), 'Doctor CLI prints actionable next guidance');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 28b: planner emits subsystem-aware specs for high-risk work', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-planner-risk-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
