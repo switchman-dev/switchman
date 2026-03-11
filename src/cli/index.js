@@ -119,6 +119,50 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function humanizeReasonCode(reasonCode) {
+  const labels = {
+    no_active_lease: 'no active lease',
+    lease_expired: 'lease expired',
+    worktree_mismatch: 'wrong worktree',
+    path_not_claimed: 'path not claimed',
+    path_claimed_by_other_lease: 'claimed by another lease',
+    policy_exception_required: 'policy exception required',
+    policy_exception_allowed: 'policy exception allowed',
+    changes_outside_claims: 'changed files outside claims',
+    changes_outside_task_scope: 'changed files outside task scope',
+    missing_expected_tests: 'missing expected tests',
+    missing_expected_docs: 'missing expected docs',
+    missing_expected_source_changes: 'missing expected source changes',
+    objective_not_evidenced: 'task objective not evidenced',
+    no_changes_detected: 'no changes detected',
+    task_execution_timeout: 'task execution timed out',
+    task_failed: 'task failed',
+    agent_command_failed: 'agent command failed',
+    rejected: 'rejected',
+  };
+  return labels[reasonCode] || String(reasonCode || 'unknown').replace(/_/g, ' ');
+}
+
+function nextStepForReason(reasonCode) {
+  const actions = {
+    no_active_lease: 'reacquire the task or lease before writing',
+    lease_expired: 'refresh or reacquire the lease, then retry',
+    worktree_mismatch: 'run the task from the assigned worktree',
+    path_not_claimed: 'claim the file before editing it',
+    path_claimed_by_other_lease: 'wait for the other task or pick a different file',
+    changes_outside_claims: 'claim all edited files or narrow the task scope',
+    changes_outside_task_scope: 'keep edits inside allowed paths or update the plan',
+    missing_expected_tests: 'add test coverage before rerunning',
+    missing_expected_docs: 'add the expected docs change before rerunning',
+    missing_expected_source_changes: 'make a source change inside the task scope',
+    objective_not_evidenced: 'align the output more closely to the task objective',
+    no_changes_detected: 'produce a tracked change or close the task differently',
+    task_execution_timeout: 'raise the timeout or reduce task size',
+    agent_command_failed: 'inspect stderr/stdout and rerun the agent',
+  };
+  return actions[reasonCode] || null;
+}
+
 function acquireNextTaskLease(db, worktreeName, agent, attempts = 5) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     const task = getNextPendingTask(db);
@@ -462,6 +506,13 @@ pipelineCmd
         const blocked = task.blocked_by?.length ? ` ${chalk.dim(`blocked by ${task.blocked_by.join(', ')}`)}` : '';
         const type = task.task_spec?.task_type ? ` ${chalk.dim(`[${task.task_spec.task_type}]`)}` : '';
         console.log(`  ${statusBadge(task.status)} ${task.id} ${task.title}${type} ${chalk.dim(worktree)}${blocked}`);
+        if (task.failure?.summary) {
+          const reasonLabel = humanizeReasonCode(task.failure.reason_code);
+          console.log(`    ${chalk.red('why:')} ${task.failure.summary} ${chalk.dim(`(${reasonLabel})`)}`);
+        }
+        if (task.next_action) {
+          console.log(`    ${chalk.yellow('next:')} ${task.next_action}`);
+        }
       }
     } catch (err) {
       db.close();
@@ -1170,7 +1221,8 @@ program
           console.log(`  ${chalk.cyan(entry.worktree)} ${chalk.dim(entry.lease_id || 'no active lease')}`);
           entry.files.forEach((file) => {
             const reason = entry.reasons.find((item) => item.file === file)?.reason_code || 'path_not_claimed';
-            console.log(`    ${chalk.yellow(file)} ${chalk.dim(reason)}`);
+            const nextStep = nextStepForReason(reason);
+            console.log(`    ${chalk.yellow(file)} ${chalk.dim(humanizeReasonCode(reason))}${nextStep ? ` ${chalk.dim(`— ${nextStep}`)}` : ''}`);
           });
         }
         console.log('');
@@ -1248,6 +1300,29 @@ program
       }
     }
 
+    if (failed.length > 0) {
+      console.log('');
+      console.log(chalk.bold('Failed Tasks:'));
+      for (const task of failed.slice(0, 5)) {
+        const failureLine = String(task.description || '')
+          .split('\n')
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .reverse()
+          .find((line) => line.startsWith('FAILED: '));
+        const failureText = failureLine ? failureLine.slice('FAILED: '.length) : 'unknown failure';
+        const reasonMatch = failureText.match(/^([a-z0-9_]+):\s*(.+)$/i);
+        const reasonCode = reasonMatch ? reasonMatch[1] : null;
+        const summary = reasonMatch ? reasonMatch[2] : failureText;
+        const nextStep = nextStepForReason(reasonCode);
+        console.log(`  ${chalk.red(task.title)} ${chalk.dim(task.id)}`);
+        console.log(`    ${chalk.red('why:')} ${summary} ${chalk.dim(`(${humanizeReasonCode(reasonCode)})`)}`);
+        if (nextStep) {
+          console.log(`    ${chalk.yellow('next:')} ${nextStep}`);
+        }
+      }
+    }
+
     // File Claims
     const claims = getActiveFileClaims(db);
     if (claims.length > 0) {
@@ -1288,7 +1363,10 @@ program
         console.log('');
         console.log(chalk.bold('Unclaimed Changed Paths:'));
         for (const entry of report.unclaimedChanges) {
+          const reasonCode = entry.reasons?.[0]?.reason_code || null;
+          const nextStep = nextStepForReason(reasonCode);
           console.log(`  ${chalk.cyan(entry.worktree)}: ${entry.files.slice(0, 5).join(', ')}${entry.files.length > 5 ? ` +${entry.files.length - 5} more` : ''}`);
+          console.log(`    ${chalk.dim(humanizeReasonCode(reasonCode))}${nextStep ? ` — ${nextStep}` : ''}`);
         }
       }
 
@@ -1296,7 +1374,7 @@ program
         console.log('');
         console.log(chalk.bold('Recent Commit Gate Failures:'));
         for (const failure of report.commitGateFailures.slice(0, 5)) {
-          console.log(`  ${chalk.red(failure.worktree || 'unknown')} ${chalk.dim(failure.reason_code || 'rejected')} ${chalk.dim(failure.created_at)}`);
+          console.log(`  ${chalk.red(failure.worktree || 'unknown')} ${chalk.dim(humanizeReasonCode(failure.reason_code || 'rejected'))} ${chalk.dim(failure.created_at)}`);
         }
       }
 
@@ -1304,7 +1382,7 @@ program
         console.log('');
         console.log(chalk.bold('Recent Denied Events:'));
         for (const event of report.deniedWrites.slice(0, 5)) {
-          console.log(`  ${chalk.red(event.event_type)} ${chalk.cyan(event.worktree || 'repo')} ${chalk.dim(event.reason_code || event.status)}`);
+          console.log(`  ${chalk.red(event.event_type)} ${chalk.cyan(event.worktree || 'repo')} ${chalk.dim(humanizeReasonCode(event.reason_code || event.status))}`);
         }
       }
     } catch {

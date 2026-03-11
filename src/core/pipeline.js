@@ -156,16 +156,62 @@ export function getPipelineStatus(db, pipelineId) {
       const blockedBy = dependencies.filter((dependencyId) =>
         tasks.find((candidate) => candidate.id === dependencyId)?.status !== 'done',
       );
+      const taskSpec = getTaskSpec(db, task.id);
+      const failure = task.status === 'failed' ? parseTaskFailure(task.description) : null;
       return {
         ...task,
-        task_spec: getTaskSpec(db, task.id),
+        task_spec: taskSpec,
         suggested_worktree: parseSuggestedWorktree(task.description),
         dependencies,
         blocked_by: blockedBy,
         ready_to_run: task.status === 'pending' && blockedBy.length === 0,
+        failure,
+        next_action: task.status === 'failed'
+          ? inferTaskNextAction({ ...task, task_spec: taskSpec }, failure)
+          : null,
       };
     }),
   };
+}
+
+function parseTaskFailure(description) {
+  const lines = String(description || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const failureLine = [...lines].reverse().find((line) => line.startsWith('FAILED: '));
+  if (!failureLine) return null;
+
+  const message = failureLine.slice('FAILED: '.length);
+  const match = message.match(/^([a-z0-9_]+):\s*(.+)$/i);
+  return {
+    raw: message,
+    reason_code: match ? match[1] : null,
+    summary: match ? match[2] : message,
+  };
+}
+
+function inferTaskNextAction(task, failure) {
+  if (!failure?.reason_code) return null;
+
+  switch (failure.reason_code) {
+    case 'changes_outside_claims':
+      return 'Claim every edited file first, or split the task into smaller scoped changes.';
+    case 'changes_outside_task_scope':
+      return 'Keep edits inside allowed paths or widen the planned task scope.';
+    case 'missing_expected_tests':
+      return 'Add or update tests before rerunning this task.';
+    case 'missing_expected_docs':
+      return 'Add the expected docs change or update the docs path in the task spec.';
+    case 'missing_expected_source_changes':
+      return 'Make a source change inside the claimed task scope.';
+    case 'objective_not_evidenced':
+      return 'Produce output that clearly matches the task objective or rewrite the task intent.';
+    case 'no_changes_detected':
+      return 'Create a tracked file change or move the work into a more appropriate follow-up task.';
+    default:
+      return 'Inspect the task output and rerun with a clearer, narrower task scope.';
+  }
 }
 
 function chooseWorktree(task, availableWorktrees) {
@@ -191,6 +237,7 @@ function buildLaunchEnv(repoRoot, task, lease, worktree) {
     SWITCHMAN_TASK_TITLE: task.title,
     SWITCHMAN_TASK_TYPE: taskSpec?.task_type || '',
     SWITCHMAN_TASK_SPEC: taskSpec ? JSON.stringify(taskSpec) : '',
+    SWITCHMAN_TASK_OUTPUT_PATH: taskSpec?.primary_output_path || '',
     SWITCHMAN_TASK_TIMEOUT_MS: executionPolicy?.timeout_ms ? String(executionPolicy.timeout_ms) : '',
     SWITCHMAN_TASK_MAX_RETRIES: Number.isInteger(executionPolicy?.max_retries) ? String(executionPolicy.max_retries) : '',
     SWITCHMAN_TASK_RETRY_BACKOFF_MS: executionPolicy?.retry_backoff_ms ? String(executionPolicy.retry_backoff_ms) : '',
@@ -727,12 +774,26 @@ function resolvePipelineHeadBranch(db, repoRoot, pipelineStatus, explicitHeadBra
   if (explicitHeadBranch) return explicitHeadBranch;
 
   const worktreesByName = new Map(listWorktrees(db).map((worktree) => [worktree.name, worktree]));
+  const resolveBranchForTask = (task) => {
+    const worktreeName = task.worktree || task.suggested_worktree || null;
+    const branch = worktreeName ? worktreesByName.get(worktreeName)?.branch || null : null;
+    return branch && branch !== 'main' && branch !== 'unknown' ? branch : null;
+  };
+
+  const implementationBranches = uniq(
+    pipelineStatus.tasks
+      .filter((task) => task.task_spec?.task_type === 'implementation')
+      .map(resolveBranchForTask)
+      .filter(Boolean),
+  );
+  if (implementationBranches.length === 1) {
+    return implementationBranches[0];
+  }
+
   const candidateBranches = uniq(
     pipelineStatus.tasks
-      .map((task) => task.worktree)
-      .filter(Boolean)
-      .map((worktreeName) => worktreesByName.get(worktreeName)?.branch || null)
-      .filter((branch) => branch && branch !== 'main' && branch !== 'unknown'),
+      .map(resolveBranchForTask)
+      .filter(Boolean),
   );
 
   if (candidateBranches.length === 1) {
@@ -826,6 +887,10 @@ export async function createPipelineFollowupTasks(db, repoRoot, pipelineId) {
   const report = await scanAllWorktrees(db, repoRoot);
   const aiGate = await runAiMergeGate(db, repoRoot);
   const existingTitles = new Set(status.tasks.map((task) => task.title));
+  const hasPlannedTestsTask = status.tasks.some((task) =>
+    task.task_spec?.task_type === 'tests' && !task.title.startsWith('Add missing tests'),
+  );
+  const hasGovernanceTask = status.tasks.some((task) => task.task_spec?.task_type === 'governance');
   const created = [];
   const pipelineTasks = [...status.tasks];
 
@@ -869,15 +934,20 @@ export async function createPipelineFollowupTasks(db, repoRoot, pipelineId) {
     );
   }
 
-  for (const pair of aiGate.pairs.filter((item) => item.status !== 'pass')) {
-    maybeCreateTask(
-      `Review integration risk between ${pair.worktree_a} and ${pair.worktree_b}`,
-      pair.reasons.join('\n'),
-    );
+  if (!hasGovernanceTask && aiGate.status === 'blocked') {
+    const blockedPairs = aiGate.pairs.filter((item) => item.status !== 'pass');
+    if (blockedPairs.length > 0) {
+      maybeCreateTask(
+        'Review blocked AI merge findings',
+        blockedPairs
+          .map((pair) => `${pair.worktree_a} <-> ${pair.worktree_b}\n${pair.reasons.join('\n')}`)
+          .join('\n\n'),
+      );
+    }
   }
 
   for (const worktree of aiGate.worktrees) {
-    if (worktree.findings.includes('source changes without corresponding test updates')) {
+    if (!hasPlannedTestsTask && worktree.findings.includes('source changes without corresponding test updates')) {
       maybeCreateTask(
         `Add missing tests for ${worktree.worktree}`,
         `Source files without test updates: ${worktree.source_files.join(', ')}`,

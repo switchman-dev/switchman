@@ -1336,6 +1336,48 @@ test('Fix 28: pipeline PR summary combines task status with gate results', () =>
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28a: pipeline status exposes readable failure context and next action', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-status-failure-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'feature/agent1' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-status-failure',
+    priority: 5,
+  });
+  failTask(pipelineDb, 'pipe-status-failure-01', 'changes_outside_task_scope: changed files outside task scope: src/rogue.js');
+
+  const status = getPipelineStatus(pipelineDb, 'pipe-status-failure');
+  const failedTask = status.tasks.find((task) => task.id === 'pipe-status-failure-01');
+  assert(failedTask.failure.reason_code === 'changes_outside_task_scope', 'Pipeline status exposes the structured failure reason code');
+  assert(failedTask.failure.summary.includes('src/rogue.js'), 'Pipeline status exposes a readable failure summary');
+  assert(failedTask.next_action.includes('allowed paths'), 'Pipeline status provides a concrete next action for the failure');
+
+  const cliOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'status',
+    'pipe-status-failure',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  assert(cliOutput.includes('why:'), 'Pipeline status CLI prints a readable failure summary');
+  assert(cliOutput.includes('next:'), 'Pipeline status CLI prints a concrete next step for failed tasks');
+  pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 28b: planner emits subsystem-aware specs for high-risk work', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-planner-risk-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
