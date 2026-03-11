@@ -23,6 +23,80 @@ npm install -g @switchman-dev
 
 ---
 
+## First successful run: 3 agents on one repo
+
+If you only try one thing, try this.
+
+### 1. Create a test repo and three agent worktrees
+
+```bash
+cd my-project
+switchman setup --agents 3
+```
+
+This gives you:
+- one shared Switchman database in `.switchman/`
+- three linked worktrees
+- local `.mcp.json` files so Claude Code can discover Switchman automatically
+
+### 2. Add three small, separate tasks
+
+```bash
+switchman task add "Implement auth helper" --priority 9
+switchman task add "Add auth tests" --priority 8
+switchman task add "Update auth docs" --priority 7
+```
+
+Use tasks that naturally touch different files for your first run. Do not start with a broad refactor.
+
+### 3. Open one Claude Code window per worktree
+
+Open each generated worktree folder in its own Claude Code window.
+
+If Claude Code sees the local `.mcp.json`, each agent can use Switchman without extra setup.
+
+### 4. Tell each agent to work through Switchman
+
+Use this exact instruction:
+
+```text
+Use Switchman for all task coordination in this repo.
+
+1. Run `switchman lease next --json` to get your task and lease.
+2. Before editing anything, run `switchman claim <taskId> <worktree> <files...>`.
+3. Only edit files you have claimed.
+4. If a claim is blocked, do not use --force. Pick a different file or different approach.
+5. When finished, run `switchman task done <taskId>`.
+
+Do not read or write `.switchman/switchman.db` directly.
+Do not bypass Switchman for file coordination.
+```
+
+### 5. Watch the run
+
+In the repo root:
+
+```bash
+switchman status
+switchman scan
+```
+
+What a good first run looks like:
+- all three tasks end in `done`
+- `switchman scan` reports no conflicts
+- `switchman gate ci` passes
+
+### 6. If you want a built-in local demo instead
+
+```bash
+bash examples/setup.sh
+bash examples/walkthrough.sh
+```
+
+That runs the included 3-agent demo against the example API in [examples/README.md](/Users/ned/Documents/GitHub/switchman/examples/README.md).
+
+---
+
 ## Pick your setup
 
 ### Option A — Claude Code (recommended)
@@ -159,6 +233,67 @@ switchman status
 
 ---
 
+## If something goes wrong
+
+Start here before digging into the internals.
+
+### `switchman status`
+
+Use this first when a run feels stuck.
+
+It answers:
+- what is running
+- what is blocked
+- what failed
+- what needs attention next
+
+### `switchman scan`
+
+Use this before merge, or any time you suspect agents overlapped.
+
+It tells you:
+- changed files per worktree
+- unclaimed or unmanaged changes
+- conflict signals across worktrees
+
+### `switchman gate ci`
+
+Use this as the final repo-level check.
+
+```bash
+switchman gate ci
+```
+
+If it fails, Switchman has detected unmanaged changes, stale state, or merge-governance problems.
+
+### Common recovery cases
+
+`A file claim is blocked`
+- another task already owns that file
+- do not use `--force`
+- choose a different file or let the other task finish first
+
+`A task is still in progress but the agent is gone`
+- inspect with `switchman status`
+- if the lease is stale, run:
+
+```bash
+switchman lease reap
+```
+
+`A pipeline task failed`
+- run:
+
+```bash
+switchman pipeline status <pipelineId>
+```
+
+Switchman now prints:
+- `why:` what failed
+- `next:` what to do next
+
+---
+
 ## Commands
 
 ### `switchman setup`
@@ -215,7 +350,7 @@ Check all worktrees for conflicts — both uncommitted file overlaps and branch-
 By default, common generated paths such as `node_modules/`, `dist/`, `build/`, and `coverage/` are ignored.
 
 ### `switchman status`
-Full overview: task counts, active leases, stale leases, locked files, and a quick conflict scan.
+Full overview: task counts, active leases, stale leases, locked files, a quick conflict scan, and readable failure explanations.
 
 ### `switchman worktree list`
 List all git worktrees with their registered agents and status.
@@ -228,6 +363,24 @@ Re-sync git worktrees into the Switchman database (useful if you add worktrees a
 ## Pipelines and PRs
 
 Switchman can now take a backlog item through planning, governed execution, review, and PR handoff.
+
+### Happy-path pipeline flow
+
+```bash
+switchman pipeline start "Harden auth API permissions" \
+  --description "Update login permissions for the public API and add migration checks"
+
+switchman pipeline exec pipe-123 "/path/to/your-agent-command"
+switchman pipeline status pipe-123
+switchman pipeline pr pipe-123
+switchman pipeline publish pipe-123 --base main --draft
+```
+
+The intended operator loop is:
+1. start the pipeline
+2. run it
+3. inspect `pipeline status` if anything blocks
+4. review the PR artifact or publish the PR
 
 ### Create a pipeline from one issue
 

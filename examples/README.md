@@ -25,6 +25,8 @@ examples/
 
 ## Quick start
 
+This is the fastest way to understand Switchman as a new user.
+
 Make sure Switchman is installed globally first:
 ```bash
 npm install -g .   # from the switchman repo root
@@ -36,16 +38,28 @@ bash examples/setup.sh
 bash examples/walkthrough.sh
 ```
 
+If you want the shortest path:
+- `setup.sh` creates the repo, worktrees, and seed tasks
+- `walkthrough.sh` shows one complete 3-agent happy path, including a real claim conflict
+
 ## What the walkthrough shows
 
 1. **3 worktrees created** — simulating 3 parallel Claude Code instances each on their own branch
-2. **Agent 1 picks up a task** — `switchman task next` returns the highest-priority item
+2. **Agent 1 picks up a task** — `switchman lease next` returns the highest-priority item and lease
 3. **Agent 1 claims files** — declares which files it will edit before touching them
 4. **Agent 2 picks up a task** — takes the next item from the queue
 5. **Agent 2 tries to claim a conflicting file** — Switchman blocks it
 6. **Agent 2 adapts** — claims only the safe files instead
 7. **Agent 1 finishes** — marks task done, releases file claims
-8. **Final status** — queue updated, no lingering conflicts
+8. **Final status** — queue updated, readable status output, no lingering conflicts
+
+## What a good demo run looks like
+
+At the end of the walkthrough, you want to see:
+- tasks moving from `pending` -> `in_progress` -> `done`
+- one agent blocked from claiming a file already owned by another
+- `switchman scan` showing no unclaimed changes
+- `switchman status` giving a clean overview of what happened
 
 ## The taskapi project
 

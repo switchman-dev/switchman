@@ -2,7 +2,7 @@
 # examples/walkthrough.sh
 #
 # Walks through the Switchman workflow step by step.
-# Simulates 3 agents working in parallel — including a real conflict.
+# Simulates 3 agents working in parallel, including a real file-claim conflict.
 #
 # Run AFTER setup.sh:
 #   bash examples/walkthrough.sh
@@ -51,11 +51,11 @@ read -r
 # ── Step 2: Agent 1 picks up a task ──────────────────────────────────────────
 
 step "2. Agent 1 picks up the highest-priority task"
-agent "agent-rate-limiting" "calling: switchman task next --json"
+agent "agent-rate-limiting" "calling: switchman lease next --json"
 echo ""
 
-TASK1=$(switchman task next --json 2>/dev/null || echo "null")
-TASK1_ID=$(echo "$TASK1" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'])" 2>/dev/null || echo "")
+TASK1=$(switchman lease next --json --worktree agent-rate-limiting --agent claude-code 2>/dev/null || echo "null")
+TASK1_ID=$(echo "$TASK1" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['task']['id'])" 2>/dev/null || echo "")
 
 if [ -z "$TASK1_ID" ]; then
   echo "  No pending tasks found. Run setup.sh first."
@@ -63,9 +63,7 @@ if [ -z "$TASK1_ID" ]; then
 fi
 
 echo "$TASK1" | python3 -m json.tool 2>/dev/null || echo "$TASK1"
-echo ""
-switchman task assign "$TASK1_ID" agent-rate-limiting --agent claude-code
-ok "Task assigned to agent-rate-limiting"
+ok "Task + lease assigned to agent-rate-limiting"
 
 read -r
 
@@ -86,14 +84,12 @@ read -r
 # ── Step 4: Agent 2 picks up a task ──────────────────────────────────────────
 
 step "4. Agent 2 picks up the next task"
-agent "agent-validation" "calling: switchman task next --json"
+agent "agent-validation" "calling: switchman lease next --json"
 echo ""
 
-TASK2=$(switchman task next --json 2>/dev/null || echo "null")
-TASK2_ID=$(echo "$TASK2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['id'])" 2>/dev/null || echo "")
-
-switchman task assign "$TASK2_ID" agent-validation --agent cursor
-ok "Task assigned to agent-validation"
+TASK2=$(switchman lease next --json --worktree agent-validation --agent claude-code 2>/dev/null || echo "null")
+TASK2_ID=$(echo "$TASK2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['task']['id'])" 2>/dev/null || echo "")
+ok "Task + lease assigned to agent-validation"
 
 read -r
 
@@ -145,7 +141,7 @@ step "8. Agent 1 finishes — marks task done and releases files"
 agent "agent-rate-limiting" "Rate limiting implemented and committed."
 echo ""
 
-switchman task done "$TASK1_ID" --release-files
+switchman task done "$TASK1_ID"
 ok "Task done. src/middleware/auth.js and src/server.js are now free."
 
 read -r
@@ -161,11 +157,11 @@ echo ""
 echo -e "${GREEN}✓ Walkthrough complete.${RESET}"
 echo ""
 echo "What you saw:"
-echo "  • 2 agents picked up tasks from the shared queue"
+echo "  • 2 agents picked up tasks from the shared queue with real leases"
 echo "  • Agent 2 was blocked from claiming a file already owned by Agent 1"
 echo "  • Agent 2 adapted by claiming different files"
 echo "  • Agent 1 completed and released its claims"
-echo "  • The queue updated in real time throughout"
+echo "  • switchman status and switchman scan stayed readable throughout"
 echo ""
 echo "To reset and run again:"
 echo "  bash examples/teardown.sh && bash examples/setup.sh"
