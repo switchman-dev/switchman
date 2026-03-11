@@ -34,6 +34,7 @@ import {
 import { scanAllWorktrees } from '../core/detector.js';
 import { upsertProjectMcpConfig } from '../core/mcp.js';
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
+import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
 
 function installMcpConfig(targetDirs) {
@@ -1128,6 +1129,52 @@ gateCmd
     }
 
     if (!ok) process.exitCode = 1;
+  });
+
+gateCmd
+  .command('ai')
+  .description('Run the AI-style merge gate to assess semantic integration risk across worktrees')
+  .option('--json', 'Output raw JSON')
+  .action(async (opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = await runAiMergeGate(db, repoRoot);
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      const badge = result.status === 'pass'
+        ? chalk.green('PASS')
+        : result.status === 'warn'
+          ? chalk.yellow('WARN')
+          : chalk.red('BLOCK');
+      console.log(`${badge} ${result.summary}`);
+
+      const riskyPairs = result.pairs.filter((pair) => pair.status !== 'pass');
+      if (riskyPairs.length > 0) {
+        console.log(chalk.bold('  Risky pairs:'));
+        for (const pair of riskyPairs) {
+          console.log(`    ${chalk.cyan(pair.worktree_a)} ${chalk.dim('vs')} ${chalk.cyan(pair.worktree_b)} ${chalk.dim(pair.status)} ${chalk.dim(`score=${pair.score}`)}`);
+          for (const reason of pair.reasons.slice(0, 3)) {
+            console.log(`      ${chalk.yellow(reason)}`);
+          }
+        }
+      }
+
+      const riskyWorktrees = result.worktrees.filter((worktree) => worktree.findings.length > 0);
+      if (riskyWorktrees.length > 0) {
+        console.log(chalk.bold('  Worktree signals:'));
+        for (const worktree of riskyWorktrees) {
+          console.log(`    ${chalk.cyan(worktree.worktree)} ${chalk.dim(`score=${worktree.score}`)}`);
+          for (const finding of worktree.findings.slice(0, 2)) {
+            console.log(`      ${chalk.yellow(finding)}`);
+          }
+        }
+      }
+    }
+
+    if (result.status === 'blocked') process.exitCode = 1;
   });
 
 // ── monitor ──────────────────────────────────────────────────────────────────

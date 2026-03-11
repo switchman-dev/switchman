@@ -1022,6 +1022,99 @@ test('Fix 24: process liveness helper detects running and exited processes', () 
   assert(!isProcessRunning(pid), 'Liveness helper returns false after the process exits');
 });
 
+test('Fix 25: AI merge gate blocks high-risk overlapping subsystem changes', () => {
+  const repoDir = join(tmpdir(), `sw-ai-gate-block-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const featureA = join(tmpdir(), `sw-ai-gate-a-${Date.now()}`);
+  const featureB = join(tmpdir(), `sw-ai-gate-b-${Date.now()}`);
+  execSync(`git worktree add -b feature-auth-a "${featureA}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature-auth-b "${featureB}"`, { cwd: repoDir });
+
+  execSync('mkdir -p src/auth && printf "one\\n" > src/auth/login.js', { cwd: featureA, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "two\\n" > src/auth/session.js', { cwd: featureB, shell: '/bin/zsh' });
+
+  const gateDb = initDb(repoDir);
+  registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(gateDb, { name: featureA.split('/').pop(), path: featureA, branch: 'feature-auth-a' });
+  registerWorktree(gateDb, { name: featureB.split('/').pop(), path: featureB, branch: 'feature-auth-b' });
+  const taskA = createTask(gateDb, { title: 'Auth A' });
+  const taskB = createTask(gateDb, { title: 'Auth B' });
+  assignTask(gateDb, taskA, featureA.split('/').pop());
+  assignTask(gateDb, taskB, featureB.split('/').pop());
+  claimFiles(gateDb, taskA, featureA.split('/').pop(), ['src/auth/login.js']);
+  claimFiles(gateDb, taskB, featureB.split('/').pop(), ['src/auth/session.js']);
+  gateDb.close();
+  let stdout = '';
+  try {
+    stdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ai', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    stdout = String(err.stdout || '');
+  }
+  const result = JSON.parse(stdout);
+
+  assert(result.status === 'blocked', 'AI merge gate blocks overlapping high-risk subsystem changes');
+  assert(result.pairs.some((pair) =>
+    pair.status === 'blocked'
+    && pair.shared_areas.includes('src/auth')
+    && pair.shared_risk_tags.includes('auth'),
+  ), 'Blocked pair identifies shared auth subsystem risk');
+  execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 26: AI merge gate passes isolated worktree changes', () => {
+  const repoDir = join(tmpdir(), `sw-ai-gate-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const featureA = join(tmpdir(), `sw-ai-gate-pass-a-${Date.now()}`);
+  const featureB = join(tmpdir(), `sw-ai-gate-pass-b-${Date.now()}`);
+  execSync(`git worktree add -b feature-ui "${featureA}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature-docs "${featureB}"`, { cwd: repoDir });
+
+  execSync('mkdir -p src/ui && printf "button\\n" > src/ui/button.js', { cwd: featureA, shell: '/bin/zsh' });
+  execSync('printf "docs\\n" > docs.md', { cwd: featureB, shell: '/bin/zsh' });
+
+  const gateDb = initDb(repoDir);
+  registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(gateDb, { name: featureA.split('/').pop(), path: featureA, branch: 'feature-ui' });
+  registerWorktree(gateDb, { name: featureB.split('/').pop(), path: featureB, branch: 'feature-docs' });
+  const taskA = createTask(gateDb, { title: 'UI work' });
+  const taskB = createTask(gateDb, { title: 'Docs work' });
+  assignTask(gateDb, taskA, featureA.split('/').pop());
+  assignTask(gateDb, taskB, featureB.split('/').pop());
+  claimFiles(gateDb, taskA, featureA.split('/').pop(), ['src/ui/button.js']);
+  claimFiles(gateDb, taskB, featureB.split('/').pop(), ['docs.md']);
+  gateDb.close();
+  const result = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ai', '--json'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.status === 'pass', 'AI merge gate passes isolated low-overlap changes');
+  assert(result.pairs.every((pair) => pair.status === 'pass'), 'All pair analyses pass for isolated changes');
+  execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 // ─── Cleanup & Results ────────────────────────────────────────────────────────
 
 if (db) db.close();

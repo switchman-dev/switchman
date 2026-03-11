@@ -41,6 +41,7 @@ import {
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, monitorWorktreesOnce } from '../core/enforcement.js';
+import { runAiMergeGate } from '../core/merge-gate.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -829,6 +830,52 @@ Examples:
       return toolOk(JSON.stringify(result, null, 2), result);
     } catch (err) {
       return toolError(`Scan failed: ${err.message}. Ensure switchman is initialised ('switchman init').`);
+    }
+  },
+);
+
+// ── switchman_merge_gate ──────────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_merge_gate',
+  {
+    title: 'Run AI Merge Gate',
+    description: `Evaluates semantic merge risk across active worktrees using Switchman's local change graph.
+
+This is an AI-style merge gate implemented as a deterministic local reviewer. It combines:
+  1. Existing enforcement signals
+  2. Exact file overlaps and git merge conflicts
+  3. Shared subsystem overlap
+  4. High-risk areas like auth, schema, config, and API changes
+  5. Missing-test signals for source-heavy worktrees
+
+Args:
+  - (none required)
+
+Returns JSON:
+  {
+    "ok": boolean,
+    "status": "pass" | "warn" | "blocked",
+    "summary": string,
+    "worktrees": [{ "worktree": string, "score": number, "findings": string[] }],
+    "pairs": [{ "worktree_a": string, "worktree_b": string, "status": string, "score": number, "reasons": string[] }]
+  }`,
+    inputSchema: z.object({}),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async () => {
+    try {
+      const { repoRoot, db } = getContext();
+      const result = await runAiMergeGate(db, repoRoot);
+      db.close();
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(`AI merge gate failed: ${err.message}. Ensure switchman is initialised ('switchman init').`);
     }
   },
 );
