@@ -10,6 +10,7 @@ import {
   checkMergeConflicts,
 } from './git.js';
 import { filterIgnoredPaths } from './ignore.js';
+import { evaluateRepoCompliance } from './enforcement.js';
 
 /**
  * Scan all worktrees for conflicts.
@@ -21,12 +22,20 @@ export async function scanAllWorktrees(db, repoRoot) {
 
   // Build a unified list, merging db metadata with git reality
   const worktrees = mergeWorktreeInfo(dbWorktrees, gitWorktrees);
+  const enforcement = evaluateRepoCompliance(db, repoRoot, worktrees);
 
   if (worktrees.length < 2) {
     return {
       worktrees,
+      fileMap: {},
       conflicts: [],
       fileConflicts: [],
+      unclaimedChanges: enforcement.unclaimedChanges,
+      worktreeCompliance: enforcement.worktreeCompliance,
+      complianceSummary: enforcement.complianceSummary,
+      deniedWrites: enforcement.deniedWrites,
+      commitGateFailures: enforcement.commitGateFailures,
+      scannedAt: new Date().toISOString(),
       summary: 'Less than 2 worktrees. Nothing to compare.',
     };
   }
@@ -64,13 +73,17 @@ export async function scanAllWorktrees(db, repoRoot) {
   }
 
   const allConflicts = [...branchConflicts];
-
   return {
     worktrees,
     fileMap,
     conflicts: allConflicts,
     fileConflicts,
-    summary: buildSummary(worktrees, allConflicts, fileConflicts),
+    unclaimedChanges: enforcement.unclaimedChanges,
+    worktreeCompliance: enforcement.worktreeCompliance,
+    complianceSummary: enforcement.complianceSummary,
+    deniedWrites: enforcement.deniedWrites,
+    commitGateFailures: enforcement.commitGateFailures,
+    summary: buildSummary(worktrees, allConflicts, fileConflicts, enforcement.unclaimedChanges),
     scannedAt: new Date().toISOString(),
   };
 }
@@ -155,7 +168,7 @@ function getPairs(arr) {
   return pairs;
 }
 
-function buildSummary(worktrees, conflicts, fileConflicts) {
+function buildSummary(worktrees, conflicts, fileConflicts, unclaimedChanges) {
   const lines = [];
   lines.push(`Scanned ${worktrees.length} worktree(s)`);
 
@@ -167,6 +180,9 @@ function buildSummary(worktrees, conflicts, fileConflicts) {
     }
     if (fileConflicts.length > 0) {
       lines.push(`⚠ ${fileConflicts.length} file(s) being edited in multiple worktrees`);
+    }
+    if (unclaimedChanges.length > 0) {
+      lines.push(`⚠ ${unclaimedChanges.length} worktree(s) have unclaimed changed files`);
     }
   }
 

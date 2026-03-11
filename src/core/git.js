@@ -4,9 +4,17 @@
  */
 
 import { execSync, spawnSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { join, relative, resolve, basename } from 'path';
 import { filterIgnoredPaths } from './ignore.js';
+
+function normalizeFsPath(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
 
 /**
  * Find the switchman database root from cwd or a given path.
@@ -56,12 +64,26 @@ export function findRepoRoot(startPath = process.cwd()) {
   }
 }
 
+export function getGitCommonDir(startPath = process.cwd()) {
+  try {
+    const commonDir = execSync('git rev-parse --git-common-dir', {
+      cwd: startPath,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    return resolve(startPath, commonDir);
+  } catch {
+    throw new Error('Not inside a git repository. Run switchman from inside a git repo.');
+  }
+}
+
 /**
  * List all git worktrees for this repo
  * Returns: [{ name, path, branch, isMain, HEAD }]
  */
 export function listGitWorktrees(repoRoot) {
   try {
+    const normalizedRepoRoot = normalizeFsPath(repoRoot);
     const output = execSync('git worktree list --porcelain', {
       cwd: repoRoot,
       encoding: 'utf8',
@@ -84,8 +106,9 @@ export function listGitWorktrees(repoRoot) {
       }
 
       if (wt.path) {
-        wt.name = wt.path === repoRoot ? 'main' : wt.path.split('/').pop();
-        wt.isMain = wt.path === repoRoot;
+        const normalizedPath = normalizeFsPath(wt.path);
+        wt.name = normalizedPath === normalizedRepoRoot ? 'main' : wt.path.split('/').pop();
+        wt.isMain = normalizedPath === normalizedRepoRoot;
         worktrees.push(wt);
       }
     }
@@ -94,6 +117,12 @@ export function listGitWorktrees(repoRoot) {
   } catch {
     return [];
   }
+}
+
+export function getCurrentWorktree(repoRoot, startPath = process.cwd()) {
+  const currentPath = normalizeFsPath(startPath);
+  const worktrees = listGitWorktrees(repoRoot);
+  return worktrees.find((wt) => normalizeFsPath(wt.path) === currentPath) || null;
 }
 
 /**

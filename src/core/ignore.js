@@ -28,7 +28,7 @@ function patternPrefix(pattern) {
   return normalizePath(pattern).replace(/\/\*\*$/, '');
 }
 
-export function isIgnoredPath(filePath, patterns = DEFAULT_SCAN_IGNORE_PATTERNS) {
+export function matchesPathPatterns(filePath, patterns = DEFAULT_SCAN_IGNORE_PATTERNS) {
   const normalized = normalizePath(filePath);
   if (!normalized) return false;
 
@@ -36,6 +36,10 @@ export function isIgnoredPath(filePath, patterns = DEFAULT_SCAN_IGNORE_PATTERNS)
     const prefix = patternPrefix(pattern);
     return normalized === prefix || normalized.startsWith(`${prefix}/`) || normalized.includes(`/${prefix}/`);
   });
+}
+
+export function isIgnoredPath(filePath, patterns = DEFAULT_SCAN_IGNORE_PATTERNS) {
+  return matchesPathPatterns(filePath, patterns);
 }
 
 export function filterIgnoredPaths(filePaths, patterns = DEFAULT_SCAN_IGNORE_PATTERNS) {

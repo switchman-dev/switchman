@@ -40,6 +40,7 @@ import {
   listWorktrees,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
+import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, monitorWorktreesOnce } from '../core/enforcement.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -322,6 +323,273 @@ Examples:
   },
 );
 
+// ── switchman_write_file ──────────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_write_file',
+  {
+    title: 'Write File Through Switchman',
+    description: `Replaces a file's contents through the Switchman write gateway.
+
+Use this instead of direct filesystem writes when the agent is running in managed mode. The target path must already be claimed by the active lease.
+
+Args:
+  - lease_id (string): Active lease ID returned by switchman_task_next
+  - path (string): Target file path, relative to repo root
+  - content (string): Full replacement content
+  - worktree (string, optional): Expected worktree name for extra validation
+
+Returns JSON:
+  {
+    "ok": boolean,
+    "file_path": string,
+    "lease_id": string,
+    "bytes_written": number
+  }`,
+    inputSchema: z.object({
+      lease_id: z.string().min(1).describe('Active lease ID returned by switchman_task_next'),
+      path: z.string().min(1).describe('Target file path relative to repo root'),
+      content: z.string().describe('Full replacement content'),
+      worktree: z.string().optional().describe('Optional worktree name for validation'),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ lease_id, path, content, worktree }) => {
+    try {
+      const { repoRoot, db } = getContext();
+      const result = gatewayWriteFile(db, repoRoot, {
+        leaseId: lease_id,
+        path,
+        content,
+        worktree: worktree ?? null,
+      });
+      db.close();
+
+      if (!result.ok) {
+        return toolError(`Write denied for ${result.file_path ?? path}: ${result.reason_code}.`);
+      }
+
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(err.message);
+    }
+  },
+);
+
+// ── switchman_remove_path ─────────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_remove_path',
+  {
+    title: 'Remove Path Through Switchman',
+    description: `Removes a file or directory through the Switchman write gateway.
+
+Use this instead of direct filesystem deletion when the agent is running in managed mode. The target path must already be claimed by the active lease.
+
+Args:
+  - lease_id (string): Active lease ID returned by switchman_task_next
+  - path (string): Target file or directory path, relative to repo root
+  - worktree (string, optional): Expected worktree name for extra validation
+
+Returns JSON:
+  {
+    "ok": boolean,
+    "file_path": string,
+    "lease_id": string,
+    "removed": true
+  }`,
+    inputSchema: z.object({
+      lease_id: z.string().min(1).describe('Active lease ID returned by switchman_task_next'),
+      path: z.string().min(1).describe('Target path relative to repo root'),
+      worktree: z.string().optional().describe('Optional worktree name for validation'),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ lease_id, path, worktree }) => {
+    try {
+      const { repoRoot, db } = getContext();
+      const result = gatewayRemovePath(db, repoRoot, {
+        leaseId: lease_id,
+        path,
+        worktree: worktree ?? null,
+      });
+      db.close();
+
+      if (!result.ok) {
+        return toolError(`Remove denied for ${result.file_path ?? path}: ${result.reason_code}.`);
+      }
+
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(err.message);
+    }
+  },
+);
+
+// ── switchman_append_file ─────────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_append_file',
+  {
+    title: 'Append File Through Switchman',
+    description: `Appends content to a claimed file through the Switchman write gateway.`,
+    inputSchema: z.object({
+      lease_id: z.string().min(1).describe('Active lease ID returned by switchman_task_next'),
+      path: z.string().min(1).describe('Target file path relative to repo root'),
+      content: z.string().describe('Content to append'),
+      worktree: z.string().optional().describe('Optional worktree name for validation'),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ lease_id, path, content, worktree }) => {
+    try {
+      const { repoRoot, db } = getContext();
+      const result = gatewayAppendFile(db, repoRoot, {
+        leaseId: lease_id,
+        path,
+        content,
+        worktree: worktree ?? null,
+      });
+      db.close();
+
+      if (!result.ok) {
+        return toolError(`Append denied for ${result.file_path ?? path}: ${result.reason_code}.`);
+      }
+
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(err.message);
+    }
+  },
+);
+
+// ── switchman_move_path ───────────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_move_path',
+  {
+    title: 'Move Path Through Switchman',
+    description: `Moves a claimed file to another claimed path through the Switchman write gateway.`,
+    inputSchema: z.object({
+      lease_id: z.string().min(1).describe('Active lease ID returned by switchman_task_next'),
+      source_path: z.string().min(1).describe('Source file path relative to repo root'),
+      destination_path: z.string().min(1).describe('Destination file path relative to repo root'),
+      worktree: z.string().optional().describe('Optional worktree name for validation'),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async ({ lease_id, source_path, destination_path, worktree }) => {
+    try {
+      const { repoRoot, db } = getContext();
+      const result = gatewayMovePath(db, repoRoot, {
+        leaseId: lease_id,
+        sourcePath: source_path,
+        destinationPath: destination_path,
+        worktree: worktree ?? null,
+      });
+      db.close();
+
+      if (!result.ok) {
+        return toolError(`Move denied for ${result.file_path ?? destination_path}: ${result.reason_code}.`);
+      }
+
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(err.message);
+    }
+  },
+);
+
+// ── switchman_make_directory ──────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_make_directory',
+  {
+    title: 'Create Directory Through Switchman',
+    description: `Creates a directory through the Switchman write gateway when it is part of a claimed destination path.`,
+    inputSchema: z.object({
+      lease_id: z.string().min(1).describe('Active lease ID returned by switchman_task_next'),
+      path: z.string().min(1).describe('Directory path relative to repo root'),
+      worktree: z.string().optional().describe('Optional worktree name for validation'),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ lease_id, path, worktree }) => {
+    try {
+      const { repoRoot, db } = getContext();
+      const result = gatewayMakeDirectory(db, repoRoot, {
+        leaseId: lease_id,
+        path,
+        worktree: worktree ?? null,
+      });
+      db.close();
+
+      if (!result.ok) {
+        return toolError(`Mkdir denied for ${result.file_path ?? path}: ${result.reason_code}.`);
+      }
+
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(err.message);
+    }
+  },
+);
+
+// ── switchman_monitor_once ────────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_monitor_once',
+  {
+    title: 'Observe Runtime File Changes Once',
+    description: `Runs one filesystem monitoring pass across all registered worktrees.
+
+This compares the current worktree file state against the previous Switchman snapshot, logs observed mutations, and classifies them as allowed or denied based on the active lease and claims.`,
+    inputSchema: z.object({}),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+  },
+  async () => {
+    try {
+      const { repoRoot, db } = getContext();
+      const worktrees = listWorktrees(db);
+      const result = monitorWorktreesOnce(db, repoRoot, worktrees);
+      db.close();
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(err.message);
+    }
+  },
+);
+
 // ── switchman_task_done ────────────────────────────────────────────────────────
 
 server.registerTool(
@@ -542,8 +810,10 @@ Examples:
           name: wt.name,
           branch: wt.branch ?? 'unknown',
           changed_files: (report.fileMap?.[wt.name] ?? []).length,
+          compliance_state: report.worktreeCompliance?.find((entry) => entry.worktree === wt.name)?.compliance_state ?? wt.compliance_state ?? 'observed',
         })),
         file_conflicts: report.fileConflicts,
+        unclaimed_changes: report.unclaimedChanges,
         branch_conflicts: report.conflicts.map((c) => ({
           type: c.type,
           worktree_a: c.worktreeA,
@@ -552,7 +822,8 @@ Examples:
           branch_b: c.branchB,
           conflicting_files: c.conflictingFiles,
         })),
-        safe_to_proceed: report.conflicts.length === 0 && report.fileConflicts.length === 0,
+        compliance_summary: report.complianceSummary,
+        safe_to_proceed: report.conflicts.length === 0 && report.fileConflicts.length === 0 && report.unclaimedChanges.length === 0,
         summary: report.summary,
       };
       return toolOk(JSON.stringify(result, null, 2), result);
@@ -677,6 +948,8 @@ Returns JSON:
           branch: wt.branch,
           agent: wt.agent ?? null,
           status: wt.status,
+          enforcement_mode: wt.enforcement_mode ?? 'observed',
+          compliance_state: wt.compliance_state ?? 'observed',
           active_lease_id: activeLeaseByWorktree.get(wt.name)?.id ?? null,
         })),
         repo_root: repoRoot,

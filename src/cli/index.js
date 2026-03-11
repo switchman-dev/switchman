@@ -20,7 +20,7 @@ import { program } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { join } from 'path';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 
 import { findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.js';
 import {
@@ -33,6 +33,8 @@ import {
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { upsertProjectMcpConfig } from '../core/mcp.js';
+import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
+import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
 
 function installMcpConfig(targetDirs) {
   return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
@@ -69,6 +71,10 @@ function statusBadge(status) {
     expired: chalk.red,
     idle: chalk.gray,
     busy: chalk.blue,
+    managed: chalk.green,
+    observed: chalk.yellow,
+    non_compliant: chalk.red,
+    stale: chalk.red,
   };
   return (colors[status] || chalk.white)(status.toUpperCase().padEnd(11));
 }
@@ -569,7 +575,8 @@ wtCmd
       const dbInfo = worktrees.find(d => d.path === wt.path);
       const agent = dbInfo?.agent ? chalk.cyan(dbInfo.agent) : chalk.dim('no agent');
       const status = dbInfo?.status ? statusBadge(dbInfo.status) : chalk.dim('unregistered');
-      console.log(`  ${chalk.bold(wt.name.padEnd(20))} ${status} branch: ${chalk.cyan(wt.branch || 'unknown')}  agent: ${agent}`);
+      const compliance = dbInfo?.compliance_state ? statusBadge(dbInfo.compliance_state) : chalk.dim('unknown');
+      console.log(`  ${chalk.bold(wt.name.padEnd(20))} ${status} ${compliance} branch: ${chalk.cyan(wt.branch || 'unknown')}  agent: ${agent}`);
       console.log(`    ${chalk.dim(wt.path)}`);
     }
     console.log('');
@@ -639,6 +646,153 @@ program
     console.log(`${chalk.green('✓')} Released all claims for task ${chalk.cyan(taskId)}`);
   });
 
+program
+  .command('write <leaseId> <path>')
+  .description('Write a file through the Switchman enforcement gateway')
+  .requiredOption('--text <content>', 'Replacement file content')
+  .option('--worktree <name>', 'Expected worktree for lease validation')
+  .action((leaseId, path, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = gatewayWriteFile(db, repoRoot, {
+      leaseId,
+      path,
+      content: opts.text,
+      worktree: opts.worktree || null,
+    });
+    db.close();
+
+    if (!result.ok) {
+      console.log(chalk.red(`✗ Write denied for ${chalk.cyan(result.file_path || path)} ${chalk.dim(result.reason_code)}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Wrote ${chalk.cyan(result.file_path)} via lease ${chalk.dim(result.lease_id)}`);
+  });
+
+program
+  .command('rm <leaseId> <path>')
+  .description('Remove a file or directory through the Switchman enforcement gateway')
+  .option('--worktree <name>', 'Expected worktree for lease validation')
+  .action((leaseId, path, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = gatewayRemovePath(db, repoRoot, {
+      leaseId,
+      path,
+      worktree: opts.worktree || null,
+    });
+    db.close();
+
+    if (!result.ok) {
+      console.log(chalk.red(`✗ Remove denied for ${chalk.cyan(result.file_path || path)} ${chalk.dim(result.reason_code)}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Removed ${chalk.cyan(result.file_path)} via lease ${chalk.dim(result.lease_id)}`);
+  });
+
+program
+  .command('append <leaseId> <path>')
+  .description('Append to a file through the Switchman enforcement gateway')
+  .requiredOption('--text <content>', 'Content to append')
+  .option('--worktree <name>', 'Expected worktree for lease validation')
+  .action((leaseId, path, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = gatewayAppendFile(db, repoRoot, {
+      leaseId,
+      path,
+      content: opts.text,
+      worktree: opts.worktree || null,
+    });
+    db.close();
+
+    if (!result.ok) {
+      console.log(chalk.red(`✗ Append denied for ${chalk.cyan(result.file_path || path)} ${chalk.dim(result.reason_code)}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Appended to ${chalk.cyan(result.file_path)} via lease ${chalk.dim(result.lease_id)}`);
+  });
+
+program
+  .command('mv <leaseId> <sourcePath> <destinationPath>')
+  .description('Move a file through the Switchman enforcement gateway')
+  .option('--worktree <name>', 'Expected worktree for lease validation')
+  .action((leaseId, sourcePath, destinationPath, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = gatewayMovePath(db, repoRoot, {
+      leaseId,
+      sourcePath,
+      destinationPath,
+      worktree: opts.worktree || null,
+    });
+    db.close();
+
+    if (!result.ok) {
+      console.log(chalk.red(`✗ Move denied for ${chalk.cyan(result.file_path || destinationPath)} ${chalk.dim(result.reason_code)}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Moved ${chalk.cyan(result.source_path)} → ${chalk.cyan(result.file_path)} via lease ${chalk.dim(result.lease_id)}`);
+  });
+
+program
+  .command('mkdir <leaseId> <path>')
+  .description('Create a directory through the Switchman enforcement gateway')
+  .option('--worktree <name>', 'Expected worktree for lease validation')
+  .action((leaseId, path, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = gatewayMakeDirectory(db, repoRoot, {
+      leaseId,
+      path,
+      worktree: opts.worktree || null,
+    });
+    db.close();
+
+    if (!result.ok) {
+      console.log(chalk.red(`✗ Mkdir denied for ${chalk.cyan(result.file_path || path)} ${chalk.dim(result.reason_code)}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Created ${chalk.cyan(result.file_path)} via lease ${chalk.dim(result.lease_id)}`);
+  });
+
+program
+  .command('wrap <leaseId> <command...>')
+  .description('Launch a CLI tool under an active Switchman lease with enforcement context env vars')
+  .option('--worktree <name>', 'Expected worktree for lease validation')
+  .option('--cwd <path>', 'Override working directory for the wrapped command')
+  .action((leaseId, commandParts, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const [command, ...args] = commandParts;
+    const result = runWrappedCommand(db, repoRoot, {
+      leaseId,
+      command,
+      args,
+      worktree: opts.worktree || null,
+      cwd: opts.cwd || null,
+    });
+    db.close();
+
+    if (!result.ok) {
+      console.log(chalk.red(`✗ Wrapped command denied ${chalk.dim(result.reason_code || 'wrapped_command_failed')}`));
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Wrapped command completed under lease ${chalk.dim(result.lease_id)}`);
+  });
+
 // ── scan ───────────────────────────────────────────────────────────────────────
 
 program
@@ -671,7 +825,8 @@ program
         console.log(chalk.bold('Worktrees:'));
         for (const wt of report.worktrees) {
           const files = report.fileMap?.[wt.name] || [];
-          console.log(`  ${chalk.cyan(wt.name.padEnd(20))} branch: ${(wt.branch || 'unknown').padEnd(30)} ${chalk.dim(files.length + ' changed file(s)')}`);
+          const compliance = report.worktreeCompliance?.find((entry) => entry.worktree === wt.name)?.compliance_state || wt.compliance_state || 'observed';
+          console.log(`  ${chalk.cyan(wt.name.padEnd(20))} ${statusBadge(compliance)} branch: ${(wt.branch || 'unknown').padEnd(30)} ${chalk.dim(files.length + ' changed file(s)')}`);
         }
         console.log('');
       }
@@ -701,8 +856,20 @@ program
         console.log('');
       }
 
+      if (report.unclaimedChanges.length > 0) {
+        console.log(chalk.red(`✗ Unclaimed or unmanaged changed files detected:`));
+        for (const entry of report.unclaimedChanges) {
+          console.log(`  ${chalk.cyan(entry.worktree)} ${chalk.dim(entry.lease_id || 'no active lease')}`);
+          entry.files.forEach((file) => {
+            const reason = entry.reasons.find((item) => item.file === file)?.reason_code || 'path_not_claimed';
+            console.log(`    ${chalk.yellow(file)} ${chalk.dim(reason)}`);
+          });
+        }
+        console.log('');
+      }
+
       // All clear
-      if (report.conflicts.length === 0 && report.fileConflicts.length === 0) {
+      if (report.conflicts.length === 0 && report.fileConflicts.length === 0 && report.unclaimedChanges.length === 0) {
         console.log(chalk.green(`✓ No conflicts detected across ${report.worktrees.length} worktree(s)`));
       }
 
@@ -795,11 +962,42 @@ program
       const report = await scanAllWorktrees(db, repoRoot);
       spinner.stop();
 
-      const totalConflicts = report.conflicts.length + report.fileConflicts.length;
+      const totalConflicts = report.conflicts.length + report.fileConflicts.length + report.unclaimedChanges.length;
       if (totalConflicts === 0) {
         console.log(chalk.green(`✓ No conflicts across ${report.worktrees.length} worktree(s)`));
       } else {
         console.log(chalk.red(`⚠ ${totalConflicts} conflict(s) detected — run 'switchman scan' for details`));
+      }
+
+      console.log('');
+      console.log(chalk.bold('Compliance:'));
+      console.log(`  ${chalk.green('Managed')}       ${report.complianceSummary.managed}`);
+      console.log(`  ${chalk.yellow('Observed')}      ${report.complianceSummary.observed}`);
+      console.log(`  ${chalk.red('Non-Compliant')} ${report.complianceSummary.non_compliant}`);
+      console.log(`  ${chalk.red('Stale')}         ${report.complianceSummary.stale}`);
+
+      if (report.unclaimedChanges.length > 0) {
+        console.log('');
+        console.log(chalk.bold('Unclaimed Changed Paths:'));
+        for (const entry of report.unclaimedChanges) {
+          console.log(`  ${chalk.cyan(entry.worktree)}: ${entry.files.slice(0, 5).join(', ')}${entry.files.length > 5 ? ` +${entry.files.length - 5} more` : ''}`);
+        }
+      }
+
+      if (report.commitGateFailures.length > 0) {
+        console.log('');
+        console.log(chalk.bold('Recent Commit Gate Failures:'));
+        for (const failure of report.commitGateFailures.slice(0, 5)) {
+          console.log(`  ${chalk.red(failure.worktree || 'unknown')} ${chalk.dim(failure.reason_code || 'rejected')} ${chalk.dim(failure.created_at)}`);
+        }
+      }
+
+      if (report.deniedWrites.length > 0) {
+        console.log('');
+        console.log(chalk.bold('Recent Denied Events:'));
+        for (const event of report.deniedWrites.slice(0, 5)) {
+          console.log(`  ${chalk.red(event.event_type)} ${chalk.cyan(event.worktree || 'repo')} ${chalk.dim(event.reason_code || event.status)}`);
+        }
       }
     } catch {
       spinner.stop();
@@ -810,6 +1008,318 @@ program
     console.log('');
     console.log(chalk.dim('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
     console.log('');
+  });
+
+// ── gate ─────────────────────────────────────────────────────────────────────
+
+const gateCmd = program.command('gate').description('Enforcement and commit-gate helpers');
+
+gateCmd
+  .command('commit')
+  .description('Validate current worktree changes against the active lease and claims')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = runCommitGate(db, repoRoot);
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else if (result.ok) {
+      console.log(`${chalk.green('✓')} ${result.summary}`);
+    } else {
+      console.log(chalk.red(`✗ ${result.summary}`));
+      for (const violation of result.violations) {
+        const label = violation.file || '(worktree)';
+        console.log(`  ${chalk.yellow(label)} ${chalk.dim(violation.reason_code)}`);
+      }
+    }
+
+    if (!result.ok) process.exitCode = 1;
+  });
+
+gateCmd
+  .command('merge')
+  .description('Validate current worktree changes before recording a merge commit')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = runCommitGate(db, repoRoot);
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else if (result.ok) {
+      console.log(`${chalk.green('✓')} Merge gate passed for ${chalk.cyan(result.worktree || 'current worktree')}.`);
+    } else {
+      console.log(chalk.red(`✗ Merge gate rejected changes in ${chalk.cyan(result.worktree || 'current worktree')}.`));
+      for (const violation of result.violations) {
+        const label = violation.file || '(worktree)';
+        console.log(`  ${chalk.yellow(label)} ${chalk.dim(violation.reason_code)}`);
+      }
+    }
+
+    if (!result.ok) process.exitCode = 1;
+  });
+
+gateCmd
+  .command('install')
+  .description('Install git hooks that run the Switchman commit and merge gates')
+  .action(() => {
+    const repoRoot = getRepo();
+    const hookPaths = installGateHooks(repoRoot);
+    console.log(`${chalk.green('✓')} Installed pre-commit hook at ${chalk.cyan(hookPaths.pre_commit)}`);
+    console.log(`${chalk.green('✓')} Installed pre-merge-commit hook at ${chalk.cyan(hookPaths.pre_merge_commit)}`);
+  });
+
+gateCmd
+  .command('ci')
+  .description('Run a repo-level enforcement gate suitable for CI, merges, or PR validation')
+  .option('--json', 'Output raw JSON')
+  .action(async (opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const report = await scanAllWorktrees(db, repoRoot);
+    db.close();
+
+    const ok = report.conflicts.length === 0
+      && report.fileConflicts.length === 0
+      && report.unclaimedChanges.length === 0
+      && report.complianceSummary.non_compliant === 0
+      && report.complianceSummary.stale === 0;
+
+    const result = {
+      ok,
+      summary: ok
+        ? `Repo gate passed for ${report.worktrees.length} worktree(s).`
+        : 'Repo gate rejected unmanaged changes, stale leases, or worktree conflicts.',
+      compliance: report.complianceSummary,
+      unclaimed_changes: report.unclaimedChanges,
+      file_conflicts: report.fileConflicts,
+      branch_conflicts: report.conflicts,
+    };
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else if (ok) {
+      console.log(`${chalk.green('✓')} ${result.summary}`);
+    } else {
+      console.log(chalk.red(`✗ ${result.summary}`));
+      if (result.unclaimed_changes.length > 0) {
+        console.log(chalk.bold('  Unclaimed changes:'));
+        for (const entry of result.unclaimed_changes) {
+          console.log(`    ${chalk.cyan(entry.worktree)}: ${entry.files.join(', ')}`);
+        }
+      }
+      if (result.file_conflicts.length > 0) {
+        console.log(chalk.bold('  File conflicts:'));
+        for (const conflict of result.file_conflicts) {
+          console.log(`    ${chalk.yellow(conflict.file)} ${chalk.dim(conflict.worktrees.join(', '))}`);
+        }
+      }
+      if (result.branch_conflicts.length > 0) {
+        console.log(chalk.bold('  Branch conflicts:'));
+        for (const conflict of result.branch_conflicts) {
+          console.log(`    ${chalk.yellow(conflict.worktreeA)} ${chalk.dim('vs')} ${chalk.yellow(conflict.worktreeB)}`);
+        }
+      }
+    }
+
+    if (!ok) process.exitCode = 1;
+  });
+
+// ── monitor ──────────────────────────────────────────────────────────────────
+
+const monitorCmd = program.command('monitor').description('Observe worktrees for runtime file mutations');
+
+monitorCmd
+  .command('once')
+  .description('Capture one monitoring pass and log observed file changes')
+  .option('--json', 'Output raw JSON')
+  .option('--quarantine', 'Move or restore denied runtime changes immediately after detection')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const worktrees = listGitWorktrees(repoRoot);
+    const result = monitorWorktreesOnce(db, repoRoot, worktrees, { quarantine: opts.quarantine });
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    if (result.events.length === 0) {
+      console.log(chalk.dim('No file changes observed since the last monitor snapshot.'));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Observed ${result.summary.total} file change(s)`);
+    for (const event of result.events) {
+      const badge = event.status === 'allowed' ? chalk.green('ALLOWED') : chalk.red('DENIED ');
+      const action = event.enforcement_action ? ` ${chalk.dim(event.enforcement_action)}` : '';
+      console.log(`  ${badge} ${chalk.cyan(event.worktree)} ${chalk.yellow(event.file_path)} ${chalk.dim(event.change_type)}${event.reason_code ? ` ${chalk.dim(event.reason_code)}` : ''}${action}`);
+    }
+  });
+
+monitorCmd
+  .command('watch')
+  .description('Poll worktrees continuously and log observed file changes')
+  .option('--interval-ms <ms>', 'Polling interval in milliseconds', '2000')
+  .option('--quarantine', 'Move or restore denied runtime changes immediately after detection')
+  .option('--daemonized', 'Internal flag used by monitor start', false)
+  .action(async (opts) => {
+    const repoRoot = getRepo();
+    const intervalMs = Number.parseInt(opts.intervalMs, 10);
+
+    if (!Number.isFinite(intervalMs) || intervalMs < 100) {
+      console.error(chalk.red('--interval-ms must be at least 100'));
+      process.exit(1);
+    }
+
+    console.log(chalk.cyan(`Watching worktrees every ${intervalMs}ms. Press Ctrl+C to stop.`));
+
+    let stopped = false;
+    const stop = () => {
+      stopped = true;
+      process.stdout.write('\n');
+      if (opts.daemonized) {
+        clearMonitorState(repoRoot);
+      }
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+
+    while (!stopped) {
+      const db = getDb(repoRoot);
+      const worktrees = listGitWorktrees(repoRoot);
+      const result = monitorWorktreesOnce(db, repoRoot, worktrees, { quarantine: opts.quarantine });
+      db.close();
+
+      for (const event of result.events) {
+        const badge = event.status === 'allowed' ? chalk.green('ALLOWED') : chalk.red('DENIED ');
+        const action = event.enforcement_action ? ` ${chalk.dim(event.enforcement_action)}` : '';
+        console.log(`  ${badge} ${chalk.cyan(event.worktree)} ${chalk.yellow(event.file_path)} ${chalk.dim(event.change_type)}${event.reason_code ? ` ${chalk.dim(event.reason_code)}` : ''}${action}`);
+      }
+
+      if (stopped) break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, intervalMs));
+    }
+
+    console.log(chalk.dim('Stopped worktree monitor.'));
+  });
+
+monitorCmd
+  .command('start')
+  .description('Start the worktree monitor as a background process')
+  .option('--interval-ms <ms>', 'Polling interval in milliseconds', '2000')
+  .option('--quarantine', 'Move or restore denied runtime changes immediately after detection')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const intervalMs = Number.parseInt(opts.intervalMs, 10);
+    const existingState = readMonitorState(repoRoot);
+
+    if (existingState && isProcessRunning(existingState.pid)) {
+      console.log(chalk.yellow(`Monitor already running with pid ${existingState.pid}`));
+      return;
+    }
+
+    const logPath = join(repoRoot, '.switchman', 'monitor.log');
+    const child = spawn(process.execPath, [
+      process.argv[1],
+      'monitor',
+      'watch',
+      '--interval-ms',
+      String(intervalMs),
+      ...(opts.quarantine ? ['--quarantine'] : []),
+      '--daemonized',
+    ], {
+      cwd: repoRoot,
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+
+    const statePath = writeMonitorState(repoRoot, {
+      pid: child.pid,
+      interval_ms: intervalMs,
+      quarantine: Boolean(opts.quarantine),
+      log_path: logPath,
+      started_at: new Date().toISOString(),
+    });
+
+    console.log(`${chalk.green('✓')} Started monitor pid ${chalk.cyan(String(child.pid))}`);
+    console.log(`${chalk.dim('State:')} ${statePath}`);
+  });
+
+monitorCmd
+  .command('stop')
+  .description('Stop the background worktree monitor')
+  .action(() => {
+    const repoRoot = getRepo();
+    const state = readMonitorState(repoRoot);
+
+    if (!state) {
+      console.log(chalk.dim('Monitor is not running.'));
+      return;
+    }
+
+    if (!isProcessRunning(state.pid)) {
+      clearMonitorState(repoRoot);
+      console.log(chalk.dim('Monitor state was stale and has been cleared.'));
+      return;
+    }
+
+    process.kill(state.pid, 'SIGTERM');
+    clearMonitorState(repoRoot);
+    console.log(`${chalk.green('✓')} Stopped monitor pid ${chalk.cyan(String(state.pid))}`);
+  });
+
+monitorCmd
+  .command('status')
+  .description('Show background monitor process status')
+  .action(() => {
+    const repoRoot = getRepo();
+    const state = readMonitorState(repoRoot);
+
+    if (!state) {
+      console.log(chalk.dim('Monitor is not running.'));
+      return;
+    }
+
+    const running = isProcessRunning(state.pid);
+    if (!running) {
+      clearMonitorState(repoRoot);
+      console.log(chalk.yellow('Monitor state existed but the process is no longer running.'));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Monitor running`);
+    console.log(`  ${chalk.dim('pid')} ${state.pid}`);
+    console.log(`  ${chalk.dim('interval_ms')} ${state.interval_ms}`);
+    console.log(`  ${chalk.dim('quarantine')} ${state.quarantine ? 'true' : 'false'}`);
+    console.log(`  ${chalk.dim('started_at')} ${state.started_at}`);
+  });
+
+// ── policy ───────────────────────────────────────────────────────────────────
+
+const policyCmd = program.command('policy').description('Manage enforcement policy exceptions');
+
+policyCmd
+  .command('init')
+  .description('Write a starter enforcement policy file for generated-path exceptions')
+  .action(() => {
+    const repoRoot = getRepo();
+    const policyPath = writeEnforcementPolicy(repoRoot, {
+      allowed_generated_paths: [
+        'dist/**',
+        'build/**',
+        'coverage/**',
+      ],
+    });
+    console.log(`${chalk.green('✓')} Wrote enforcement policy to ${chalk.cyan(policyPath)}`);
   });
 
 program.parse();

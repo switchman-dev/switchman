@@ -3,16 +3,18 @@
  * Tests core DB and git functions without needing a real git repo
  */
 
-import { execSync } from 'child_process';
-import { mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync } from 'fs';
+import { execFileSync, execSync } from 'child_process';
+import { mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { DatabaseSync } from 'node:sqlite';
 
 import { findRepoRoot } from '../src/core/git.js';
 import { getWorktreeChangedFiles } from '../src/core/git.js';
-import { filterIgnoredPaths, isIgnoredPath } from '../src/core/ignore.js';
+import { filterIgnoredPaths, isIgnoredPath, matchesPathPatterns } from '../src/core/ignore.js';
 import { upsertProjectMcpConfig } from '../src/core/mcp.js';
+import { evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
+import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 
@@ -39,6 +41,7 @@ import {
   releaseFileClaims,
   checkFileConflicts,
   getActiveFileClaims,
+  listAuditEvents,
 } from '../src/core/db.js';
 
 let passed = 0;
@@ -472,6 +475,551 @@ test('Fix 7: setup MCP config can be written locally without clobbering other se
   assert(secondConfig.mcpServers.switchman.command === 'switchman-mcp', 'Switchman MCP server is merged into existing config');
 
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 8: worktree compliance marks unmanaged changes as non-compliant', () => {
+  const repoDir = join(tmpdir(), `sw-enforce-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  execSync('mkdir -p src && printf "x\\n" > src/unclaimed.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const enforceDb = initDb(repoDir);
+  registerWorktree(enforceDb, { name: 'main', path: repoDir, branch: 'main' });
+  const compliance = evaluateWorktreeCompliance(enforceDb, repoDir, { name: 'main', path: repoDir, branch: 'main' });
+
+  assert(compliance.compliance_state === 'non_compliant', 'Unmanaged changed files mark the worktree non-compliant');
+  assert(compliance.unclaimed_changed_files.includes('src/unclaimed.js'), 'Unclaimed changed file is reported');
+  enforceDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 9: commit gate passes for claimed files under an active lease', () => {
+  const repoDir = join(tmpdir(), `sw-gate-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const gateDb = initDb(repoDir);
+  registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(gateDb, { title: 'Gate pass task' });
+  assignTask(gateDb, taskId, 'main');
+  claimFiles(gateDb, taskId, 'main', ['src/claimed.js']);
+  execSync('mkdir -p src && printf "ok\\n" > src/claimed.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const result = runCommitGate(gateDb, repoDir, { cwd: repoDir });
+  assert(result.ok, 'Commit gate allows claimed changes under the active lease');
+  assert(result.changed_files.includes('src/claimed.js'), 'Commit gate inspects the changed claimed file');
+  gateDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 10: commit gate rejects unclaimed files', () => {
+  const repoDir = join(tmpdir(), `sw-gate-fail-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const gateDb = initDb(repoDir);
+  registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
+  execSync('mkdir -p src && printf "bad\\n" > src/unclaimed.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const result = runCommitGate(gateDb, repoDir, { cwd: repoDir });
+  assert(!result.ok, 'Commit gate rejects unclaimed changes');
+  assert(result.violations.some((violation) => violation.reason_code === 'no_active_lease'), 'Missing lease is reported as the rejection reason');
+  gateDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 11: commit hook installer writes a pre-commit hook', () => {
+  const repoDir = join(tmpdir(), `sw-hook-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const hookPath = installCommitHook(repoDir);
+  const hookBody = readFileSync(hookPath, 'utf8');
+  const hookMode = statSync(hookPath).mode & 0o777;
+
+  assert(existsSync(hookPath), 'Pre-commit hook file is written');
+  assert(hookBody.includes('switchman gate commit'), 'Pre-commit hook runs the Switchman commit gate');
+  assert(hookMode === 0o755, 'Pre-commit hook is executable');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 11b: gate hook installer writes both commit and merge hooks', () => {
+  const repoDir = join(tmpdir(), `sw-gate-hooks-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const hookPaths = installGateHooks(repoDir);
+  const mergeHookBody = readFileSync(hookPaths.pre_merge_commit, 'utf8');
+
+  assert(existsSync(hookPaths.pre_commit), 'Pre-commit hook is installed by the gate hook installer');
+  assert(existsSync(hookPaths.pre_merge_commit), 'Pre-merge-commit hook is installed by the gate hook installer');
+  assert(mergeHookBody.includes('switchman gate merge'), 'Pre-merge-commit hook runs the merge gate');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 12: managed write gateway allows claimed writes', () => {
+  const repoDir = join(tmpdir(), `sw-write-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const writeDb = initDb(repoDir);
+  registerWorktree(writeDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(writeDb, { title: 'Gateway write task' });
+  assignTask(writeDb, taskId, 'main');
+  const lease = claimFiles(writeDb, taskId, 'main', ['src/gateway.js']);
+
+  const result = gatewayWriteFile(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/gateway.js',
+    content: 'export const ok = true;\n',
+    worktree: 'main',
+  });
+
+  assert(result.ok, 'Write gateway allows a claimed file write');
+  assert(readFileSync(join(repoDir, 'src/gateway.js'), 'utf8') === 'export const ok = true;\n', 'Write gateway updates the file contents');
+  writeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 13: managed write gateway rejects unclaimed paths', () => {
+  const repoDir = join(tmpdir(), `sw-write-fail-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const writeDb = initDb(repoDir);
+  registerWorktree(writeDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(writeDb, { title: 'Gateway denied task' });
+  assignTask(writeDb, taskId, 'main');
+  const lease = getActiveLeaseForTask(writeDb, taskId);
+
+  const validation = validateWriteAccess(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/unclaimed.js',
+    worktree: 'main',
+  });
+  const result = gatewayWriteFile(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/unclaimed.js',
+    content: 'nope\n',
+    worktree: 'main',
+  });
+
+  assert(!validation.ok, 'Validation rejects an unclaimed path');
+  assert(validation.reason_code === 'path_not_claimed', 'Unclaimed write is classified correctly');
+  assert(!result.ok, 'Write gateway denies an unclaimed path');
+  assert(result.reason_code === 'path_not_claimed', 'Denied write returns path_not_claimed');
+  writeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 14: managed remove gateway enforces the same claim policy', () => {
+  const repoDir = join(tmpdir(), `sw-rm-pass-${Date.now()}`);
+  mkdirSync(join(repoDir, 'src'), { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'src/remove-me.js'), 'delete me\n');
+  execSync('git add src/remove-me.js', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const writeDb = initDb(repoDir);
+  registerWorktree(writeDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(writeDb, { title: 'Gateway remove task' });
+  assignTask(writeDb, taskId, 'main');
+  const lease = claimFiles(writeDb, taskId, 'main', ['src/remove-me.js']);
+
+  const result = gatewayRemovePath(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/remove-me.js',
+    worktree: 'main',
+  });
+
+  assert(result.ok, 'Remove gateway allows a claimed delete');
+  assert(!existsSync(join(repoDir, 'src/remove-me.js')), 'Remove gateway deletes the claimed file');
+  writeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 14b: managed append gateway appends only to claimed files', () => {
+  const repoDir = join(tmpdir(), `sw-append-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const writeDb = initDb(repoDir);
+  registerWorktree(writeDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(writeDb, { title: 'Gateway append task' });
+  assignTask(writeDb, taskId, 'main');
+  const lease = claimFiles(writeDb, taskId, 'main', ['src/append.js']);
+  gatewayWriteFile(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/append.js',
+    content: 'start\n',
+    worktree: 'main',
+  });
+
+  const result = gatewayAppendFile(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/append.js',
+    content: 'finish\n',
+    worktree: 'main',
+  });
+
+  assert(result.ok, 'Append gateway allows appending to a claimed file');
+  assert(readFileSync(join(repoDir, 'src/append.js'), 'utf8') === 'start\nfinish\n', 'Append gateway preserves existing content and appends new content');
+  writeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 14c: managed move gateway requires both source and destination claims', () => {
+  const repoDir = join(tmpdir(), `sw-mv-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const writeDb = initDb(repoDir);
+  registerWorktree(writeDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(writeDb, { title: 'Gateway move task' });
+  assignTask(writeDb, taskId, 'main');
+  const lease = claimFiles(writeDb, taskId, 'main', ['src/source.js', 'src/destination.js']);
+  gatewayWriteFile(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/source.js',
+    content: 'move me\n',
+    worktree: 'main',
+  });
+
+  const result = gatewayMovePath(writeDb, repoDir, {
+    leaseId: lease.id,
+    sourcePath: 'src/source.js',
+    destinationPath: 'src/destination.js',
+    worktree: 'main',
+  });
+
+  assert(result.ok, 'Move gateway allows renaming between two claimed paths');
+  assert(!existsSync(join(repoDir, 'src/source.js')), 'Move gateway removes the source path');
+  assert(readFileSync(join(repoDir, 'src/destination.js'), 'utf8') === 'move me\n', 'Move gateway creates the destination path with the original contents');
+  writeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 14d: managed mkdir gateway allows directories for claimed descendants', () => {
+  const repoDir = join(tmpdir(), `sw-mkdir-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const writeDb = initDb(repoDir);
+  registerWorktree(writeDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(writeDb, { title: 'Gateway mkdir task' });
+  assignTask(writeDb, taskId, 'main');
+  const lease = claimFiles(writeDb, taskId, 'main', ['src/generated/file.js']);
+
+  const result = gatewayMakeDirectory(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/generated',
+    worktree: 'main',
+  });
+
+  assert(result.ok, 'Mkdir gateway allows creating a directory that contains a claimed descendant');
+  assert(existsSync(join(repoDir, 'src/generated')), 'Mkdir gateway creates the requested directory');
+  writeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 15: runtime monitor logs denied direct writes immediately', () => {
+  const repoDir = join(tmpdir(), `sw-monitor-denied-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const monitorDb = initDb(repoDir);
+  registerWorktree(monitorDb, { name: 'main', path: repoDir, branch: 'main' });
+  monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+
+  execSync('mkdir -p src && printf "drift\\n" > src/drift.js', { cwd: repoDir, shell: '/bin/zsh' });
+  const result = monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+  const audit = listAuditEvents(monitorDb, { eventType: 'write_observed', status: 'denied', limit: 10 });
+
+  assert(result.summary.denied === 1, 'Monitor reports the denied direct write');
+  assert(result.events[0].reason_code === 'no_active_lease', 'Denied direct write is classified correctly');
+  assert(audit.some((event) => event.file_path === 'src/drift.js'), 'Denied observed write is written to the audit log');
+  monitorDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 16: runtime monitor treats claimed in-scope writes as allowed', () => {
+  const repoDir = join(tmpdir(), `sw-monitor-allowed-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const monitorDb = initDb(repoDir);
+  registerWorktree(monitorDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(monitorDb, { title: 'Observed write task' });
+  assignTask(monitorDb, taskId, 'main');
+  claimFiles(monitorDb, taskId, 'main', ['src/observed.js']);
+  monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+
+  execSync('mkdir -p src && printf "claimed\\n" > src/observed.js', { cwd: repoDir, shell: '/bin/zsh' });
+  const result = monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+
+  assert(result.summary.allowed === 1, 'Monitor reports the claimed write as allowed');
+  assert(result.events[0].file_path === 'src/observed.js', 'Monitor reports the claimed file path');
+  monitorDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 17: managed gateway writes into the assigned linked worktree path', () => {
+  const mainRepo = join(tmpdir(), `sw-linked-main-${Date.now()}`);
+  mkdirSync(mainRepo, { recursive: true });
+  execSync('git init', { cwd: mainRepo });
+  execSync('git config user.email "test@test.com"', { cwd: mainRepo });
+  execSync('git config user.name "Test"', { cwd: mainRepo });
+  execSync('git commit --allow-empty -m "init"', { cwd: mainRepo });
+
+  const linkedPath = join(tmpdir(), `sw-linked-wt-${Date.now()}`);
+  execSync(`git worktree add -b linked-test "${linkedPath}"`, { cwd: mainRepo });
+
+  const linkedDb = initDb(mainRepo);
+  registerWorktree(linkedDb, { name: 'main', path: mainRepo, branch: 'main' });
+  registerWorktree(linkedDb, { name: linkedPath.split('/').pop(), path: linkedPath, branch: 'linked-test' });
+  const taskId = createTask(linkedDb, { title: 'Linked worktree write task' });
+  assignTask(linkedDb, taskId, linkedPath.split('/').pop());
+  const lease = claimFiles(linkedDb, taskId, linkedPath.split('/').pop(), ['src/linked.js']);
+
+  const result = gatewayWriteFile(linkedDb, mainRepo, {
+    leaseId: lease.id,
+    path: 'src/linked.js',
+    content: 'export const linked = true;\n',
+    worktree: linkedPath.split('/').pop(),
+  });
+
+  assert(result.ok, 'Gateway write succeeds for linked worktree lease');
+  assert(readFileSync(join(linkedPath, 'src/linked.js'), 'utf8') === 'export const linked = true;\n', 'Gateway writes into the linked worktree checkout');
+  assert(!existsSync(join(mainRepo, 'src', 'linked.js')), 'Gateway does not write into the main repo checkout by mistake');
+  linkedDb.close();
+  execSync(`git worktree remove "${linkedPath}" --force`, { cwd: mainRepo });
+  rmSync(mainRepo, { recursive: true, force: true });
+});
+
+test('Fix 18: runtime quarantine moves denied added files out of the worktree', () => {
+  const repoDir = join(tmpdir(), `sw-monitor-quarantine-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const monitorDb = initDb(repoDir);
+  registerWorktree(monitorDb, { name: 'main', path: repoDir, branch: 'main' });
+  monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+
+  execSync('mkdir -p src && printf "rogue\\n" > src/rogue.js', { cwd: repoDir, shell: '/bin/zsh' });
+  const result = monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }], { quarantine: true });
+  const event = result.events.find((item) => item.file_path === 'src/rogue.js');
+
+  assert(result.summary.quarantined === 1, 'Denied runtime write is quarantined');
+  assert(event.enforcement_action === 'quarantined', 'Quarantine action is recorded on the observed event');
+  assert(!existsSync(join(repoDir, 'src/rogue.js')), 'Quarantined file is removed from the worktree');
+  assert(existsSync(event.quarantine_path), 'Quarantined file is moved into the quarantine area');
+  monitorDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 19: enforcement policy allows generated outputs without explicit claims', () => {
+  const repoDir = join(tmpdir(), `sw-policy-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const policyPath = writeEnforcementPolicy(repoDir, {
+    allowed_generated_paths: ['generated/**'],
+  });
+  assert(matchesPathPatterns('generated/output.js', ['generated/**']), 'Path matcher accepts generated-path policy patterns');
+  assert(existsSync(policyPath), 'Enforcement policy file is written');
+
+  const policyDb = initDb(repoDir);
+  registerWorktree(policyDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(policyDb, { title: 'Generated output task' });
+  assignTask(policyDb, taskId, 'main');
+  monitorWorktreesOnce(policyDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+
+  execSync('mkdir -p generated && printf "artifact\\n" > generated/output.js', { cwd: repoDir, shell: '/bin/zsh' });
+  const result = monitorWorktreesOnce(policyDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+  const event = result.events.find((item) => item.file_path === 'generated/output.js');
+
+  assert(result.summary.allowed === 1, 'Generated output covered by policy is allowed');
+  assert(event.reason_code === 'policy_exception_allowed', 'Allowed generated output records the policy exception reason');
+  policyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 20: wrapper mode launches commands with Switchman lease context', () => {
+  const repoDir = join(tmpdir(), `sw-wrapper-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const wrapDb = initDb(repoDir);
+  registerWorktree(wrapDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(wrapDb, { title: 'Wrapper task' });
+  const lease = startTaskLease(wrapDb, taskId, 'main', 'claude-code');
+  const outputPath = join(repoDir, 'wrapper-env.json');
+  const script = `require('node:fs').writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({ lease: process.env.SWITCHMAN_LEASE_ID, task: process.env.SWITCHMAN_TASK_ID, worktree: process.env.SWITCHMAN_WORKTREE, repo: process.env.SWITCHMAN_REPO_ROOT, worktreePath: process.env.SWITCHMAN_WORKTREE_PATH }));`;
+
+  const result = runWrappedCommand(wrapDb, repoDir, {
+    leaseId: lease.id,
+    command: 'node',
+    args: ['-e', script],
+    worktree: 'main',
+  });
+  const wrappedEnv = JSON.parse(readFileSync(outputPath, 'utf8'));
+
+  assert(result.ok, 'Wrapper command succeeds for an active lease');
+  assert(wrappedEnv.lease === lease.id, 'Wrapper injects SWITCHMAN_LEASE_ID');
+  assert(wrappedEnv.task === taskId, 'Wrapper injects SWITCHMAN_TASK_ID');
+  assert(wrappedEnv.worktree === 'main', 'Wrapper injects SWITCHMAN_WORKTREE');
+  assert(wrappedEnv.repo === repoDir, 'Wrapper injects SWITCHMAN_REPO_ROOT');
+  assert(wrappedEnv.worktreePath === repoDir, 'Wrapper injects SWITCHMAN_WORKTREE_PATH');
+  wrapDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 21: wrapper mode rejects expired leases before launch', () => {
+  const repoDir = join(tmpdir(), `sw-wrapper-denied-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const wrapDb = initDb(repoDir);
+  registerWorktree(wrapDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(wrapDb, { title: 'Expired wrapper task' });
+  const lease = startTaskLease(wrapDb, taskId, 'main', 'claude-code');
+  wrapDb.prepare(`
+    UPDATE leases
+    SET heartbeat_at=datetime('now', '-30 minutes')
+    WHERE id=?
+  `).run(lease.id);
+
+  const result = runWrappedCommand(wrapDb, repoDir, {
+    leaseId: lease.id,
+    command: 'node',
+    args: ['-e', 'process.exit(0)'],
+    worktree: 'main',
+  });
+
+  assert(!result.ok, 'Wrapper command is denied for an expired lease');
+  assert(result.reason_code === 'lease_expired', 'Expired lease denial returns lease_expired');
+  wrapDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 22: repo CI gate rejects unmanaged changes across worktrees', () => {
+  const repoDir = join(tmpdir(), `sw-ci-gate-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  initDb(repoDir).close();
+  execSync('mkdir -p src && printf "drift\\n" > src/rogue.js', { cwd: repoDir, shell: '/bin/zsh' });
+  let status = 0;
+  let stdout = '';
+  try {
+    stdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ci', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    status = err.status ?? 1;
+    stdout = String(err.stdout || '');
+  }
+
+  const result = JSON.parse(stdout);
+  assert(status === 1, 'CI gate exits non-zero for unmanaged changes');
+  assert(!result.ok, 'CI gate reports the repo as rejected');
+  assert(result.unclaimed_changes.some((entry) => entry.files.includes('src/rogue.js')), 'CI gate reports the unmanaged changed file');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 23: monitor state helpers persist and clear background monitor state', () => {
+  const repoDir = join(tmpdir(), `sw-monitor-state-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+
+  const statePath = writeMonitorState(repoDir, {
+    pid: 12345,
+    interval_ms: 2000,
+    quarantine: true,
+    started_at: new Date().toISOString(),
+  });
+  const state = readMonitorState(repoDir);
+
+  assert(existsSync(statePath), 'Monitor state file is written');
+  assert(state?.pid === 12345, 'Monitor state can be read back from disk');
+
+  clearMonitorState(repoDir);
+  assert(readMonitorState(repoDir) === null, 'Monitor state file can be cleared');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 24: process liveness helper detects running and exited processes', () => {
+  const pid = Number.parseInt(execFileSync('/bin/sh', [
+    '-c',
+    `node -e "setTimeout(() => {}, 5000)" >/dev/null 2>&1 & echo $!`,
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  }).trim(), 10);
+
+  assert(isProcessRunning(pid), 'Liveness helper returns true for a running process');
+  process.kill(pid, 'SIGTERM');
+  for (let i = 0; i < 20; i++) {
+    if (!isProcessRunning(pid)) break;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+  assert(!isProcessRunning(pid), 'Liveness helper returns false after the process exits');
 });
 
 // ─── Cleanup & Results ────────────────────────────────────────────────────────

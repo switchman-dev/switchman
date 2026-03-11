@@ -90,6 +90,8 @@ function ensureSchema(db) {
       branch        TEXT NOT NULL,
       agent         TEXT,
       status        TEXT NOT NULL DEFAULT 'idle',
+      enforcement_mode TEXT NOT NULL DEFAULT 'observed',
+      compliance_state TEXT NOT NULL DEFAULT 'observed',
       registered_at TEXT NOT NULL DEFAULT (datetime('now')),
       last_seen     TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -102,11 +104,40 @@ function ensureSchema(db) {
       conflicting_files TEXT NOT NULL,
       resolved          INTEGER DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type   TEXT NOT NULL,
+      status       TEXT NOT NULL DEFAULT 'info',
+      reason_code  TEXT,
+      worktree     TEXT,
+      task_id      TEXT,
+      lease_id     TEXT,
+      file_path    TEXT,
+      details      TEXT,
+      created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS worktree_snapshots (
+      worktree     TEXT NOT NULL,
+      file_path    TEXT NOT NULL,
+      fingerprint  TEXT NOT NULL,
+      observed_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (worktree, file_path)
+    );
   `);
 
   const fileClaimColumns = getTableColumns(db, 'file_claims');
   if (fileClaimColumns.length > 0 && !fileClaimColumns.includes('lease_id')) {
     db.exec(`ALTER TABLE file_claims ADD COLUMN lease_id TEXT REFERENCES leases(id)`);
+  }
+
+  const worktreeColumns = getTableColumns(db, 'worktrees');
+  if (worktreeColumns.length > 0 && !worktreeColumns.includes('enforcement_mode')) {
+    db.exec(`ALTER TABLE worktrees ADD COLUMN enforcement_mode TEXT NOT NULL DEFAULT 'observed'`);
+  }
+  if (worktreeColumns.length > 0 && !worktreeColumns.includes('compliance_state')) {
+    db.exec(`ALTER TABLE worktrees ADD COLUMN compliance_state TEXT NOT NULL DEFAULT 'observed'`);
   }
 
   db.exec(`
@@ -123,6 +154,9 @@ function ensureSchema(db) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_file_claims_unique_active
       ON file_claims(file_path)
       WHERE released_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log(event_type);
+    CREATE INDEX IF NOT EXISTS idx_audit_log_created_at ON audit_log(created_at);
+    CREATE INDEX IF NOT EXISTS idx_worktree_snapshots_worktree ON worktree_snapshots(worktree);
   `);
 
   migrateLegacyActiveTasks(db);
@@ -161,7 +195,31 @@ function createLeaseTx(db, { id, taskId, worktree, agent, status = 'active', fai
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(leaseId, taskId, worktree, agent || null, status, failureReason);
   touchWorktreeLeaseState(db, worktree, agent, status === 'active' ? 'busy' : 'idle');
+  logAuditEventTx(db, {
+    eventType: 'lease_started',
+    status: 'allowed',
+    worktree,
+    taskId,
+    leaseId,
+    details: JSON.stringify({ agent: agent || null }),
+  });
   return getLeaseTx(db, leaseId);
+}
+
+function logAuditEventTx(db, { eventType, status = 'info', reasonCode = null, worktree = null, taskId = null, leaseId = null, filePath = null, details = null }) {
+  db.prepare(`
+    INSERT INTO audit_log (event_type, status, reason_code, worktree, task_id, lease_id, file_path, details)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    eventType,
+    status,
+    reasonCode,
+    worktree,
+    taskId,
+    leaseId,
+    filePath,
+    details ? String(details) : null,
+  );
 }
 
 function migrateLegacyActiveTasks(db) {
@@ -362,6 +420,7 @@ export function assignTask(db, taskId, worktree, agent) {
 
 export function completeTask(db, taskId) {
   withImmediateTransaction(db, () => {
+    const activeLease = getActiveLeaseForTaskTx(db, taskId);
     db.prepare(`
       UPDATE tasks
       SET status='done', completed_at=datetime('now'), updated_at=datetime('now')
@@ -369,11 +428,19 @@ export function completeTask(db, taskId) {
     `).run(taskId);
     closeActiveLeasesForTaskTx(db, taskId, 'completed');
     releaseClaimsForTaskTx(db, taskId);
+    logAuditEventTx(db, {
+      eventType: 'task_completed',
+      status: 'allowed',
+      worktree: activeLease?.worktree ?? null,
+      taskId,
+      leaseId: activeLease?.id ?? null,
+    });
   });
 }
 
 export function failTask(db, taskId, reason) {
   withImmediateTransaction(db, () => {
+    const activeLease = getActiveLeaseForTaskTx(db, taskId);
     db.prepare(`
       UPDATE tasks
       SET status='failed', description=COALESCE(description,'') || '\nFAILED: ' || ?, updated_at=datetime('now')
@@ -381,6 +448,15 @@ export function failTask(db, taskId, reason) {
     `).run(reason || 'unknown', taskId);
     closeActiveLeasesForTaskTx(db, taskId, 'failed', reason || 'unknown');
     releaseClaimsForTaskTx(db, taskId);
+    logAuditEventTx(db, {
+      eventType: 'task_failed',
+      status: 'denied',
+      reasonCode: 'task_failed',
+      worktree: activeLease?.worktree ?? null,
+      taskId,
+      leaseId: activeLease?.id ?? null,
+      details: reason || 'unknown',
+    });
   });
 }
 
@@ -449,6 +525,14 @@ export function heartbeatLease(db, leaseId, agent) {
 
   const lease = getLease(db, leaseId);
   touchWorktreeLeaseState(db, lease.worktree, agent || lease.agent, 'busy');
+  logAuditEventTx(db, {
+    eventType: 'lease_heartbeated',
+    status: 'allowed',
+    worktree: lease.worktree,
+    taskId: lease.task_id,
+    leaseId: lease.id,
+    details: JSON.stringify({ agent: agent || lease.agent || null }),
+  });
   return lease;
 }
 
@@ -497,6 +581,14 @@ export function reapStaleLeases(db, staleAfterMinutes = DEFAULT_STALE_LEASE_MINU
       releaseClaimsForLeaseTx(db, lease.id);
       resetTask.run(lease.task_id, lease.task_id);
       touchWorktreeLeaseState(db, lease.worktree, lease.agent, 'idle');
+      logAuditEventTx(db, {
+        eventType: 'lease_expired',
+        status: 'denied',
+        reasonCode: 'lease_expired',
+        worktree: lease.worktree,
+        taskId: lease.task_id,
+        leaseId: lease.id,
+      });
     }
 
     return staleLeases.map((lease) => ({
@@ -544,6 +636,14 @@ export function claimFiles(db, taskId, worktree, filePaths, agent) {
       }
 
       insert.run(taskId, lease.id, fp, worktree, agent || null);
+      logAuditEventTx(db, {
+        eventType: 'file_claimed',
+        status: 'allowed',
+        worktree,
+        taskId,
+        leaseId: lease.id,
+        filePath: fp,
+      });
     }
 
     db.prepare(`
@@ -613,8 +713,22 @@ export function listWorktrees(db) {
   return db.prepare(`SELECT * FROM worktrees ORDER BY registered_at`).all();
 }
 
+export function getWorktree(db, name) {
+  return db.prepare(`SELECT * FROM worktrees WHERE name=?`).get(name);
+}
+
 export function updateWorktreeStatus(db, name, status) {
   db.prepare(`UPDATE worktrees SET status=?, last_seen=datetime('now') WHERE name=?`).run(status, name);
+}
+
+export function updateWorktreeCompliance(db, name, complianceState, enforcementMode = null) {
+  db.prepare(`
+    UPDATE worktrees
+    SET compliance_state=?,
+        enforcement_mode=COALESCE(?, enforcement_mode),
+        last_seen=datetime('now')
+    WHERE name=?
+  `).run(complianceState, enforcementMode, name);
 }
 
 // ─── Conflict Log ─────────────────────────────────────────────────────────────
@@ -624,6 +738,70 @@ export function logConflict(db, worktreeA, worktreeB, conflictingFiles) {
     INSERT INTO conflict_log (worktree_a, worktree_b, conflicting_files)
     VALUES (?, ?, ?)
   `).run(worktreeA, worktreeB, JSON.stringify(conflictingFiles));
+}
+
+export function logAuditEvent(db, payload) {
+  logAuditEventTx(db, payload);
+}
+
+export function listAuditEvents(db, { eventType = null, status = null, limit = 50 } = {}) {
+  if (eventType && status) {
+    return db.prepare(`
+      SELECT * FROM audit_log
+      WHERE event_type=? AND status=?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(eventType, status, limit);
+  }
+  if (eventType) {
+    return db.prepare(`
+      SELECT * FROM audit_log
+      WHERE event_type=?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(eventType, limit);
+  }
+  if (status) {
+    return db.prepare(`
+      SELECT * FROM audit_log
+      WHERE status=?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(status, limit);
+  }
+  return db.prepare(`
+    SELECT * FROM audit_log
+    ORDER BY created_at DESC, id DESC
+    LIMIT ?
+  `).all(limit);
+}
+
+export function getWorktreeSnapshotState(db, worktree) {
+  const rows = db.prepare(`
+    SELECT * FROM worktree_snapshots
+    WHERE worktree=?
+    ORDER BY file_path
+  `).all(worktree);
+
+  return new Map(rows.map((row) => [row.file_path, row.fingerprint]));
+}
+
+export function replaceWorktreeSnapshotState(db, worktree, snapshot) {
+  withImmediateTransaction(db, () => {
+    db.prepare(`
+      DELETE FROM worktree_snapshots
+      WHERE worktree=?
+    `).run(worktree);
+
+    const insert = db.prepare(`
+      INSERT INTO worktree_snapshots (worktree, file_path, fingerprint)
+      VALUES (?, ?, ?)
+    `);
+
+    for (const [filePath, fingerprint] of snapshot.entries()) {
+      insert.run(worktree, filePath, fingerprint);
+    }
+  });
 }
 
 export function getConflictLog(db) {
