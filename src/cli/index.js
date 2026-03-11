@@ -36,6 +36,7 @@ import { upsertProjectMcpConfig } from '../core/mcp.js';
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
+import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, getPipelineStatus, runPipeline, startPipeline } from '../core/pipeline.js';
 
 function installMcpConfig(targetDirs) {
   return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
@@ -377,6 +378,220 @@ taskCmd
     } else {
       console.log(`${chalk.green('✓')} Assigned: ${chalk.bold(task.title)}`);
       console.log(`  ${chalk.dim('id:')} ${task.id}  ${chalk.dim('worktree:')} ${chalk.cyan(worktreeName)}  ${chalk.dim('lease:')} ${chalk.dim(lease.id)}  ${chalk.dim('priority:')} ${task.priority}`);
+    }
+  });
+
+// ── pipeline ──────────────────────────────────────────────────────────────────
+
+const pipelineCmd = program.command('pipeline').description('Create and summarize issue-to-PR execution pipelines');
+
+pipelineCmd
+  .command('start <title>')
+  .description('Create a pipeline from one issue title and split it into execution subtasks')
+  .option('-d, --description <desc>', 'Issue description or markdown checklist')
+  .option('-p, --priority <n>', 'Priority 1-10 (default 5)', '5')
+  .option('--id <id>', 'Custom pipeline ID')
+  .option('--json', 'Output raw JSON')
+  .action((title, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = startPipeline(db, {
+      title,
+      description: opts.description || null,
+      priority: Number.parseInt(opts.priority, 10),
+      pipelineId: opts.id || null,
+    });
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Pipeline created ${chalk.cyan(result.pipeline_id)}`);
+    console.log(`  ${chalk.bold(result.title)}`);
+    for (const task of result.tasks) {
+      const suggested = task.suggested_worktree ? ` ${chalk.dim(`→ ${task.suggested_worktree}`)}` : '';
+      console.log(`  ${chalk.cyan(task.id)} ${task.title}${suggested}`);
+    }
+  });
+
+pipelineCmd
+  .command('status <pipelineId>')
+  .description('Show task status for a pipeline')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = getPipelineStatus(db, pipelineId);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`${chalk.bold(result.title)} ${chalk.dim(result.pipeline_id)}`);
+      console.log(`  ${chalk.dim('done')} ${result.counts.done}  ${chalk.dim('in_progress')} ${result.counts.in_progress}  ${chalk.dim('pending')} ${result.counts.pending}  ${chalk.dim('failed')} ${result.counts.failed}`);
+      for (const task of result.tasks) {
+        const worktree = task.worktree || task.suggested_worktree || 'unassigned';
+        const blocked = task.blocked_by?.length ? ` ${chalk.dim(`blocked by ${task.blocked_by.join(', ')}`)}` : '';
+        console.log(`  ${statusBadge(task.status)} ${task.id} ${task.title} ${chalk.dim(worktree)}${blocked}`);
+      }
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('pr <pipelineId>')
+  .description('Generate a PR-ready summary for a pipeline using the repo and AI gates')
+  .option('--json', 'Output raw JSON')
+  .action(async (pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = await buildPipelinePrSummary(db, repoRoot, pipelineId);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(result.markdown);
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('run <pipelineId> [agentCommand...]')
+  .description('Dispatch pending pipeline tasks onto available worktrees and optionally launch an agent command in each one')
+  .option('--agent <name>', 'Agent name to record on acquired leases', 'pipeline-runner')
+  .option('--detached', 'Launch agent commands as detached background processes')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, agentCommand, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = runPipeline(db, repoRoot, {
+        pipelineId,
+        agentCommand,
+        agentName: opts.agent,
+        detached: Boolean(opts.detached),
+      });
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      if (result.assigned.length === 0) {
+        console.log(chalk.dim('No pending pipeline tasks were assigned. All worktrees may already be busy.'));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Dispatched ${result.assigned.length} pipeline task(s)`);
+      for (const assignment of result.assigned) {
+        const launch = result.launched.find((item) => item.task_id === assignment.task_id);
+        const launchInfo = launch ? ` ${chalk.dim(`pid=${launch.pid}`)}` : '';
+        console.log(`  ${chalk.cyan(assignment.task_id)} → ${chalk.cyan(assignment.worktree)} ${chalk.dim(assignment.lease_id)}${launchInfo}`);
+      }
+      if (result.remaining_pending > 0) {
+        console.log(chalk.dim(`${result.remaining_pending} pipeline task(s) remain pending due to unavailable worktrees.`));
+      }
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('review <pipelineId>')
+  .description('Inspect repo and AI gate failures for a pipeline and create follow-up fix tasks')
+  .option('--json', 'Output raw JSON')
+  .action(async (pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = await createPipelineFollowupTasks(db, repoRoot, pipelineId);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      if (result.created_count === 0) {
+        console.log(chalk.dim('No follow-up tasks were created. The pipeline gates did not surface new actionable items.'));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Created ${result.created_count} follow-up task(s)`);
+      for (const task of result.created) {
+        console.log(`  ${chalk.cyan(task.id)} ${task.title}`);
+      }
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('exec <pipelineId> [agentCommand...]')
+  .description('Run a bounded autonomous loop: dispatch, execute, review, and stop when ready or blocked')
+  .option('--agent <name>', 'Agent name to record on acquired leases', 'pipeline-runner')
+  .option('--max-iterations <n>', 'Maximum execution/review iterations', '3')
+  .option('--max-retries <n>', 'Retry a failed pipeline task up to this many times', '1')
+  .option('--retry-backoff-ms <ms>', 'Base backoff in milliseconds between retry attempts', '0')
+  .option('--json', 'Output raw JSON')
+  .action(async (pipelineId, agentCommand, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = await executePipeline(db, repoRoot, {
+        pipelineId,
+        agentCommand,
+        agentName: opts.agent,
+        maxIterations: Number.parseInt(opts.maxIterations, 10),
+        maxRetries: Number.parseInt(opts.maxRetries, 10),
+        retryBackoffMs: Number.parseInt(opts.retryBackoffMs, 10),
+      });
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      const badge = result.status === 'ready'
+        ? chalk.green('READY')
+        : result.status === 'blocked'
+          ? chalk.red('BLOCKED')
+          : chalk.yellow('MAX');
+      console.log(`${badge} Pipeline ${chalk.cyan(result.pipeline_id)} ${chalk.dim(result.status)}`);
+      for (const iteration of result.iterations) {
+        console.log(`  iter ${iteration.iteration}: resumed=${iteration.resumed_retries} dispatched=${iteration.dispatched} executed=${iteration.executed} retries=${iteration.retries_scheduled} followups=${iteration.followups_created} ai=${iteration.ai_gate_status} ready=${iteration.ready}`);
+      }
+      console.log(chalk.dim(result.pr.markdown.split('\n')[0]));
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
     }
   });
 

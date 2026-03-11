@@ -15,6 +15,8 @@ import { filterIgnoredPaths, isIgnoredPath, matchesPathPatterns } from '../src/c
 import { upsertProjectMcpConfig } from '../src/core/mcp.js';
 import { evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
+import { evaluateTaskOutcome } from '../src/core/outcome.js';
+import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 
@@ -26,6 +28,7 @@ import {
   assignTask,
   startTaskLease,
   completeTask,
+  failTask,
   listTasks,
   getTask,
   getNextPendingTask,
@@ -65,6 +68,31 @@ function test(name, fn) {
     console.log(`  ✗ THREW: ${err.message}`);
     failed++;
   }
+}
+
+function setupPipelineExecRepo(prefix, branchName) {
+  const repoDir = join(tmpdir(), `${prefix}-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(tmpdir(), `${prefix}-agent-${Date.now()}`);
+  execSync(`git worktree add -b ${branchName} "${agentPath}"`, { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: 'agent1', path: agentPath, branch: branchName });
+
+  return { repoDir, agentPath, db };
+}
+
+function cleanupPipelineExecRepo(repoDir, agentPath) {
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
 }
 
 // Setup
@@ -1113,6 +1141,492 @@ test('Fix 26: AI merge gate passes isolated worktree changes', () => {
   execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
   execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 27: pipeline start creates grouped subtasks with suggested worktrees', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-start-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'feature/agent1' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'feature/agent2' });
+
+  const result = startPipeline(pipelineDb, {
+    title: 'Ship login retries',
+    description: '- implement retry logic\n- add tests\n- update docs',
+    pipelineId: 'pipe-demo',
+    priority: 8,
+  });
+  const status = getPipelineStatus(pipelineDb, 'pipe-demo');
+
+  assert(result.tasks.length === 3, 'Pipeline start creates one task per checklist item');
+  assert(result.tasks[0].id === 'pipe-demo-01', 'Pipeline tasks use stable prefixed IDs');
+  assert(status.tasks.some((task) => task.suggested_worktree === 'agent1'), 'Pipeline tasks capture suggested worktrees');
+  pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28: pipeline PR summary combines task status with gate results', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-pr-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-pr',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-pr-01');
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'pipeline', 'pr', 'pipe-pr', '--json'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.pipeline_id === 'pipe-pr', 'Pipeline PR summary returns the requested pipeline ID');
+  assert(typeof result.markdown === 'string' && result.markdown.includes('# PR Summary: Refresh docs'), 'Pipeline PR summary includes PR-ready markdown');
+  assert(result.ci_gate.ok, 'Pipeline PR summary includes a passing repo gate for a clean repo');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 29: pipeline run dispatches pending tasks onto available worktrees', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-run-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'feature/agent1' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'feature/agent2' });
+  startPipeline(pipelineDb, {
+    title: 'Ship login retries',
+    description: '- implement retry logic\n- add tests\n- update docs',
+    pipelineId: 'pipe-run',
+    priority: 8,
+  });
+
+  const result = runPipeline(pipelineDb, repoDir, { pipelineId: 'pipe-run' });
+  const status = getPipelineStatus(pipelineDb, 'pipe-run');
+
+  assert(result.assigned.length === 2, 'Pipeline run assigns pending tasks to available non-main worktrees');
+  assert(result.remaining_pending === 1, 'Pipeline run leaves excess tasks pending when worktrees run out');
+  assert(status.counts.in_progress === 2, 'Dispatched tasks are moved into in_progress');
+  pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 30: pipeline run launches agent commands with Switchman env', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-launch-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+  const agentPath = join(tmpdir(), `sw-pipeline-launch-agent-${Date.now()}`);
+  execSync(`git worktree add -b pipeline-launch "${agentPath}"`, { cwd: repoDir });
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: agentPath, branch: 'pipeline-launch' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-launch',
+    priority: 5,
+  });
+  const outputPath = join(agentPath, 'pipeline-env.json');
+  const script = `require('node:fs').writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify({ pipeline: process.env.SWITCHMAN_PIPELINE_ID, task: process.env.SWITCHMAN_TASK_ID, lease: process.env.SWITCHMAN_LEASE_ID, worktree: process.env.SWITCHMAN_WORKTREE }));`;
+
+  const result = runPipeline(pipelineDb, repoDir, {
+    pipelineId: 'pipe-launch',
+    agentCommand: [process.execPath, '-e', script],
+  });
+  for (let i = 0; i < 20 && !existsSync(outputPath); i++) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
+  const envPayload = JSON.parse(readFileSync(outputPath, 'utf8'));
+
+  assert(result.launched.length === 1, 'Pipeline run launches one command per assigned task');
+  assert(envPayload.pipeline === 'pipe-launch', 'Launched pipeline command receives SWITCHMAN_PIPELINE_ID');
+  assert(envPayload.task === 'pipe-launch-01', 'Launched pipeline command receives SWITCHMAN_TASK_ID');
+  assert(envPayload.worktree === 'agent1', 'Launched pipeline command receives SWITCHMAN_WORKTREE');
+  pipelineDb.close();
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 31: pipeline review creates follow-up tasks from AI merge risk', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-review-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const featureA = join(tmpdir(), `sw-pipeline-review-a-${Date.now()}`);
+  const featureB = join(tmpdir(), `sw-pipeline-review-b-${Date.now()}`);
+  execSync(`git worktree add -b review-auth-a "${featureA}"`, { cwd: repoDir });
+  execSync(`git worktree add -b review-auth-b "${featureB}"`, { cwd: repoDir });
+  execSync('mkdir -p src/auth && printf "one\\n" > src/auth/login.js', { cwd: featureA, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "two\\n" > src/auth/session.js', { cwd: featureB, shell: '/bin/zsh' });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: featureA.split('/').pop(), path: featureA, branch: 'review-auth-a' });
+  registerWorktree(pipelineDb, { name: featureB.split('/').pop(), path: featureB, branch: 'review-auth-b' });
+  startPipeline(pipelineDb, {
+    title: 'Harden login flow',
+    description: '- update auth flow',
+    pipelineId: 'pipe-review',
+    priority: 7,
+  });
+  const taskA = createTask(pipelineDb, { id: 'pipe-review-02', title: 'Auth A', description: '[Pipeline pipe-review]', priority: 7 });
+  const taskB = createTask(pipelineDb, { id: 'pipe-review-03', title: 'Auth B', description: '[Pipeline pipe-review]', priority: 7 });
+  assignTask(pipelineDb, taskA, featureA.split('/').pop());
+  assignTask(pipelineDb, taskB, featureB.split('/').pop());
+  claimFiles(pipelineDb, taskA, featureA.split('/').pop(), ['src/auth/login.js']);
+  claimFiles(pipelineDb, taskB, featureB.split('/').pop(), ['src/auth/session.js']);
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'pipeline', 'review', 'pipe-review', '--json'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.created_count > 0, 'Pipeline review creates follow-up tasks for merge-risk findings');
+  assert(result.created.some((task) => task.title.includes('Review integration risk')), 'Pipeline review creates an integration-risk follow-up task');
+  execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 32: pipeline review stays quiet when gates have no new issues', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-review-clean-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-review-clean',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-review-clean-01');
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'pipeline', 'review', 'pipe-review-clean', '--json'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.created_count === 0, 'Pipeline review creates no follow-up tasks for a clean pipeline');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 33: pipeline exec drives a simple pipeline to ready', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-exec-ready-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(tmpdir(), `sw-pipeline-exec-ready-agent-${Date.now()}`);
+  execSync(`git worktree add -b pipe-exec-ready-branch "${agentPath}"`, { cwd: repoDir });
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: agentPath, branch: 'pipe-exec-ready-branch' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-exec-ready',
+    priority: 5,
+  });
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'exec',
+    'pipe-exec-ready',
+    '--json',
+    '--',
+    '/bin/sh',
+    '-c',
+    "printf 'updated\\n' > README.md && git add README.md && git -c user.email=test@test.com -c user.name=Test commit -m 'docs update' >/dev/null",
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.status === 'ready', 'Pipeline exec reports ready when commands succeed and gates pass');
+  assert(result.pr.ready, 'Pipeline exec returns a ready PR summary');
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 34: pipeline exec blocks when work fails and no new work can progress', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-exec-blocked-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(tmpdir(), `sw-pipeline-exec-blocked-agent-${Date.now()}`);
+  execSync(`git worktree add -b pipe-exec-blocked-branch "${agentPath}"`, { cwd: repoDir });
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: agentPath, branch: 'pipe-exec-blocked-branch' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-exec-blocked',
+    priority: 5,
+  });
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'exec',
+    'pipe-exec-blocked',
+    '--max-iterations',
+    '2',
+    '--max-retries',
+    '0',
+    '--json',
+    '--',
+    process.execPath,
+    '-e',
+    'process.exit(2)',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.status === 'blocked', 'Pipeline exec blocks when commands fail and no forward progress remains');
+  assert(result.iterations.some((iteration) => iteration.executed_failures > 0), 'Pipeline exec records failed command executions');
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 35: dependency-aware pipeline execution holds test tasks until implementation completes', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-deps-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(repoDir, 'agent1');
+  mkdirSync(agentPath, { recursive: true });
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: agentPath, branch: 'feature/agent1' });
+  startPipeline(pipelineDb, {
+    title: 'Ship login retries',
+    description: 'Implement login retries',
+    pipelineId: 'pipe-deps',
+    priority: 5,
+  });
+  const initialStatus = getPipelineStatus(pipelineDb, 'pipe-deps');
+  const implementTask = initialStatus.tasks.find((task) => task.title.startsWith('Implement:'));
+  const testTask = initialStatus.tasks.find((task) => task.title.startsWith('Add or update tests'));
+  const firstRun = runPipeline(pipelineDb, repoDir, { pipelineId: 'pipe-deps' });
+
+  assert(testTask.dependencies.includes(implementTask.id), 'Planner wires the test task to depend on the implementation task');
+  assert(firstRun.assigned.length === 1 && firstRun.assigned[0].task_id === implementTask.id, 'Runner dispatches only the dependency-free implementation task first');
+
+  completeTask(pipelineDb, implementTask.id);
+  const secondRun = runPipeline(pipelineDb, repoDir, { pipelineId: 'pipe-deps' });
+  assert(secondRun.assigned.some((assignment) => assignment.task_id === testTask.id), 'Runner dispatches the dependent test task after implementation completes');
+  pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 36: task outcome evaluator flags successful no-op executions', () => {
+  const repoDir = join(tmpdir(), `sw-outcome-noop-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const worktreePath = join(repoDir, 'agent1');
+  mkdirSync(worktreePath, { recursive: true });
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: 'agent1', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Implement: no-op task' });
+  assignTask(db, taskId, 'agent1');
+  claimFiles(db, taskId, 'agent1', ['src/example.js']);
+
+  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  assert(result.status === 'needs_followup', 'Outcome evaluator flags no-op command results');
+  assert(result.reason_code === 'no_changes_detected', 'Outcome evaluator reports no_changes_detected for no-op results');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 37: task outcome evaluator accepts in-scope claimed source changes', () => {
+  const repoDir = join(tmpdir(), `sw-outcome-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Implement: update source' });
+  assignTask(db, taskId, 'main');
+  claimFiles(db, taskId, 'main', ['src/example.js']);
+  execSync('mkdir -p src && printf "ok\\n" > src/example.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  assert(result.status === 'accepted', 'Outcome evaluator accepts claimed source changes for implementation tasks');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 38: pipeline exec retries transient failures and reaches ready', () => {
+  const { repoDir, agentPath, db } = setupPipelineExecRepo('sw-pipeline-retry-ready', 'pipe-retry-ready-branch');
+  startPipeline(db, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-retry-ready',
+    priority: 5,
+  });
+  db.close();
+
+  const attemptFile = join(tmpdir(), `sw-pipeline-retry-ready-attempt-${Date.now()}`);
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'exec',
+    'pipe-retry-ready',
+    '--max-iterations',
+    '3',
+    '--max-retries',
+    '1',
+    '--json',
+    '--',
+    '/bin/sh',
+    '-c',
+    `count=$(cat "${attemptFile}" 2>/dev/null || echo 0); count=$((count+1)); printf '%s\\n' "$count" > "${attemptFile}"; if [ "$count" -lt 2 ]; then exit 1; fi; printf 'updated\\n' > README.md && git add README.md && git -c user.email=test@test.com -c user.name=Test commit -m 'docs update' >/dev/null`,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.status === 'ready', 'Pipeline exec recovers from a transient task failure within retry budget');
+  assert(result.iterations.some((iteration) => iteration.retries_scheduled === 1), 'Pipeline exec records scheduled retries when a task fails transiently');
+  cleanupPipelineExecRepo(repoDir, agentPath);
+});
+
+test('Fix 39: pipeline exec blocks after exhausting retry budget', () => {
+  const { repoDir, agentPath, db } = setupPipelineExecRepo('sw-pipeline-retry-blocked', 'pipe-retry-blocked-branch');
+  startPipeline(db, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-retry-blocked',
+    priority: 5,
+  });
+  db.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'exec',
+    'pipe-retry-blocked',
+    '--max-iterations',
+    '3',
+    '--max-retries',
+    '1',
+    '--json',
+    '--',
+    process.execPath,
+    '-e',
+    'process.exit(2)',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const retryDb = openDb(repoDir);
+  const retryEvents = listAuditEvents(retryDb, { eventType: 'pipeline_task_retry_scheduled', limit: 10 });
+  const status = getPipelineStatus(retryDb, 'pipe-retry-blocked');
+  retryDb.close();
+
+  assert(result.status === 'blocked', 'Pipeline exec blocks once retry budget is exhausted and no forward progress remains');
+  assert(retryEvents.length === 1, 'Pipeline exec schedules exactly one retry when max-retries is one');
+  assert(status.counts.failed === 1, 'Pipeline leaves the task failed after retries are exhausted');
+  cleanupPipelineExecRepo(repoDir, agentPath);
+});
+
+test('Fix 40: pipeline exec resumes previously failed tasks when retries remain', () => {
+  const { repoDir, agentPath, db } = setupPipelineExecRepo('sw-pipeline-retry-resume', 'pipe-retry-resume-branch');
+  startPipeline(db, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-retry-resume',
+    priority: 5,
+  });
+  const lease = startTaskLease(db, 'pipe-retry-resume-01', 'agent1', 'pipeline-runner');
+  assert(Boolean(lease), 'Fixture acquires a lease before simulating a previous failed run');
+  failTask(db, 'pipe-retry-resume-01', 'pre-existing failure');
+  db.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'exec',
+    'pipe-retry-resume',
+    '--max-iterations',
+    '2',
+    '--max-retries',
+    '1',
+    '--json',
+    '--',
+    '/bin/sh',
+    '-c',
+    "printf 'updated\\n' > README.md && git add README.md && git -c user.email=test@test.com -c user.name=Test commit -m 'docs update' >/dev/null",
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.status === 'ready', 'Pipeline exec resumes a previously failed task when retry budget remains');
+  assert(result.iterations[0].resumed_retries === 1, 'Pipeline exec reports resumed retry work in the iteration summary');
+  cleanupPipelineExecRepo(repoDir, agentPath);
 });
 
 // ─── Cleanup & Results ────────────────────────────────────────────────────────

@@ -460,6 +460,34 @@ export function failTask(db, taskId, reason) {
   });
 }
 
+export function retryTask(db, taskId, reason = null) {
+  return withImmediateTransaction(db, () => {
+    const task = getTaskTx(db, taskId);
+    if (!task || task.status !== 'failed') {
+      return null;
+    }
+
+    db.prepare(`
+      UPDATE tasks
+      SET status='pending',
+          worktree=NULL,
+          agent=NULL,
+          completed_at=NULL,
+          updated_at=datetime('now')
+      WHERE id=? AND status='failed'
+    `).run(taskId);
+
+    logAuditEventTx(db, {
+      eventType: 'task_retried',
+      status: 'allowed',
+      taskId,
+      details: reason || null,
+    });
+
+    return getTaskTx(db, taskId);
+  });
+}
+
 export function listTasks(db, statusFilter) {
   if (statusFilter) {
     return db.prepare(`SELECT * FROM tasks WHERE status=? ORDER BY priority DESC, created_at ASC`).all(statusFilter);
@@ -744,7 +772,31 @@ export function logAuditEvent(db, payload) {
   logAuditEventTx(db, payload);
 }
 
-export function listAuditEvents(db, { eventType = null, status = null, limit = 50 } = {}) {
+export function listAuditEvents(db, { eventType = null, status = null, taskId = null, limit = 50 } = {}) {
+  if (eventType && status && taskId) {
+    return db.prepare(`
+      SELECT * FROM audit_log
+      WHERE event_type=? AND status=? AND task_id=?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(eventType, status, taskId, limit);
+  }
+  if (eventType && taskId) {
+    return db.prepare(`
+      SELECT * FROM audit_log
+      WHERE event_type=? AND task_id=?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(eventType, taskId, limit);
+  }
+  if (status && taskId) {
+    return db.prepare(`
+      SELECT * FROM audit_log
+      WHERE status=? AND task_id=?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(status, taskId, limit);
+  }
   if (eventType && status) {
     return db.prepare(`
       SELECT * FROM audit_log
