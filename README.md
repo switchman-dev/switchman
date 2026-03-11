@@ -225,6 +225,99 @@ Re-sync git worktrees into the Switchman database (useful if you add worktrees a
 
 ---
 
+## Pipelines and PRs
+
+Switchman can now take a backlog item through planning, governed execution, review, and PR handoff.
+
+### Create a pipeline from one issue
+
+```bash
+switchman pipeline start "Harden auth API permissions" \
+  --description "Update login permissions for the public API and add migration checks"
+```
+
+This creates structured subtasks with task specs, dependencies, and suggested worktrees.
+
+### Run the pipeline
+
+```bash
+switchman pipeline exec pipe-123 "/path/to/your-agent-command"
+```
+
+This dispatches dependency-ready tasks, launches agents with `SWITCHMAN_*` task context, applies retries/timeouts from the task spec, and runs review follow-ups until the pipeline is ready or blocked.
+
+### Generate a reviewer-facing PR summary
+
+```bash
+switchman pipeline pr pipe-123
+switchman pipeline pr pipe-123 --json
+```
+
+Use this to inspect the current PR-ready summary, gate results, risk notes, and provenance.
+
+### Export a PR bundle
+
+```bash
+switchman pipeline bundle pipe-123 .switchman/pr-bundles/auth-hardening
+```
+
+This writes:
+
+- `pr-summary.json`
+- `pr-summary.md`
+- `pr-body.md`
+
+### Publish a GitHub PR
+
+```bash
+switchman pipeline publish pipe-123 --base main --draft
+```
+
+This uses `gh pr create` with the generated PR title and body. Requirements:
+
+- GitHub CLI (`gh`) installed
+- `gh auth login` already completed
+- the pipeline worktree branch pushed or otherwise available as the PR head branch
+
+---
+
+## CI and GitHub Actions
+
+Switchman can publish CI-friendly gate output and install a ready-to-run GitHub Actions workflow.
+
+### Run the repo gate in CI
+
+```bash
+switchman gate ci
+switchman gate ci --json
+switchman gate ci --github
+```
+
+`switchman gate ci` fails non-zero when the repo contains unmanaged changes, stale compliance problems, or merge-governance issues.
+
+When run under GitHub Actions with `--github`, Switchman writes:
+
+- a step summary markdown report
+- `GITHUB_OUTPUT` values such as `switchman_ok=true|false`
+
+You can also point these explicitly:
+
+```bash
+switchman gate ci \
+  --github-step-summary /path/to/summary.md \
+  --github-output /path/to/output.txt
+```
+
+### Install the GitHub Actions workflow
+
+```bash
+switchman gate install-ci
+```
+
+This writes `.github/workflows/switchman-gate.yml`, which runs the Switchman CI gate on pushes and pull requests.
+
+---
+
 ## MCP tools (Claude Code)
 
 | Tool | What it does |
