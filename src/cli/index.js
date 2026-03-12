@@ -859,6 +859,23 @@ program
   .description('Conflict-aware task coordinator for parallel AI coding agents')
   .version('0.1.0');
 
+program.showHelpAfterError('(run with --help for usage examples)');
+program.addHelpText('after', `
+Start here:
+  switchman setup --agents 5
+  switchman status --watch
+  switchman gate ci
+
+Most useful commands:
+  switchman task add "Implement auth helper" --priority 9
+  switchman lease next --json
+  switchman queue run --watch
+
+Docs:
+  README.md
+  docs/setup-cursor.md
+`);
+
 // ── init ──────────────────────────────────────────────────────────────────────
 
 program
@@ -902,6 +919,11 @@ program
   .description('One-command setup: create agent workspaces and initialise Switchman')
   .option('-a, --agents <n>', 'Number of agent workspaces to create (default: 3)', '3')
   .option('--prefix <prefix>', 'Branch prefix (default: switchman)', 'switchman')
+  .addHelpText('after', `
+Examples:
+  switchman setup --agents 5
+  switchman setup --agents 3 --prefix team
+`)
   .action((opts) => {
     const agentCount = parseInt(opts.agents);
 
@@ -1001,6 +1023,11 @@ mcpCmd
   .option('--windsurf', 'Write Windsurf MCP config to ~/.codeium/mcp_config.json')
   .option('--home <path>', 'Override the home directory for config writes (useful for testing)')
   .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Examples:
+  switchman mcp install --windsurf
+  switchman mcp install --windsurf --json
+`)
   .action((opts) => {
     if (!opts.windsurf) {
       console.error(chalk.red('Choose an editor install target, for example `switchman mcp install --windsurf`.'));
@@ -1030,6 +1057,12 @@ mcpCmd
 // ── task ──────────────────────────────────────────────────────────────────────
 
 const taskCmd = program.command('task').description('Manage the task list');
+taskCmd.addHelpText('after', `
+Examples:
+  switchman task add "Fix login bug" --priority 8
+  switchman task list --status pending
+  switchman task done task-123
+`);
 
 taskCmd
   .command('add <title>')
@@ -1127,10 +1160,15 @@ taskCmd
 
 taskCmd
   .command('next')
-  .description('Get and assign the next pending task (compatibility shim for lease next)')
+  .description('Get the next pending task quickly (use `lease next` for the full workflow)')
   .option('--json', 'Output as JSON')
   .option('--worktree <name>', 'Workspace to assign the task to (defaults to the current folder name)')
   .option('--agent <name>', 'Agent identifier for logging (e.g. claude-code)')
+  .addHelpText('after', `
+Examples:
+  switchman task next
+  switchman task next --json
+`)
   .action((opts) => {
     const repoRoot = getRepo();
     const worktreeName = getCurrentWorktreeName(opts.worktree);
@@ -1160,6 +1198,12 @@ taskCmd
 // ── queue ─────────────────────────────────────────────────────────────────────
 
 const queueCmd = program.command('queue').description('Land finished work safely back onto main, one item at a time');
+queueCmd.addHelpText('after', `
+Examples:
+  switchman queue add --worktree agent1
+  switchman queue status
+  switchman queue run --watch
+`);
 
 queueCmd
   .command('add [branch]')
@@ -1266,6 +1310,11 @@ queueCmd
   .command('status')
   .description('Show an operator-friendly merge queue summary')
   .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Examples:
+  switchman queue status
+  switchman queue status --json
+`)
   .action((opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -1302,13 +1351,19 @@ queueCmd
 
 queueCmd
   .command('run')
-  .description('Process queued merge items serially')
+  .description('Process landing-queue items one at a time')
   .option('--max-items <n>', 'Maximum queue items to process', '1')
   .option('--target <branch>', 'Default target branch', 'main')
   .option('--watch', 'Keep polling for new queue items')
   .option('--watch-interval-ms <n>', 'Polling interval for --watch mode', '1000')
   .option('--max-cycles <n>', 'Maximum watch cycles before exiting (mainly for tests)')
   .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Examples:
+  switchman queue run
+  switchman queue run --watch
+  switchman queue run --watch --watch-interval-ms 1000
+`)
   .action(async (opts) => {
     const repoRoot = getRepo();
 
@@ -1413,6 +1468,12 @@ queueCmd
 // ── pipeline ──────────────────────────────────────────────────────────────────
 
 const pipelineCmd = program.command('pipeline').description('Create and summarize issue-to-PR execution pipelines');
+pipelineCmd.addHelpText('after', `
+Examples:
+  switchman pipeline start "Harden auth API permissions"
+  switchman pipeline exec pipe-123 "/path/to/agent-command"
+  switchman pipeline status pipe-123
+`);
 
 pipelineCmd
   .command('start <title>')
@@ -1706,7 +1767,16 @@ pipelineCmd
 
 // ── lease ────────────────────────────────────────────────────────────────────
 
-const leaseCmd = program.command('lease').description('Manage active work leases');
+const leaseCmd = program.command('lease').description('Manage active work sessions and keep long-running tasks alive');
+leaseCmd.addHelpText('after', `
+Plain English:
+  lease = a task currently checked out by an agent
+
+Examples:
+  switchman lease next --json
+  switchman lease heartbeat lease-123
+  switchman lease reap
+`);
 
 leaseCmd
   .command('acquire <taskId> <worktree>')
@@ -1742,10 +1812,16 @@ leaseCmd
 
 leaseCmd
   .command('next')
-  .description('Claim the next pending task and acquire its lease')
+  .description('Start the next pending task and open a tracked work session for it')
   .option('--json', 'Output as JSON')
-  .option('--worktree <name>', 'Worktree to assign the task to (defaults to current worktree name)')
+  .option('--worktree <name>', 'Workspace to assign the task to (defaults to the current folder name)')
   .option('--agent <name>', 'Agent identifier for logging')
+  .addHelpText('after', `
+Examples:
+  switchman lease next
+  switchman lease next --json
+  switchman lease next --worktree agent2 --agent cursor
+`)
   .action((opts) => {
     const repoRoot = getRepo();
     const worktreeName = getCurrentWorktreeName(opts.worktree);
@@ -1832,9 +1908,14 @@ leaseCmd
 
 leaseCmd
   .command('reap')
-  .description('Expire stale leases, release their claims, and return their tasks to pending')
+  .description('Clean up abandoned work sessions and release their file locks')
   .option('--stale-after-minutes <minutes>', 'Age threshold for staleness')
   .option('--json', 'Output as JSON')
+  .addHelpText('after', `
+Examples:
+  switchman lease reap
+  switchman lease reap --stale-after-minutes 20
+`)
   .action((opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -1919,7 +2000,11 @@ leasePolicyCmd
 
 // ── worktree ───────────────────────────────────────────────────────────────────
 
-const wtCmd = program.command('worktree').description('Manage worktrees');
+const wtCmd = program.command('worktree').description('Manage registered workspaces (Git worktrees)');
+wtCmd.addHelpText('after', `
+Plain English:
+  worktree = the Git feature behind each agent workspace
+`);
 
 wtCmd
   .command('add <name> <path> <branch>')
@@ -2181,6 +2266,12 @@ program
   .description('Scan all workspaces for conflicts')
   .option('--json', 'Output raw JSON')
   .option('--quiet', 'Only show conflicts')
+  .addHelpText('after', `
+Examples:
+  switchman scan
+  switchman scan --quiet
+  switchman scan --json
+`)
   .action(async (opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -2296,6 +2387,14 @@ program
   .option('--watch', 'Keep refreshing status in the terminal')
   .option('--watch-interval-ms <n>', 'Polling interval for --watch mode', '2000')
   .option('--max-cycles <n>', 'Maximum refresh cycles before exiting', '0')
+  .addHelpText('after', `
+Examples:
+  switchman status
+  switchman status --watch
+  switchman status --json
+
+Use this first when the repo feels stuck.
+`)
   .action(async (opts) => {
     const repoRoot = getRepo();
     const watch = Boolean(opts.watch);
@@ -2416,6 +2515,12 @@ program
 // ── gate ─────────────────────────────────────────────────────────────────────
 
 const gateCmd = program.command('gate').description('Safety checks for edits, merges, and CI');
+gateCmd.addHelpText('after', `
+Examples:
+  switchman gate ci
+  switchman gate ai
+  switchman gate install-ci
+`);
 
 const auditCmd = program.command('audit').description('Inspect and verify the tamper-evident audit trail');
 

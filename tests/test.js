@@ -2795,6 +2795,34 @@ test('Status text surfaces one front-door operator view', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('CLI help includes examples for the main entrypoint', () => {
+  const helpOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    '--help',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+
+  assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
+  assert(helpOutput.includes('switchman status --watch'), 'Top-level help includes a practical status example');
+  assert(helpOutput.includes('docs/setup-cursor.md'), 'Top-level help points users to the recommended setup guide');
+});
+
+test('Lease help explains the term and shows examples', () => {
+  const helpOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'lease',
+    '--help',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+
+  assert(helpOutput.includes('lease = a task currently checked out by an agent'), 'Lease help includes plain-English vocabulary guidance');
+  assert(helpOutput.includes('switchman lease next --json'), 'Lease help includes a practical example');
+});
+
 test('Fix 28ab: doctor and repo gate surface stale dependency invalidations', () => {
   const repoDir = join(tmpdir(), `sw-doctor-stale-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
