@@ -695,16 +695,29 @@ function renderUnifiedStatusReport(report) {
     })
     : [chalk.dim('Nothing active right now.')];
 
-  const attentionLines = report.attention.length > 0
-    ? report.attention.slice(0, 6).flatMap((item) => {
-      const tone = item.severity === 'block' ? chalk.red('BLOCK') : chalk.yellow('WARN ');
+  const blockedItems = report.attention.filter((item) => item.severity === 'block');
+  const warningItems = report.attention.filter((item) => item.severity !== 'block');
+
+  const blockedLines = blockedItems.length > 0
+    ? blockedItems.slice(0, 4).flatMap((item) => {
+      const lines = [`${chalk.red('BLOCK')} ${item.title}`];
+      if (item.detail) lines.push(`  ${chalk.dim(item.detail)}`);
+      lines.push(`  ${chalk.yellow('next:')} ${item.next_step}`);
+      if (item.command) lines.push(`  ${chalk.cyan('run:')} ${item.command}`);
+      return lines;
+    })
+    : [chalk.green('Nothing blocked.')];
+
+  const warningLines = warningItems.length > 0
+    ? warningItems.slice(0, 4).flatMap((item) => {
+      const tone = chalk.yellow('WARN ');
       const lines = [`${tone} ${item.title}`];
       if (item.detail) lines.push(`  ${chalk.dim(item.detail)}`);
       lines.push(`  ${chalk.yellow('next:')} ${item.next_step}`);
       if (item.command) lines.push(`  ${chalk.cyan('run:')} ${item.command}`);
       return lines;
     })
-    : [chalk.green('Nothing urgent.')];
+    : [chalk.green('Nothing warning-worthy right now.')];
 
   const queueLines = report.queue.items.length > 0
     ? [
@@ -733,7 +746,8 @@ function renderUnifiedStatusReport(report) {
 
   const panelBlocks = [
     renderPanel('Running now', runningLines, chalk.cyan),
-    renderPanel('Attention now', attentionLines, report.health === 'block' ? chalk.red : chalk.yellow),
+    renderPanel('Blocked', blockedLines, blockedItems.length > 0 ? chalk.red : chalk.green),
+    renderPanel('Warnings', warningLines, warningItems.length > 0 ? chalk.yellow : chalk.green),
     renderPanel('Landing queue', queueLines, queueCounts.blocked > 0 ? chalk.red : chalk.blue),
     renderPanel('Next action', nextActionLines, chalk.green),
   ];

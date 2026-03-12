@@ -2722,7 +2722,7 @@ test('Status text surfaces one front-door operator view', () => {
   });
 
   assert(textOutput.includes('switchman status'), 'Status text includes the dashboard banner');
-  assert(textOutput.includes('Attention now'), 'Status text includes operator attention items');
+  assert(textOutput.includes('Blocked'), 'Status text includes the blocked panel');
   assert(textOutput.includes('Landing queue'), 'Status text includes merge queue visibility');
   assert(textOutput.includes('Next action'), 'Status text includes the next action panel');
   rmSync(repoDir, { recursive: true, force: true });
