@@ -46,6 +46,7 @@ import {
   getNextPendingTask,
   enqueueMergeItem,
   listMergeQueue,
+  markMergeQueueState,
   listLeases,
   listBoundaryValidationStates,
   listDependencyInvalidations,
@@ -2620,6 +2621,110 @@ test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () 
   assert(textOutput.includes('next:'), 'Doctor CLI prints actionable next guidance');
   assert(textOutput.includes('run:'), 'Doctor CLI prints exact follow-through commands');
   assert(textOutput.includes('scope:src/**'), 'Doctor CLI prints scope ownership for active leases');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Status JSON unifies queue, lease policy, and operator attention', () => {
+  const repoDir = join(tmpdir(), `sw-status-json-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  writeLeasePolicy(repoDir, {
+    heartbeat_interval_seconds: 45,
+    stale_after_minutes: 12,
+    reap_on_status_check: false,
+    requeue_task_on_reap: true,
+  });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const activeTaskId = createTask(db, { title: 'Implement auth cleanup', priority: 8 });
+  assignTask(db, activeTaskId, 'main');
+  upsertTaskSpec(db, activeTaskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  const failedTaskId = createTask(db, { title: 'Update docs', priority: 5 });
+  assignTask(db, failedTaskId, 'main');
+  failTask(db, failedTaskId, 'changes_outside_task_scope: changed files outside task scope: src/rogue.js');
+  const queued = enqueueMergeItem(db, {
+    sourceType: 'branch',
+    sourceRef: 'feature/docs',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(db, queued.id, {
+    status: 'blocked',
+    lastErrorCode: 'gate_failed',
+    lastErrorSummary: 'Repo gate rejected unmanaged changes.',
+    nextAction: `Run \`switchman gate ci\`, resolve the reported issues, then run \`switchman queue retry ${queued.id}\`.`,
+  });
+  db.close();
+
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(jsonOutput.counts.queue.blocked === 1, 'Status JSON includes merge queue counts');
+  assert(jsonOutput.lease_policy.stale_after_minutes === 12, 'Status JSON includes the active lease policy');
+  assert(jsonOutput.attention.some((item) => item.kind === 'queue_blocked'), 'Status JSON includes blocked queue items in attention');
+  assert(jsonOutput.active_work.some((item) => item.scope_summary === 'scope:src/**'), 'Status JSON preserves active lease scope summaries');
+  assert(jsonOutput.suggested_commands.includes('switchman queue status'), 'Status JSON suggests queue follow-up commands');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Status text surfaces one front-door operator view', () => {
+  const repoDir = join(tmpdir(), `sw-status-text-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const failedTaskId = createTask(db, { title: 'Refresh docs', priority: 6 });
+  assignTask(db, failedTaskId, 'main');
+  failTask(db, failedTaskId, 'changes_outside_task_scope: changed files outside task scope: src/rogue.js');
+  const queued = enqueueMergeItem(db, {
+    sourceType: 'branch',
+    sourceRef: 'feature/docs',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(db, queued.id, {
+    status: 'retrying',
+    lastErrorCode: 'merge_conflict',
+    lastErrorSummary: 'Merge conflict blocked queue item.',
+    nextAction: 'Retry 1 of 1 scheduled automatically. Run `switchman queue run` again after fixing any underlying branch drift if needed.',
+    incrementRetry: true,
+  });
+  db.close();
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(textOutput.includes('switchman status'), 'Status text includes the dashboard banner');
+  assert(textOutput.includes('Attention now'), 'Status text includes operator attention items');
+  assert(textOutput.includes('Landing queue'), 'Status text includes merge queue visibility');
+  assert(textOutput.includes('Next action'), 'Status text includes the next action panel');
   rmSync(repoDir, { recursive: true, force: true });
 });
 

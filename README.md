@@ -84,6 +84,7 @@ In another terminal:
 
 ```bash
 switchman status
+switchman status --watch
 switchman scan
 switchman gate ci
 ```
@@ -269,6 +270,21 @@ It answers:
 - what failed
 - what needs attention next
 
+It is designed to be the main operator view in the terminal:
+- a health banner at the top
+- compact task / lease / queue / merge-readiness counts
+- dashboard-style panels for `Running now`, `Attention now`, `Landing queue`, and `Next action`
+- exact follow-up commands when something is blocked
+
+Useful modes:
+
+```bash
+switchman status
+switchman status --watch
+switchman status --json
+switchman status --watch --watch-interval-ms 2000
+```
+
 ### `switchman scan`
 
 Use this before merge, or any time you suspect agents overlapped.
@@ -418,7 +434,19 @@ Check all worktrees for conflicts — both uncommitted file overlaps and branch-
 By default, common generated paths such as `node_modules/`, `dist/`, `build/`, and `coverage/` are ignored.
 
 ### `switchman status`
-Full overview: task counts, active leases, stale leases, locked files, a quick conflict scan, and readable failure explanations.
+The main terminal dashboard for the repo.
+
+It shows:
+- health banner and merge-readiness summary
+- active work and stale or blocked attention items
+- landing queue state and retries
+- next tasks and suggested commands
+
+Useful options:
+- `--json` — machine-readable output for scripts and integrations
+- `--watch` — live terminal monitoring
+- `--watch-interval-ms <n>` — polling interval for watch mode
+- `--max-cycles <n>` — stop watch mode after a fixed number of refreshes
 
 ### `switchman worktree list`
 List all git worktrees with their registered agents and status.

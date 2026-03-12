@@ -128,6 +128,52 @@ function printTable(rows, columns) {
   }
 }
 
+function padRight(value, width) {
+  return String(value).padEnd(width);
+}
+
+function stripAnsi(text) {
+  return String(text).replace(/\x1B\[[0-9;]*m/g, '');
+}
+
+function colorForHealth(health) {
+  if (health === 'healthy') return chalk.green;
+  if (health === 'warn') return chalk.yellow;
+  return chalk.red;
+}
+
+function healthLabel(health) {
+  if (health === 'healthy') return 'HEALTHY';
+  if (health === 'warn') return 'ATTENTION';
+  return 'BLOCKED';
+}
+
+function renderPanel(title, lines, color = chalk.cyan) {
+  const content = lines.length > 0 ? lines : [chalk.dim('No items.')];
+  const width = Math.max(
+    stripAnsi(title).length + 2,
+    ...content.map((line) => stripAnsi(line).length),
+  );
+  const top = color(`+${'-'.repeat(width + 2)}+`);
+  const titleLine = color(`| ${padRight(title, width)} |`);
+  const body = content.map((line) => `| ${padRight(line, width)} |`);
+  const bottom = color(`+${'-'.repeat(width + 2)}+`);
+  return [top, titleLine, top, ...body, bottom];
+}
+
+function renderMetricRow(metrics) {
+  return metrics.map(({ label, value, color = chalk.white }) => `${chalk.dim(label)} ${color(String(value))}`).join(chalk.dim('   |   '));
+}
+
+function renderMiniBar(items) {
+  if (!items.length) return chalk.dim('none');
+  return items.map(({ label, value, color = chalk.white }) => `${color('■')} ${label}:${value}`).join(chalk.dim('  '));
+}
+
+function formatRelativePolicy(policy) {
+  return `stale ${policy.stale_after_minutes}m • heartbeat ${policy.heartbeat_interval_seconds}s • auto-reap ${policy.reap_on_status_check ? 'on' : 'off'}`;
+}
+
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
@@ -463,6 +509,264 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       ? [...new Set(attention.map((item) => item.command).filter(Boolean))].slice(0, 5)
       : ['switchman gate ci', 'switchman scan'],
   };
+}
+
+function buildUnifiedStatusReport({
+  repoRoot,
+  leasePolicy,
+  tasks,
+  claims,
+  doctorReport,
+  queueItems,
+  queueSummary,
+  recentQueueEvents,
+}) {
+  const queueAttention = [
+    ...queueItems
+      .filter((item) => item.status === 'blocked')
+      .map((item) => ({
+        kind: 'queue_blocked',
+        title: `${item.id} is blocked from landing`,
+        detail: item.last_error_summary || `${item.source_type}:${item.source_ref}`,
+        next_step: item.next_action || `Run \`switchman queue retry ${item.id}\` after fixing the branch state.`,
+        command: item.next_action?.includes('queue retry') ? `switchman queue retry ${item.id}` : 'switchman queue status',
+        severity: 'block',
+      })),
+    ...queueItems
+      .filter((item) => item.status === 'retrying')
+      .map((item) => ({
+        kind: 'queue_retrying',
+        title: `${item.id} is waiting for another landing attempt`,
+        detail: item.last_error_summary || `${item.source_type}:${item.source_ref}`,
+        next_step: item.next_action || 'Run `switchman queue run` again to continue landing queued work.',
+        command: 'switchman queue run',
+        severity: 'warn',
+      })),
+  ];
+
+  const attention = [...doctorReport.attention, ...queueAttention];
+  const nextUp = tasks
+    .filter((task) => task.status === 'pending')
+    .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))
+    .slice(0, 3)
+    .map((task) => ({
+      id: task.id,
+      title: task.title,
+      priority: task.priority,
+    }));
+  const failedTasks = tasks
+    .filter((task) => task.status === 'failed')
+    .slice(0, 5)
+    .map((task) => ({
+      id: task.id,
+      title: task.title,
+      failure: latestTaskFailure(task),
+    }));
+
+  const suggestedCommands = [
+    ...doctorReport.suggested_commands,
+    ...(queueItems.length > 0 ? ['switchman queue status'] : []),
+    ...(queueSummary.next ? ['switchman queue run'] : []),
+  ].filter(Boolean);
+
+  return {
+    generated_at: new Date().toISOString(),
+    repo_root: repoRoot,
+    health: attention.some((item) => item.severity === 'block')
+      ? 'block'
+      : attention.some((item) => item.severity === 'warn')
+        ? 'warn'
+        : doctorReport.health,
+    summary: attention.some((item) => item.severity === 'block')
+      ? 'Repo needs attention before more work or merge.'
+      : attention.some((item) => item.severity === 'warn')
+        ? 'Repo is running, but a few items need review.'
+        : 'Repo looks healthy. Agents are coordinated and merge checks are clear.',
+    lease_policy: leasePolicy,
+    counts: {
+      ...doctorReport.counts,
+      queue: queueSummary.counts,
+      active_claims: claims.length,
+    },
+    active_work: doctorReport.active_work,
+    attention,
+    next_up: nextUp,
+    failed_tasks: failedTasks,
+    queue: {
+      items: queueItems,
+      summary: queueSummary,
+      recent_events: recentQueueEvents,
+    },
+    merge_readiness: doctorReport.merge_readiness,
+    claims: claims.map((claim) => ({
+      worktree: claim.worktree,
+      task_id: claim.task_id,
+      file_path: claim.file_path,
+    })),
+    next_steps: [...new Set([
+      ...doctorReport.next_steps,
+      ...queueAttention.map((item) => item.next_step),
+    ])].slice(0, 6),
+    suggested_commands: [...new Set(suggestedCommands)].slice(0, 6),
+  };
+}
+
+async function collectStatusSnapshot(repoRoot) {
+  const db = getDb(repoRoot);
+  try {
+    const leasePolicy = loadLeasePolicy(repoRoot);
+
+    if (leasePolicy.reap_on_status_check) {
+      reapStaleLeases(db, leasePolicy.stale_after_minutes, {
+        requeueTask: leasePolicy.requeue_task_on_reap,
+      });
+    }
+
+    const tasks = listTasks(db);
+    const activeLeases = listLeases(db, 'active');
+    const staleLeases = getStaleLeases(db, leasePolicy.stale_after_minutes);
+    const claims = getActiveFileClaims(db);
+    const queueItems = listMergeQueue(db);
+    const queueSummary = buildQueueStatusSummary(queueItems);
+    const recentQueueEvents = queueItems
+      .slice(0, 5)
+      .flatMap((item) => listMergeQueueEvents(db, item.id, { limit: 3 }).map((event) => ({ ...event, queue_item_id: item.id })))
+      .sort((a, b) => b.id - a.id)
+      .slice(0, 8);
+    const scanReport = await scanAllWorktrees(db, repoRoot);
+    const aiGate = await runAiMergeGate(db, repoRoot);
+    const doctorReport = buildDoctorReport({
+      db,
+      repoRoot,
+      tasks,
+      activeLeases,
+      staleLeases,
+      scanReport,
+      aiGate,
+    });
+
+    return buildUnifiedStatusReport({
+      repoRoot,
+      leasePolicy,
+      tasks,
+      claims,
+      doctorReport,
+      queueItems,
+      queueSummary,
+      recentQueueEvents,
+    });
+  } finally {
+    db.close();
+  }
+}
+
+function renderUnifiedStatusReport(report) {
+  const healthColor = colorForHealth(report.health);
+  const badge = healthColor(healthLabel(report.health));
+  const mergeColor = report.merge_readiness.ci_gate_ok ? chalk.green : chalk.red;
+  const queueCounts = report.counts.queue;
+
+  console.log('');
+  console.log(healthColor('='.repeat(64)));
+  console.log(`${badge} ${chalk.bold('switchman status')} ${chalk.dim('• user-centred repo overview')}`);
+  console.log(`${chalk.dim(report.repo_root)}`);
+  console.log(`${chalk.dim(report.summary)}`);
+  console.log(healthColor('='.repeat(64)));
+  console.log(renderMetricRow([
+    { label: 'tasks', value: `${report.counts.pending}/${report.counts.in_progress}/${report.counts.done}/${report.counts.failed}`, color: chalk.white },
+    { label: 'leases', value: `${report.counts.active_leases} active`, color: chalk.blue },
+    { label: 'claims', value: report.counts.active_claims, color: chalk.cyan },
+    { label: 'merge', value: report.merge_readiness.ci_gate_ok ? 'clear' : 'blocked', color: mergeColor },
+  ]));
+  console.log(renderMiniBar([
+    { label: 'queued', value: queueCounts.queued, color: chalk.yellow },
+    { label: 'retrying', value: queueCounts.retrying, color: chalk.yellow },
+    { label: 'blocked', value: queueCounts.blocked, color: chalk.red },
+    { label: 'merging', value: queueCounts.merging, color: chalk.blue },
+    { label: 'merged', value: queueCounts.merged, color: chalk.green },
+  ]));
+  console.log(chalk.dim(`policy: ${formatRelativePolicy(report.lease_policy)} • requeue on reap ${report.lease_policy.requeue_task_on_reap ? 'on' : 'off'}`));
+
+  const runningLines = report.active_work.length > 0
+    ? report.active_work.slice(0, 5).map((item) => {
+      const boundary = item.boundary_validation ? ` validation:${item.boundary_validation.status}` : '';
+      const stale = (item.dependency_invalidations?.length || 0) > 0 ? ` stale:${item.dependency_invalidations.length}` : '';
+      return `${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}${item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : ''}${chalk.dim(boundary)}${chalk.dim(stale)}`;
+    })
+    : [chalk.dim('Nothing active right now.')];
+
+  const attentionLines = report.attention.length > 0
+    ? report.attention.slice(0, 6).flatMap((item) => {
+      const tone = item.severity === 'block' ? chalk.red('BLOCK') : chalk.yellow('WARN ');
+      const lines = [`${tone} ${item.title}`];
+      if (item.detail) lines.push(`  ${chalk.dim(item.detail)}`);
+      lines.push(`  ${chalk.yellow('next:')} ${item.next_step}`);
+      if (item.command) lines.push(`  ${chalk.cyan('run:')} ${item.command}`);
+      return lines;
+    })
+    : [chalk.green('Nothing urgent.')];
+
+  const queueLines = report.queue.items.length > 0
+    ? [
+      ...(report.queue.summary.next
+        ? [`${chalk.dim('next:')} ${report.queue.summary.next.id} ${report.queue.summary.next.source_type}:${report.queue.summary.next.source_ref} ${chalk.dim(`retries:${report.queue.summary.next.retry_count}/${report.queue.summary.next.max_retries}`)}`]
+        : []),
+      ...report.queue.items
+        .filter((entry) => ['blocked', 'retrying', 'merging'].includes(entry.status))
+        .slice(0, 4)
+        .flatMap((item) => {
+          const lines = [`${statusBadge(item.status)} ${item.id} ${item.source_type}:${item.source_ref} ${chalk.dim(`retries:${item.retry_count}/${item.max_retries}`)}`];
+          if (item.last_error_summary) lines.push(`  ${chalk.red('why:')} ${item.last_error_summary}`);
+          if (item.next_action) lines.push(`  ${chalk.yellow('next:')} ${item.next_action}`);
+          return lines;
+        }),
+    ]
+    : [chalk.dim('No queued merges.')];
+
+  const nextActionLines = [
+    ...(report.next_up.length > 0
+      ? report.next_up.map((task) => `[p${task.priority}] ${task.title} ${chalk.dim(task.id)}`)
+      : [chalk.dim('No pending tasks waiting right now.')]),
+    '',
+    ...report.suggested_commands.slice(0, 4).map((command) => `${chalk.cyan('$')} ${command}`),
+  ];
+
+  const panelBlocks = [
+    renderPanel('Running now', runningLines, chalk.cyan),
+    renderPanel('Attention now', attentionLines, report.health === 'block' ? chalk.red : chalk.yellow),
+    renderPanel('Landing queue', queueLines, queueCounts.blocked > 0 ? chalk.red : chalk.blue),
+    renderPanel('Next action', nextActionLines, chalk.green),
+  ];
+
+  console.log('');
+  for (const block of panelBlocks) {
+    for (const line of block) console.log(line);
+    console.log('');
+  }
+
+  if (report.failed_tasks.length > 0) {
+    console.log(chalk.bold('Recent failed tasks:'));
+    for (const task of report.failed_tasks) {
+      const reason = humanizeReasonCode(task.failure?.reason_code);
+      const summary = task.failure?.summary || 'unknown failure';
+      console.log(`  ${chalk.red(task.title)} ${chalk.dim(task.id)}`);
+      console.log(`    ${chalk.red('why:')} ${summary} ${chalk.dim(`(${reason})`)}`);
+    }
+    console.log('');
+  }
+
+  if (report.queue.recent_events.length > 0) {
+    console.log(chalk.bold('Recent queue events:'));
+    for (const event of report.queue.recent_events.slice(0, 5)) {
+      console.log(`  ${chalk.cyan(event.queue_item_id)} ${chalk.dim(event.event_type)} ${chalk.dim(event.status || '')} ${chalk.dim(event.created_at)}`.trim());
+    }
+    console.log('');
+  }
+
+  console.log(chalk.bold('Recommended next steps:'));
+  for (const step of report.next_steps) {
+    console.log(`  - ${step}`);
+  }
 }
 
 function acquireNextTaskLease(db, worktreeName, agent, attempts = 20) {
@@ -1937,202 +2241,41 @@ program
 
 program
   .command('status')
-  .description('Show full system status: tasks, worktrees, claims, and conflicts')
-  .action(async () => {
+  .description('Show one operational view of tasks, leases, queue state, and merge readiness')
+  .option('--json', 'Output raw JSON')
+  .option('--watch', 'Keep refreshing status in the terminal')
+  .option('--watch-interval-ms <n>', 'Polling interval for --watch mode', '2000')
+  .option('--max-cycles <n>', 'Maximum refresh cycles before exiting', '0')
+  .action(async (opts) => {
     const repoRoot = getRepo();
-    const db = getDb(repoRoot);
-    const leasePolicy = loadLeasePolicy(repoRoot);
+    const watch = Boolean(opts.watch);
+    const watchIntervalMs = Math.max(100, Number.parseInt(opts.watchIntervalMs, 10) || 2000);
+    const maxCycles = Math.max(0, Number.parseInt(opts.maxCycles, 10) || 0);
+    let cycles = 0;
 
-    if (leasePolicy.reap_on_status_check) {
-      reapStaleLeases(db, leasePolicy.stale_after_minutes, {
-        requeueTask: leasePolicy.requeue_task_on_reap,
-      });
-    }
-
-    console.log('');
-    console.log(chalk.bold.cyan('━━━ switchman status ━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
-    console.log(chalk.dim(`Repo: ${repoRoot}`));
-    console.log('');
-
-    // Tasks
-    const tasks = listTasks(db);
-    const pending = tasks.filter(t => t.status === 'pending');
-    const inProgress = tasks.filter(t => t.status === 'in_progress');
-    const done = tasks.filter(t => t.status === 'done');
-    const failed = tasks.filter(t => t.status === 'failed');
-    const activeLeases = listLeases(db, 'active');
-    const staleLeases = getStaleLeases(db, leasePolicy.stale_after_minutes);
-
-    console.log(chalk.bold('Tasks:'));
-    console.log(`  ${chalk.yellow('Pending')}     ${pending.length}`);
-    console.log(`  ${chalk.blue('In Progress')} ${inProgress.length}`);
-    console.log(`  ${chalk.green('Done')}        ${done.length}`);
-    console.log(`  ${chalk.red('Failed')}      ${failed.length}`);
-    console.log(`  ${chalk.dim('policy:')} stale_after=${leasePolicy.stale_after_minutes}m heartbeat=${leasePolicy.heartbeat_interval_seconds}s auto_reap=${leasePolicy.reap_on_status_check} requeue_on_reap=${leasePolicy.requeue_task_on_reap}`);
-
-    if (activeLeases.length > 0) {
-      console.log('');
-      console.log(chalk.bold('Active Leases:'));
-      for (const lease of activeLeases) {
-        const agent = lease.agent ? ` ${chalk.dim(`agent:${lease.agent}`)}` : '';
-        const scope = summarizeLeaseScope(db, lease);
-        const boundaryValidation = getBoundaryValidationState(db, lease.id);
-        const dependencyInvalidations = listDependencyInvalidations(db, { affectedTaskId: lease.task_id });
-        const boundary = boundaryValidation ? ` ${chalk.dim(`validation:${boundaryValidation.status}`)}` : '';
-        const staleMarker = dependencyInvalidations.length > 0 ? ` ${chalk.dim(`stale:${dependencyInvalidations.length}`)}` : '';
-        console.log(`  ${chalk.cyan(lease.worktree)} → ${lease.task_title} ${chalk.dim(lease.id)} ${chalk.dim(`task:${lease.task_id}`)}${agent}${scope ? ` ${chalk.dim(scope)}` : ''}${boundary}${staleMarker}`);
+    while (true) {
+      if (watch && process.stdout.isTTY && !opts.json) {
+        console.clear();
       }
-    } else if (inProgress.length > 0) {
-      console.log('');
-      console.log(chalk.bold('In-Progress Tasks Without Lease:'));
-      for (const t of inProgress) {
-        console.log(`  ${chalk.cyan(t.worktree || 'unassigned')} → ${t.title}`);
-      }
-    }
 
-    if (staleLeases.length > 0) {
-      console.log('');
-      console.log(chalk.bold('Stale Leases:'));
-      for (const lease of staleLeases) {
-        console.log(`  ${chalk.red(lease.worktree)} → ${lease.task_title} ${chalk.dim(lease.id)} ${chalk.dim(lease.heartbeat_at)}`);
-      }
-    }
+      const report = await collectStatusSnapshot(repoRoot);
+      cycles += 1;
 
-    if (pending.length > 0) {
-      console.log('');
-      console.log(chalk.bold('Next Up:'));
-      const next = pending.slice(0, 3);
-      for (const t of next) {
-        console.log(`  [p${t.priority}] ${t.title} ${chalk.dim(t.id)}`);
-      }
-    }
-
-    if (failed.length > 0) {
-      console.log('');
-      console.log(chalk.bold('Failed Tasks:'));
-      for (const task of failed.slice(0, 5)) {
-        const failureLine = String(task.description || '')
-          .split('\n')
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .reverse()
-          .find((line) => line.startsWith('FAILED: '));
-        const failureText = failureLine ? failureLine.slice('FAILED: '.length) : 'unknown failure';
-        const reasonMatch = failureText.match(/^([a-z0-9_]+):\s*(.+)$/i);
-        const reasonCode = reasonMatch ? reasonMatch[1] : null;
-        const summary = reasonMatch ? reasonMatch[2] : failureText;
-        const nextStep = nextStepForReason(reasonCode);
-        console.log(`  ${chalk.red(task.title)} ${chalk.dim(task.id)}`);
-        console.log(`    ${chalk.red('why:')} ${summary} ${chalk.dim(`(${humanizeReasonCode(reasonCode)})`)}`);
-        if (nextStep) {
-          console.log(`    ${chalk.yellow('next:')} ${nextStep}`);
-        }
-      }
-    }
-
-    // File Claims
-    const claims = getActiveFileClaims(db);
-    if (claims.length > 0) {
-      console.log('');
-      console.log(chalk.bold(`Active File Claims (${claims.length}):`));
-      const byWorktree = {};
-      for (const c of claims) {
-        if (!byWorktree[c.worktree]) byWorktree[c.worktree] = [];
-        byWorktree[c.worktree].push(c.file_path);
-      }
-      for (const [wt, files] of Object.entries(byWorktree)) {
-        console.log(`  ${chalk.cyan(wt)}: ${files.slice(0, 5).join(', ')}${files.length > 5 ? ` +${files.length - 5} more` : ''}`);
-      }
-    }
-
-    // Quick conflict scan
-    console.log('');
-    const spinner = ora('Running conflict scan...').start();
-    try {
-      const report = await scanAllWorktrees(db, repoRoot);
-      spinner.stop();
-
-      const totalConflicts = report.conflicts.length + report.fileConflicts.length + (report.ownershipConflicts?.length || 0) + (report.semanticConflicts?.length || 0) + report.unclaimedChanges.length;
-      if (totalConflicts === 0) {
-        console.log(chalk.green(`✓ No conflicts across ${report.worktrees.length} worktree(s)`));
+      if (opts.json) {
+        console.log(JSON.stringify(watch ? { ...report, watch: true, cycles } : report, null, 2));
       } else {
-        console.log(chalk.red(`⚠ ${totalConflicts} conflict(s) detected — run 'switchman scan' for details`));
-      }
-
-      console.log('');
-      console.log(chalk.bold('Compliance:'));
-      console.log(`  ${chalk.green('Managed')}       ${report.complianceSummary.managed}`);
-      console.log(`  ${chalk.yellow('Observed')}      ${report.complianceSummary.observed}`);
-      console.log(`  ${chalk.red('Non-Compliant')} ${report.complianceSummary.non_compliant}`);
-      console.log(`  ${chalk.red('Stale')}         ${report.complianceSummary.stale}`);
-
-      if (report.unclaimedChanges.length > 0) {
-        console.log('');
-        console.log(chalk.bold('Unclaimed Changed Paths:'));
-        for (const entry of report.unclaimedChanges) {
-          const reasonCode = entry.reasons?.[0]?.reason_code || null;
-          const nextStep = nextStepForReason(reasonCode);
-          console.log(`  ${chalk.cyan(entry.worktree)}: ${entry.files.slice(0, 5).join(', ')}${entry.files.length > 5 ? ` +${entry.files.length - 5} more` : ''}`);
-          console.log(`    ${chalk.dim(humanizeReasonCode(reasonCode))}${nextStep ? ` — ${nextStep}` : ''}`);
+        renderUnifiedStatusReport(report);
+        if (watch) {
+          console.log('');
+          console.log(chalk.dim(`Watching every ${watchIntervalMs}ms${maxCycles > 0 ? ` • cycle ${cycles}/${maxCycles}` : ''}`));
         }
       }
 
-      if ((report.ownershipConflicts?.length || 0) > 0) {
-        console.log('');
-        console.log(chalk.bold('Ownership Boundary Overlaps:'));
-        for (const conflict of report.ownershipConflicts.slice(0, 5)) {
-          if (conflict.type === 'subsystem_overlap') {
-            console.log(`  ${chalk.cyan(conflict.worktreeA)}: ${chalk.dim(`subsystem:${conflict.subsystemTag}`)} ${chalk.dim('vs')} ${chalk.cyan(conflict.worktreeB)}`);
-          } else {
-            console.log(`  ${chalk.cyan(conflict.worktreeA)}: ${chalk.dim(conflict.scopeA)} ${chalk.dim('vs')} ${chalk.cyan(conflict.worktreeB)} ${chalk.dim(conflict.scopeB)}`);
-          }
-        }
-      }
-
-      if ((report.semanticConflicts?.length || 0) > 0) {
-        console.log('');
-        console.log(chalk.bold('Semantic Overlaps:'));
-        for (const conflict of report.semanticConflicts.slice(0, 5)) {
-          console.log(`  ${chalk.cyan(conflict.worktreeA)}: ${chalk.dim(conflict.object_name)} ${chalk.dim('vs')} ${chalk.cyan(conflict.worktreeB)} ${chalk.dim(`${conflict.fileA} ↔ ${conflict.fileB}`)}`);
-        }
-      }
-
-      const staleInvalidations = listDependencyInvalidations(db, { status: 'stale' });
-      if (staleInvalidations.length > 0) {
-        console.log('');
-        console.log(chalk.bold('Stale For Revalidation:'));
-        for (const invalidation of staleInvalidations.slice(0, 5)) {
-          const staleArea = invalidation.reason_type === 'subsystem_overlap'
-            ? `subsystem:${invalidation.subsystem_tag}`
-            : `${invalidation.source_scope_pattern} ↔ ${invalidation.affected_scope_pattern}`;
-          console.log(`  ${chalk.cyan(invalidation.affected_worktree || 'unknown')}: ${chalk.dim(staleArea)} ${chalk.dim('because')} ${chalk.cyan(invalidation.source_worktree || 'unknown')} changed it`);
-        }
-      }
-
-      if (report.commitGateFailures.length > 0) {
-        console.log('');
-        console.log(chalk.bold('Recent Commit Gate Failures:'));
-        for (const failure of report.commitGateFailures.slice(0, 5)) {
-          console.log(`  ${chalk.red(failure.worktree || 'unknown')} ${chalk.dim(humanizeReasonCode(failure.reason_code || 'rejected'))} ${chalk.dim(failure.created_at)}`);
-        }
-      }
-
-      if (report.deniedWrites.length > 0) {
-        console.log('');
-        console.log(chalk.bold('Recent Denied Events:'));
-        for (const event of report.deniedWrites.slice(0, 5)) {
-          console.log(`  ${chalk.red(event.event_type)} ${chalk.cyan(event.worktree || 'repo')} ${chalk.dim(humanizeReasonCode(event.reason_code || event.status))}`);
-        }
-      }
-    } catch {
-      spinner.stop();
-      console.log(chalk.dim('Could not run conflict scan'));
+      if (!watch) break;
+      if (maxCycles > 0 && cycles >= maxCycles) break;
+      if (opts.json) break;
+      sleepSync(watchIntervalMs);
     }
-
-    db.close();
-    console.log('');
-    console.log(chalk.dim('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
-    console.log('');
   });
 
 program
