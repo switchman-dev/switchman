@@ -39,7 +39,7 @@ switchman setup --agents 5
 This gives you:
 - one shared Switchman database in `.switchman/`
 - five linked worktrees
-- local `.mcp.json` files so Claude Code can discover Switchman automatically
+- local MCP config files for Claude Code and Cursor discovery
 
 You can start with 3 agents if you want. The point of the demo is to feel safe parallelism quickly.
 
@@ -59,7 +59,7 @@ Use real tasks from your repo. If a task looks broad enough to fan out across ma
 
 Open each generated worktree folder in its own Claude Code window or agent session.
 
-If Claude Code sees the local `.mcp.json`, each agent can use Switchman without extra setup.
+If Claude Code or Cursor sees the local MCP config, each agent can use Switchman without extra setup.
 
 ### 4. Tell each agent to work through Switchman
 
@@ -120,9 +120,9 @@ That runs the included demo against the example API in [examples/README.md](/Use
 
 ## Pick your setup
 
-### Option A — Claude Code (recommended)
+### Option A — Claude Code or Cursor (recommended)
 
-Claude Code has a native Switchman integration via MCP. Your agents can coordinate automatically instead of relying on copy-pasted shell rituals.
+Claude Code and Cursor both have native Switchman integration via MCP. Your agents can coordinate automatically instead of relying on copy-pasted shell rituals.
 
 **Step 1 — Create your agent workspaces**
 
@@ -135,7 +135,11 @@ That's it. Switchman creates isolated workspaces, one per agent, and initialises
 
 **Step 2 — Add Switchman to Claude Code**
 
-`switchman setup` now writes a project-local `.mcp.json` into the repo root and each generated worktree, so Claude Code can discover Switchman automatically when you open those folders.
+`switchman setup` now writes project-local MCP config into the repo root and each generated worktree:
+- `.mcp.json` for Claude Code
+- `.cursor/mcp.json` for Cursor
+
+Open those folders in either tool and Switchman should be discoverable automatically.
 
 If you prefer a global fallback, add this to `~/.claude/claude_desktop_config.json`:
 
@@ -150,7 +154,7 @@ If you prefer a global fallback, add this to `~/.claude/claude_desktop_config.js
 }
 ```
 
-Then restart Claude Code. The project-local `.mcp.json` is the preferred path because it travels with the repo and the generated worktrees.
+Then restart Claude Code. The project-local MCP files are the preferred path because they travel with the repo and the generated worktrees.
 
 **Step 3 — Copy CLAUDE.md into your repo root**
 
@@ -168,9 +172,9 @@ switchman task add "Add rate limiting" --priority 6
 switchman task add "Update README" --priority 2
 ```
 
-**Step 5 — Open Claude Code in each workspace**
+**Step 5 — Open Claude Code or Cursor in each workspace**
 
-Open a separate Claude Code window in each folder that `switchman setup` created. Each agent should automatically see the local MCP config, pick up a task, lock the files it needs, and release them when it's done.
+Open a separate Claude Code or Cursor window in each folder that `switchman setup` created. Each agent should automatically see the local MCP config, pick up a task, lock the files it needs, and release them when it's done.
 
 **Step 6 — Check before merging**
 
@@ -364,7 +368,7 @@ Switchman now prints:
 One-command setup — creates agent workspaces and initialises the database.
 - `--agents 3` — number of workspaces to create (default: 3, max: 10)
 - `--prefix switchman` — branch name prefix (default: switchman)
-- Writes `.mcp.json` to the repo root and each generated worktree so Claude Code can attach the Switchman MCP server automatically
+- Writes `.mcp.json` and `.cursor/mcp.json` to the repo root and each generated worktree so Claude Code and Cursor can attach the Switchman MCP server automatically
 
 ### `switchman init`
 Initialise in the current git repo without creating worktrees. Creates `.switchman/switchman.db` and auto-detects existing worktrees.
@@ -737,7 +741,7 @@ This is different from normal CI:
 
 ---
 
-## MCP tools (Claude Code)
+## MCP tools
 
 | Tool | What it does |
 |------|-------------|
@@ -754,8 +758,9 @@ This is different from normal CI:
 
 ## Roadmap
 
-- [ ] Automatic stale-lease policies — configurable heartbeat/reap behaviour
-- [ ] Cursor and Windsurf native MCP integration
+- [x] Automatic stale-lease policies — configurable heartbeat/reap behaviour
+- [x] Cursor native MCP integration
+- [ ] Windsurf native MCP integration
 - [ ] Web dashboard
 - [ ] `brew install switchman`
 

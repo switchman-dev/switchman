@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { findRepoRoot } from '../src/core/git.js';
 import { getWorktreeChangedFiles } from '../src/core/git.js';
 import { filterIgnoredPaths, isIgnoredPath, matchesPathPatterns } from '../src/core/ignore.js';
-import { upsertProjectMcpConfig } from '../src/core/mcp.js';
+import { upsertCursorProjectMcpConfig, upsertProjectMcpConfig } from '../src/core/mcp.js';
 import { evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
@@ -1220,6 +1220,7 @@ test('Fix 6: default ignore list drops node_modules and build output noise', () 
   assert(filtered[0] === 'src/app.js', 'Non-generated source files are preserved');
   assert(isIgnoredPath('examples/taskapi/node_modules/pkg/index.js'), 'Nested node_modules paths are ignored');
   assert(isIgnoredPath('.mcp.json'), 'Project MCP config is ignored by default scans');
+  assert(isIgnoredPath('.cursor/mcp.json'), 'Cursor project MCP config is ignored by default scans');
 });
 
 test('Fix 7: setup MCP config can be written locally without clobbering other servers', () => {
@@ -1244,6 +1245,32 @@ test('Fix 7: setup MCP config can be written locally without clobbering other se
 
   assert(secondConfig.mcpServers.other.command === 'other-mcp', 'Existing MCP servers are preserved');
   assert(secondConfig.mcpServers.switchman.command === 'switchman-mcp', 'Switchman MCP server is merged into existing config');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Cursor MCP config can be written locally without clobbering other servers', () => {
+  const repoDir = join(tmpdir(), `sw-cursor-mcp-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+
+  const first = upsertCursorProjectMcpConfig(repoDir);
+  const firstConfig = JSON.parse(readFileSync(first.path, 'utf8'));
+  assert(first.created, 'Initial Cursor MCP config write reports creation');
+  assert(firstConfig.mcpServers.switchman.command === 'switchman-mcp', 'Cursor MCP config registers the Switchman server');
+
+  writeFileSync(first.path, `${JSON.stringify({
+    mcpServers: {
+      other: {
+        command: 'other-mcp',
+        args: [],
+      },
+    },
+  }, null, 2)}\n`);
+  const second = upsertCursorProjectMcpConfig(repoDir);
+  const secondConfig = JSON.parse(readFileSync(second.path, 'utf8'));
+
+  assert(secondConfig.mcpServers.other.command === 'other-mcp', 'Cursor MCP config preserves existing MCP servers');
+  assert(secondConfig.mcpServers.switchman.command === 'switchman-mcp', 'Cursor MCP config merges in the Switchman server');
 
   rmSync(repoDir, { recursive: true, force: true });
 });

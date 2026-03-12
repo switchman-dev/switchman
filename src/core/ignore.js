@@ -2,6 +2,7 @@ export const DEFAULT_SCAN_IGNORE_PATTERNS = [
   'node_modules/**',
   '.git/**',
   '.mcp.json',
+  '.cursor/mcp.json',
   '.switchman/**',
   'dist/**',
   'build/**',

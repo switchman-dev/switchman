@@ -34,7 +34,7 @@ import {
   verifyAuditTrail,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
-import { upsertProjectMcpConfig } from '../core/mcp.js';
+import { upsertAllProjectMcpConfigs } from '../core/mcp.js';
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
@@ -45,7 +45,7 @@ import { buildQueueStatusSummary, runMergeQueue } from '../core/queue.js';
 import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../core/policy.js';
 
 function installMcpConfig(targetDirs) {
-  return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
+  return targetDirs.flatMap((targetDir) => upsertAllProjectMcpConfigs(targetDir));
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -979,7 +979,7 @@ program
       console.log(chalk.bold('Next steps:'));
       console.log(`  1. Add your tasks:`);
       console.log(`     ${chalk.cyan('switchman task add "Your first task" --priority 8')}`);
-      console.log(`  2. Open Claude Code in each folder above — the local .mcp.json will attach Switchman automatically`);
+      console.log(`  2. Open Claude Code or Cursor in each folder above — the local MCP config will attach Switchman automatically`);
       console.log(`  3. Check status at any time:`);
       console.log(`     ${chalk.cyan('switchman status')}`);
       console.log('');

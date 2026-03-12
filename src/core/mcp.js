@@ -1,19 +1,22 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
-export function getSwitchmanMcpConfig() {
+export function getSwitchmanMcpServers() {
   return {
-    mcpServers: {
-      switchman: {
-        command: 'switchman-mcp',
-        args: [],
-      },
+    switchman: {
+      command: 'switchman-mcp',
+      args: [],
     },
   };
 }
 
-export function upsertProjectMcpConfig(targetDir) {
-  const configPath = join(targetDir, '.mcp.json');
+export function getSwitchmanMcpConfig() {
+  return {
+    mcpServers: getSwitchmanMcpServers(),
+  };
+}
+
+function upsertMcpConfigFile(configPath) {
   let config = {};
   let created = true;
 
@@ -21,13 +24,15 @@ export function upsertProjectMcpConfig(targetDir) {
     created = false;
     const raw = readFileSync(configPath, 'utf8').trim();
     config = raw ? JSON.parse(raw) : {};
+  } else {
+    mkdirSync(join(configPath, '..'), { recursive: true });
   }
 
   const nextConfig = {
     ...config,
     mcpServers: {
       ...(config.mcpServers || {}),
-      ...getSwitchmanMcpConfig().mcpServers,
+      ...getSwitchmanMcpServers(),
     },
   };
 
@@ -44,4 +49,19 @@ export function upsertProjectMcpConfig(targetDir) {
     created,
     changed,
   };
+}
+
+export function upsertCursorProjectMcpConfig(targetDir) {
+  return upsertMcpConfigFile(join(targetDir, '.cursor', 'mcp.json'));
+}
+
+export function upsertAllProjectMcpConfigs(targetDir) {
+  return [
+    upsertProjectMcpConfig(targetDir),
+    upsertCursorProjectMcpConfig(targetDir),
+  ];
+}
+
+export function upsertProjectMcpConfig(targetDir) {
+  return upsertMcpConfigFile(join(targetDir, '.mcp.json'));
 }
