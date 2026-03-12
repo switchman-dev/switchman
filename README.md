@@ -185,9 +185,17 @@ switchman gate ci
 
 ---
 
-### Option B — Any other agent (Cursor, Windsurf, Aider, etc.)
+### Option B — Any other agent (Windsurf, Aider, etc.)
 
 Switchman works as a CLI tool with any agent that can run terminal commands. The coordination is still governed, but you'll need to prompt your agents to use Switchman commands.
+
+For Windsurf specifically, install the MCP server once into Windsurf's shared config:
+
+```bash
+switchman mcp install --windsurf
+```
+
+That writes Switchman to `~/.codeium/mcp_config.json`, which matches Windsurf's documented MCP config path.
 
 **Step 1 — Create your agent workspaces**
 
@@ -756,11 +764,44 @@ This is different from normal CI:
 
 ---
 
+## Windsurf MCP
+
+Windsurf uses a shared MCP config file rather than the project-local `.cursor/mcp.json` approach that Cursor supports.
+
+Install Switchman into Windsurf once:
+
+```bash
+switchman mcp install --windsurf
+```
+
+What it does:
+- writes or updates `~/.codeium/mcp_config.json`
+- preserves existing Windsurf MCP servers
+- adds the `switchman-mcp` server entry
+
+If you want to verify it:
+
+```bash
+switchman mcp install --windsurf --json
+```
+
+Then open Windsurf and check:
+- `Settings`
+- `Cascade`
+- `MCP Servers`
+
+Use the project-local setup as normal after that:
+- `switchman setup --agents 5`
+- open the repo or worktrees in Windsurf
+- let each agent use Switchman through MCP
+
+---
+
 ## Roadmap
 
 - [x] Automatic stale-lease policies — configurable heartbeat/reap behaviour
 - [x] Cursor native MCP integration
-- [ ] Windsurf native MCP integration
+- [x] Windsurf native MCP integration
 - [ ] Web dashboard
 - [ ] `brew install switchman`
 

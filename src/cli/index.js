@@ -34,7 +34,7 @@ import {
   verifyAuditTrail,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
-import { upsertAllProjectMcpConfigs } from '../core/mcp.js';
+import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcpConfig } from '../core/mcp.js';
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
@@ -988,6 +988,42 @@ program
       spinner.fail(err.message);
       process.exit(1);
     }
+  });
+
+
+// ── mcp ───────────────────────────────────────────────────────────────────────
+
+const mcpCmd = program.command('mcp').description('Manage editor MCP configuration for Switchman');
+
+mcpCmd
+  .command('install')
+  .description('Install editor-specific MCP config for Switchman')
+  .option('--windsurf', 'Write Windsurf MCP config to ~/.codeium/mcp_config.json')
+  .option('--home <path>', 'Override the home directory for config writes (useful for testing)')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    if (!opts.windsurf) {
+      console.error(chalk.red('Choose an editor install target, for example `switchman mcp install --windsurf`.'));
+      process.exitCode = 1;
+      return;
+    }
+
+    const result = upsertWindsurfMcpConfig(opts.home);
+
+    if (opts.json) {
+      console.log(JSON.stringify({
+        editor: 'windsurf',
+        path: result.path,
+        created: result.created,
+        changed: result.changed,
+      }, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Windsurf MCP config ${result.changed ? 'written' : 'already up to date'}`);
+    console.log(`  ${chalk.dim('path:')} ${chalk.cyan(result.path)}`);
+    console.log(`  ${chalk.dim('open:')} Windsurf -> Settings -> Cascade -> MCP Servers`);
+    console.log(`  ${chalk.dim('note:')} Windsurf reads the shared config from ${getWindsurfMcpConfigPath(opts.home)}`);
   });
 
 

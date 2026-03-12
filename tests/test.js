@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { findRepoRoot } from '../src/core/git.js';
 import { getWorktreeChangedFiles } from '../src/core/git.js';
 import { filterIgnoredPaths, isIgnoredPath, matchesPathPatterns } from '../src/core/ignore.js';
-import { upsertCursorProjectMcpConfig, upsertProjectMcpConfig } from '../src/core/mcp.js';
+import { getWindsurfMcpConfigPath, upsertCursorProjectMcpConfig, upsertProjectMcpConfig, upsertWindsurfMcpConfig } from '../src/core/mcp.js';
 import { evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
@@ -1273,6 +1273,46 @@ test('Cursor MCP config can be written locally without clobbering other servers'
   assert(secondConfig.mcpServers.switchman.command === 'switchman-mcp', 'Cursor MCP config merges in the Switchman server');
 
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Windsurf MCP config can be written without clobbering other servers', () => {
+  const homeDir = join(tmpdir(), `sw-windsurf-home-${Date.now()}`);
+  mkdirSync(homeDir, { recursive: true });
+
+  const first = upsertWindsurfMcpConfig(homeDir);
+  const firstConfig = JSON.parse(readFileSync(first.path, 'utf8'));
+  assert(first.path === getWindsurfMcpConfigPath(homeDir), 'Windsurf MCP config writes to the expected user config path');
+  assert(first.created, 'Initial Windsurf MCP config write reports creation');
+  assert(firstConfig.mcpServers.switchman.command === 'switchman-mcp', 'Windsurf MCP config registers the Switchman server');
+
+  writeFileSync(first.path, `${JSON.stringify({
+    mcpServers: {
+      other: {
+        command: 'other-mcp',
+        args: [],
+      },
+    },
+  }, null, 2)}\n`);
+  const second = upsertWindsurfMcpConfig(homeDir);
+  const secondConfig = JSON.parse(readFileSync(second.path, 'utf8'));
+
+  assert(secondConfig.mcpServers.other.command === 'other-mcp', 'Windsurf MCP config preserves existing MCP servers');
+  assert(secondConfig.mcpServers.switchman.command === 'switchman-mcp', 'Windsurf MCP config merges in the Switchman server');
+
+  const cliOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'mcp',
+    'install',
+    '--windsurf',
+    '--home',
+    homeDir,
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+  assert(cliOutput.includes('.codeium/mcp_config.json'), 'Windsurf MCP install CLI prints the written config path');
+
+  rmSync(homeDir, { recursive: true, force: true });
 });
 
 test('Fix 8: worktree compliance marks unmanaged changes as non-compliant', () => {

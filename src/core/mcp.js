@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { homedir } from 'os';
 import { join } from 'path';
 
 export function getSwitchmanMcpServers() {
@@ -64,4 +65,12 @@ export function upsertAllProjectMcpConfigs(targetDir) {
 
 export function upsertProjectMcpConfig(targetDir) {
   return upsertMcpConfigFile(join(targetDir, '.mcp.json'));
+}
+
+export function getWindsurfMcpConfigPath(homeDir = homedir()) {
+  return join(homeDir, '.codeium', 'mcp_config.json');
+}
+
+export function upsertWindsurfMcpConfig(homeDir = homedir()) {
+  return upsertMcpConfigFile(getWindsurfMcpConfigPath(homeDir));
 }
