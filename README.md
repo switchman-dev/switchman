@@ -68,9 +68,9 @@ Fastest path to success:
 5. Run `switchman gate ci` when the tasks finish.
 
 If you want the recommended editor setup guide, start here:
-- [docs/setup-cursor.md](/Users/ned/Documents/GitHub/switchman/docs/setup-cursor.md)
+- [Cursor setup](docs/setup-cursor.md)
 
-If you want a guided demo, see [examples/README.md](/Users/ned/Documents/GitHub/switchman/examples/README.md).
+If you want a guided demo, see [examples/README.md](examples/README.md).
 
 ## What good looks like
 
@@ -100,10 +100,10 @@ Pick the guide that matches how you work:
 
 | Setup | Guide |
 |------|------|
-| Claude Code | [docs/setup-claude-code.md](/Users/ned/Documents/GitHub/switchman/docs/setup-claude-code.md) |
-| Cursor | [docs/setup-cursor.md](/Users/ned/Documents/GitHub/switchman/docs/setup-cursor.md) |
-| Windsurf | [docs/setup-windsurf.md](/Users/ned/Documents/GitHub/switchman/docs/setup-windsurf.md) |
-| Any CLI-driven agent | [docs/setup-cli-agents.md](/Users/ned/Documents/GitHub/switchman/docs/setup-cli-agents.md) |
+| Claude Code | [Claude Code setup](docs/setup-claude-code.md) |
+| Cursor | [Cursor setup](docs/setup-cursor.md) |
+| Windsurf | [Windsurf setup](docs/setup-windsurf.md) |
+| Any CLI-driven agent | [CLI agent setup](docs/setup-cli-agents.md) |
 
 ## If something feels stuck
 
@@ -126,17 +126,17 @@ switchman gate ci
 ```
 
 More help:
-- [docs/status-and-recovery.md](/Users/ned/Documents/GitHub/switchman/docs/status-and-recovery.md)
-- [docs/merge-queue.md](/Users/ned/Documents/GitHub/switchman/docs/merge-queue.md)
-- [docs/stale-lease-policy.md](/Users/ned/Documents/GitHub/switchman/docs/stale-lease-policy.md)
+- [Status and recovery](docs/status-and-recovery.md)
+- [Merge queue](docs/merge-queue.md)
+- [Stale lease policy](docs/stale-lease-policy.md)
 
 ## More docs
 
-- Merge queue: [docs/merge-queue.md](/Users/ned/Documents/GitHub/switchman/docs/merge-queue.md)
-- Pipelines and PRs: [docs/pipelines.md](/Users/ned/Documents/GitHub/switchman/docs/pipelines.md)
-- Stale lease policy: [docs/stale-lease-policy.md](/Users/ned/Documents/GitHub/switchman/docs/stale-lease-policy.md)
-- MCP tools: [docs/mcp-tools.md](/Users/ned/Documents/GitHub/switchman/docs/mcp-tools.md)
-- [docs/command-reference.md](/Users/ned/Documents/GitHub/switchman/docs/command-reference.md)
+- [Merge queue](docs/merge-queue.md)
+- [Pipelines and PRs](docs/pipelines.md)
+- [Stale lease policy](docs/stale-lease-policy.md)
+- [MCP tools](docs/mcp-tools.md)
+- [Command reference](docs/command-reference.md)
 
 ## Feedback
 
