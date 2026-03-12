@@ -36,6 +36,7 @@ When you queue a pipeline, Switchman resolves one landing branch for that pipeli
 - If the pipeline has exactly one implementation branch, that branch is used.
 - Otherwise, if all completed pipeline work points at one non-`main` branch, that branch is used.
 - If the pipeline is complete and spans multiple branches, Switchman creates `switchman/pipeline-landing/<pipelineId>` and queues that synthetic integration branch.
+- If that synthetic branch becomes stale because `main` or one of the component branches moved, refresh it first with `switchman pipeline land <pipelineId> --refresh`.
 - If the pipeline still has unfinished tasks, Switchman stops and tells you to finish the remaining work first.
 
 Useful options:

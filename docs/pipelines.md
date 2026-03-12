@@ -32,7 +32,13 @@ switchman pipeline land pipe-123
 switchman queue add --pipeline pipe-123
 ```
 
-By default this creates or refreshes `switchman/pipeline-landing/<pipelineId>` from `main`, merges the completed pipeline branches into it in a stable order, and gives you one governed branch to queue or publish.
+By default this creates `switchman/pipeline-landing/<pipelineId>` from `main`, merges the completed pipeline branches into it in a stable order, and gives you one governed branch to queue or publish.
+
+If one of the component branches moves later, Switchman marks the synthetic branch as stale in `switchman pipeline status` and asks you to rebuild it explicitly:
+
+```bash
+switchman pipeline land pipe-123 --refresh
+```
 
 ## Export a PR bundle
 

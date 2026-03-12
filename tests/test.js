@@ -3986,6 +3986,181 @@ test('Fix 28fa: pipeline land materializes a synthetic integration branch for mu
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28fc: pipeline land detects stale synthetic branches and refreshes them explicitly', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-refresh-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-refresh-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-refresh-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-refresh-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-refresh-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'a.txt'), 'A1\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a 1"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'b.txt'), 'B1\n');
+  execSync('git add b.txt', { cwd: branchBPath });
+  execSync('git commit -m "branch b 1"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-refresh-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-refresh-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-refresh-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-refresh', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-refresh-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-refresh', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  const initial = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-refresh',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  writeFileSync(join(branchAPath, 'a.txt'), 'A2\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a 2"', { cwd: branchAPath });
+
+  let staleError = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline',
+      'land',
+      'pipe-land-refresh',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    staleError = `${err.stdout || ''}${err.stderr || ''}`;
+  }
+
+  const status = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'status',
+    'pipe-land-refresh',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const refreshed = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-refresh',
+    '--refresh',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const landingFile = execSync(`git show ${refreshed.branch}:a.txt`, {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(initial.synthetic, 'Initial landing branch is materialized synthetically');
+  assert(staleError.includes('is stale'), 'Pipeline land reports that the synthetic branch is stale after a component branch moves');
+  assert(staleError.includes('--refresh'), 'Pipeline land points the operator at the refresh command');
+  assert(status.landing_branch.synthetic, 'Pipeline status JSON exposes landing branch status');
+  assert(status.landing_branch.stale, 'Pipeline status marks the landing branch stale after branch drift');
+  assert(status.landing_branch.stale_reasons.some((reason) => reason.code === 'component_branch_moved' && reason.branch === 'feature/pipeline-refresh-a'), 'Pipeline status names the component branch that drifted');
+  assert(refreshed.refreshed, 'Refreshing reports that the landing branch was rebuilt');
+  assert(refreshed.head_commit !== initial.head_commit, 'Refreshing updates the synthetic landing branch head commit');
+  assert(landingFile.includes('A2'), 'Refreshing rebuilds the synthetic branch with the moved component branch content');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fd: pipeline land reuses an up-to-date synthetic branch without rewriting it', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-reuse-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-reuse-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-reuse-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-reuse-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-reuse-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'a.txt'), 'A\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'b.txt'), 'B\n');
+  execSync('git add b.txt', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-reuse-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-reuse-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-reuse-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-reuse', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-reuse-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-reuse', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  const first = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-reuse',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const second = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-reuse',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(!first.reused_existing, 'First landing branch creation materializes a fresh synthetic branch');
+  assert(second.reused_existing, 'Second landing branch call reuses the up-to-date synthetic branch');
+  assert(second.head_commit === first.head_commit, 'Reusing the landing branch keeps the same synthetic head commit');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 28fb: pipeline publish materializes a synthetic landing branch when multiple completed branches exist', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-publish-synth-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });

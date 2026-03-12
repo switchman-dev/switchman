@@ -40,7 +40,7 @@ import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcp
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
-import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, materializePipelineLandingBranch, preparePipelineLandingTarget, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
+import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineStatus, materializePipelineLandingBranch, preparePipelineLandingTarget, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus } from '../core/ci.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, resolveQueueSource, runMergeQueue } from '../core/queue.js';
@@ -345,6 +345,20 @@ function buildStaleTaskExplainReport(db, taskId) {
       ? `switchman task retry ${taskId}`
       : null,
   };
+}
+
+function buildLandingStateLabel(landing) {
+  if (!landing) return null;
+  if (!landing.synthetic) {
+    return `${landing.branch} ${chalk.dim('(single branch)')}`;
+  }
+  if (!landing.last_materialized) {
+    return `${landing.branch} ${chalk.yellow('(not created yet)')}`;
+  }
+  if (landing.stale) {
+    return `${landing.branch} ${chalk.red('(stale)')}`;
+  }
+  return `${landing.branch} ${chalk.green('(current)')}`;
 }
 
 async function maybeCaptureTelemetry(event, properties = {}, { homeDir = null } = {}) {
@@ -2275,10 +2289,16 @@ Examples:
 
     try {
       const result = getPipelineStatus(db, pipelineId);
+      const landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+        requireCompleted: false,
+      });
       db.close();
 
       if (opts.json) {
-        console.log(JSON.stringify(result, null, 2));
+        console.log(JSON.stringify({
+          ...result,
+          landing_branch: landing,
+        }, null, 2));
         return;
       }
 
@@ -2297,6 +2317,7 @@ Examples:
       const focusLine = focusTask
         ? `${focusTask.title} ${chalk.dim(focusTask.id)}`
         : 'No pipeline tasks found.';
+      const landingLabel = buildLandingStateLabel(landing);
 
       console.log('');
       console.log(pipelineHealthColor('='.repeat(72)));
@@ -2310,6 +2331,9 @@ Examples:
         renderChip('failed', result.counts.failed, result.counts.failed > 0 ? chalk.red : chalk.green),
       ]));
       console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
+      if (landingLabel) {
+        console.log(`${chalk.bold('Landing:')} ${landingLabel}`);
+      }
 
       const runningLines = result.tasks.filter((task) => task.status === 'in_progress').slice(0, 4).map((task) => {
         const worktree = task.worktree || task.suggested_worktree || 'unassigned';
@@ -2335,9 +2359,24 @@ Examples:
         return `${renderChip('NEXT', task.id, chalk.green)} ${task.title} ${chalk.dim(worktree)}${blocked}`;
       });
 
+      const landingLines = landing.synthetic
+        ? [
+          `${renderChip(landing.stale ? 'STALE' : 'LAND', landing.branch, landing.stale ? chalk.red : chalk.green)} ${chalk.dim(`base ${landing.base_branch}`)}`,
+          ...(landing.stale_reasons.length > 0
+            ? landing.stale_reasons.slice(0, 3).map((reason) => `  ${chalk.red('why:')} ${reason.summary}`)
+            : [landing.last_materialized
+              ? `  ${chalk.green('state:')} ready to queue`
+              : `  ${chalk.yellow('next:')} switchman pipeline land ${result.pipeline_id}`]),
+          (landing.stale
+            ? `  ${chalk.yellow('next:')} switchman pipeline land ${result.pipeline_id} --refresh`
+            : `  ${chalk.yellow('next:')} switchman queue add --pipeline ${result.pipeline_id}`),
+        ]
+        : [];
+
       const commandLines = [
         `${chalk.cyan('$')} switchman pipeline exec ${result.pipeline_id} "/path/to/agent-command"`,
         `${chalk.cyan('$')} switchman pipeline pr ${result.pipeline_id}`,
+        ...(landing.synthetic && landing.stale ? [`${chalk.cyan('$')} switchman pipeline land ${result.pipeline_id} --refresh`] : []),
         ...(result.counts.failed > 0 ? [`${chalk.cyan('$')} switchman pipeline status ${result.pipeline_id}`] : []),
       ];
 
@@ -2346,6 +2385,7 @@ Examples:
         renderPanel('Running now', runningLines.length > 0 ? runningLines : [chalk.dim('No tasks are actively running.')], runningLines.length > 0 ? chalk.cyan : chalk.green),
         renderPanel('Blocked', blockedLines.length > 0 ? blockedLines : [chalk.green('Nothing blocked.')], blockedLines.length > 0 ? chalk.red : chalk.green),
         renderPanel('Next up', nextLines.length > 0 ? nextLines : [chalk.dim('No pending tasks left.')], chalk.green),
+        ...(landing.synthetic ? [renderPanel('Landing branch', landingLines, landing.stale ? chalk.red : chalk.cyan)] : []),
         renderPanel('Next commands', commandLines, chalk.cyan),
       ]) {
         for (const line of block) console.log(line);
@@ -2417,6 +2457,7 @@ pipelineCmd
   .description('Create or refresh one landing branch for a completed pipeline')
   .option('--base <branch>', 'Base branch for the landing branch', 'main')
   .option('--branch <branch>', 'Custom landing branch name')
+  .option('--refresh', 'Rebuild the landing branch when a source branch or base branch has moved')
   .option('--json', 'Output raw JSON')
   .action((pipelineId, opts) => {
     const repoRoot = getRepo();
@@ -2427,6 +2468,7 @@ pipelineCmd
         baseBranch: opts.base,
         landingBranch: opts.branch || null,
         requireCompleted: true,
+        refresh: Boolean(opts.refresh),
       });
       db.close();
 
@@ -2440,6 +2482,11 @@ pipelineCmd
       console.log(`  ${chalk.dim('base:')} ${result.base_branch}`);
       console.log(`  ${chalk.dim('strategy:')} ${result.strategy}`);
       console.log(`  ${chalk.dim('components:')} ${result.component_branches.join(', ')}`);
+      if (result.reused_existing) {
+        console.log(`  ${chalk.dim('state:')} already current`);
+      } else if (result.refreshed) {
+        console.log(`  ${chalk.dim('state:')} refreshed`);
+      }
       console.log(`  ${chalk.yellow('next:')} switchman queue add ${result.branch}`);
     } catch (err) {
       db.close();

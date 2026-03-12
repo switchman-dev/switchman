@@ -7,7 +7,7 @@ import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
 import { buildTaskSpec, planPipelineTasks } from './planner.js';
-import { getWorktreeBranch, gitMaterializeIntegrationBranch } from './git.js';
+import { getWorktreeBranch, gitBranchExists, gitMaterializeIntegrationBranch, gitRevParse } from './git.js';
 
 function sleepSync(ms) {
   if (ms > 0) {
@@ -831,6 +831,164 @@ function collectPipelineLandingCandidates(db, pipelineStatus) {
   };
 }
 
+function getPipelineLandingBranchName(pipelineId, landingBranch = null) {
+  return landingBranch || `switchman/pipeline-landing/${pipelineId}`;
+}
+
+function listPipelineLandingEvents(db, pipelineId, branch) {
+  return listAuditEvents(db, {
+    eventType: 'pipeline_landing_branch_materialized',
+    limit: 500,
+  }).flatMap((event) => {
+    try {
+      const details = JSON.parse(event.details || '{}');
+      if (details.pipeline_id !== pipelineId || details.branch !== branch) {
+        return [];
+      }
+      return [{
+        audit_id: event.id,
+        created_at: event.created_at,
+        ...details,
+      }];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function collectBranchHeadCommits(repoRoot, branches) {
+  return Object.fromEntries(
+    branches.map((branch) => [branch, gitRevParse(repoRoot, branch)]),
+  );
+}
+
+export function getPipelineLandingBranchStatus(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    baseBranch = 'main',
+    landingBranch = null,
+    requireCompleted = true,
+  } = {},
+) {
+  const pipelineStatus = getPipelineStatus(db, pipelineId);
+  if (requireCompleted) {
+    const unfinishedTasks = pipelineStatus.tasks.filter((task) => task.status !== 'done');
+    if (unfinishedTasks.length > 0) {
+      throw new Error(`Pipeline ${pipelineId} is not ready to land. Complete remaining tasks first: ${unfinishedTasks.map((task) => task.id).join(', ')}.`);
+    }
+  }
+
+  const { candidateBranches, prioritizedBranches } = collectPipelineLandingCandidates(db, pipelineStatus);
+  if (candidateBranches.length === 0) {
+    throw new Error(`Pipeline ${pipelineId} has no landed worktree branch to materialize.`);
+  }
+
+  if (candidateBranches.length === 1) {
+    const branch = candidateBranches[0];
+    return {
+      pipeline_id: pipelineId,
+      branch,
+      base_branch: baseBranch,
+      synthetic: false,
+      branch_exists: Boolean(gitRevParse(repoRoot, branch)),
+      branch_head_commit: gitRevParse(repoRoot, branch),
+      component_branches: [branch],
+      component_commits: { [branch]: gitRevParse(repoRoot, branch) },
+      strategy: 'single_branch',
+      stale: false,
+      stale_reasons: [],
+      last_materialized: null,
+    };
+  }
+
+  const resolvedLandingBranch = getPipelineLandingBranchName(pipelineId, landingBranch);
+  const branchExists = gitBranchExists(repoRoot, resolvedLandingBranch);
+  const branchHeadCommit = branchExists ? gitRevParse(repoRoot, resolvedLandingBranch) : null;
+  const baseCommit = gitRevParse(repoRoot, baseBranch);
+  const componentCommits = collectBranchHeadCommits(repoRoot, prioritizedBranches);
+  const latestEvent = listPipelineLandingEvents(db, pipelineId, resolvedLandingBranch)[0] || null;
+  const staleReasons = [];
+
+  if (!latestEvent) {
+    staleReasons.push({
+      code: 'not_materialized',
+      summary: 'Landing branch has not been materialized yet.',
+    });
+  } else {
+    if (!branchExists) {
+      staleReasons.push({
+        code: 'landing_branch_missing',
+        summary: `Landing branch ${resolvedLandingBranch} no longer exists.`,
+      });
+    }
+
+    const recordedComponents = Array.isArray(latestEvent.component_branches)
+      ? latestEvent.component_branches
+      : [];
+    if (recordedComponents.join('\n') !== prioritizedBranches.join('\n')) {
+      staleReasons.push({
+        code: 'component_set_changed',
+        summary: 'The pipeline now resolves to a different set of component branches.',
+      });
+    }
+
+    if (latestEvent.base_commit && baseCommit && latestEvent.base_commit !== baseCommit) {
+      staleReasons.push({
+        code: 'base_branch_moved',
+        summary: `${baseBranch} moved from ${latestEvent.base_commit.slice(0, 12)} to ${baseCommit.slice(0, 12)}.`,
+      });
+    }
+
+    const recordedCommits = latestEvent.component_commits || {};
+    for (const branch of prioritizedBranches) {
+      const previousCommit = recordedCommits[branch] || null;
+      const currentCommit = componentCommits[branch] || null;
+      if (previousCommit && currentCommit && previousCommit !== currentCommit) {
+        staleReasons.push({
+          code: 'component_branch_moved',
+          branch,
+          summary: `${branch} moved from ${previousCommit.slice(0, 12)} to ${currentCommit.slice(0, 12)}.`,
+        });
+      }
+    }
+
+    if (
+      latestEvent.head_commit &&
+      branchHeadCommit &&
+      latestEvent.head_commit !== branchHeadCommit
+    ) {
+      staleReasons.push({
+        code: 'landing_branch_drifted',
+        summary: `Landing branch head changed from ${latestEvent.head_commit.slice(0, 12)} to ${branchHeadCommit.slice(0, 12)} outside Switchman.`,
+      });
+    }
+  }
+
+  return {
+    pipeline_id: pipelineId,
+    branch: resolvedLandingBranch,
+    base_branch: baseBranch,
+    synthetic: true,
+    branch_exists: branchExists,
+    branch_head_commit: branchHeadCommit,
+    component_branches: prioritizedBranches,
+    component_commits: componentCommits,
+    strategy: 'synthetic_integration_branch',
+    stale: staleReasons.some((reason) => reason.code !== 'not_materialized'),
+    stale_reasons: staleReasons.filter((reason) => reason.code !== 'not_materialized'),
+    last_materialized: latestEvent ? {
+      audit_id: latestEvent.audit_id,
+      created_at: latestEvent.created_at,
+      head_commit: latestEvent.head_commit || null,
+      base_commit: latestEvent.base_commit || null,
+      component_branches: Array.isArray(latestEvent.component_branches) ? latestEvent.component_branches : [],
+      component_commits: latestEvent.component_commits || {},
+    } : null,
+  };
+}
+
 export function resolvePipelineLandingTarget(
   db,
   repoRoot,
@@ -887,20 +1045,16 @@ export function materializePipelineLandingBranch(
     baseBranch = 'main',
     landingBranch = null,
     requireCompleted = true,
+    refresh = false,
   } = {},
 ) {
   const pipelineStatus = getPipelineStatus(db, pipelineId);
-  if (requireCompleted) {
-    const unfinishedTasks = pipelineStatus.tasks.filter((task) => task.status !== 'done');
-    if (unfinishedTasks.length > 0) {
-      throw new Error(`Pipeline ${pipelineId} is not ready to land. Complete remaining tasks first: ${unfinishedTasks.map((task) => task.id).join(', ')}.`);
-    }
-  }
-
   const { candidateBranches, prioritizedBranches, branchToWorktree } = collectPipelineLandingCandidates(db, pipelineStatus);
-  if (candidateBranches.length === 0) {
-    throw new Error(`Pipeline ${pipelineId} has no landed worktree branch to materialize.`);
-  }
+  const landingStatus = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+    baseBranch,
+    landingBranch,
+    requireCompleted,
+  });
 
   if (candidateBranches.length === 1) {
     const branch = candidateBranches[0];
@@ -916,12 +1070,38 @@ export function materializePipelineLandingBranch(
     };
   }
 
-  const resolvedLandingBranch = landingBranch || `switchman/pipeline-landing/${pipelineId}`;
+  if (landingStatus.last_materialized && !landingStatus.stale && !refresh) {
+    return {
+      pipeline_id: pipelineId,
+      branch: landingStatus.branch,
+      base_branch: baseBranch,
+      worktree: null,
+      synthetic: true,
+      component_branches: landingStatus.component_branches,
+      component_commits: landingStatus.component_commits,
+      strategy: 'synthetic_integration_branch',
+      head_commit: landingStatus.branch_head_commit,
+      refreshed: false,
+      reused_existing: true,
+      stale: false,
+      stale_reasons: [],
+      last_materialized: landingStatus.last_materialized,
+    };
+  }
+
+  if (landingStatus.stale && !refresh) {
+    const summaries = landingStatus.stale_reasons.map((reason) => reason.summary).join(' ');
+    throw new Error(`Landing branch ${landingStatus.branch} is stale. ${summaries} Run \`switchman pipeline land ${pipelineId} --refresh${landingBranch ? ` --branch ${landingBranch}` : ''}\` to rebuild it.`);
+  }
+
+  const resolvedLandingBranch = getPipelineLandingBranchName(pipelineId, landingBranch);
   const materialized = gitMaterializeIntegrationBranch(repoRoot, {
     branch: resolvedLandingBranch,
     baseBranch,
     mergeBranches: prioritizedBranches,
   });
+  const baseCommit = gitRevParse(repoRoot, baseBranch);
+  const componentCommits = collectBranchHeadCommits(repoRoot, prioritizedBranches);
 
   logAuditEvent(db, {
     eventType: 'pipeline_landing_branch_materialized',
@@ -930,7 +1110,9 @@ export function materializePipelineLandingBranch(
       pipeline_id: pipelineId,
       branch: resolvedLandingBranch,
       base_branch: baseBranch,
+      base_commit: baseCommit,
       component_branches: prioritizedBranches,
+      component_commits: componentCommits,
       head_commit: materialized.head_commit,
     }),
   });
@@ -942,8 +1124,19 @@ export function materializePipelineLandingBranch(
     worktree: null,
     synthetic: true,
     component_branches: prioritizedBranches,
+    component_commits: componentCommits,
     strategy: 'synthetic_integration_branch',
     head_commit: materialized.head_commit,
+    refreshed: refresh || Boolean(landingStatus.last_materialized),
+    reused_existing: false,
+    stale: false,
+    stale_reasons: [],
+    last_materialized: {
+      head_commit: materialized.head_commit,
+      base_commit: baseCommit,
+      component_branches: prioritizedBranches,
+      component_commits: componentCommits,
+    },
   };
 }
 
@@ -968,6 +1161,7 @@ export function preparePipelineLandingTarget(
       baseBranch,
       landingBranch,
       requireCompleted: true,
+      refresh: true,
     });
   }
 
@@ -992,6 +1186,7 @@ export function preparePipelineLandingTarget(
       baseBranch,
       landingBranch,
       requireCompleted: true,
+      refresh: true,
     });
   }
 }
