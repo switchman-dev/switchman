@@ -22,7 +22,36 @@ Requirements:
 npm install -g @switchman-dev
 ```
 
+## Why Switchman?
+
+Git worktrees, branches, and raw coding agents are useful, but they do not coordinate themselves.
+
+That leaves teams doing a lot of manual work:
+- deciding who should work on what
+- making sure two agents do not edit the same files
+- noticing when an agent stopped halfway through
+- figuring out whether finished work is still safe to merge
+- rebasing and landing several finished branches back onto `main`
+
+Switchman removes that coordination tax.
+
+What it adds that plain Git does not:
+- task assignment, so agents do not duplicate work
+- file locking, so parallel edits do not quietly collide
+- live status, so you can see what is running, blocked, or stale
+- stale-work recovery, so abandoned work does not clog the repo
+- governed landing, so finished work reaches `main` one item at a time with retries and checks
+
+In short:
+- Git gives you branches
+- Switchman gives you coordination
+
 ## Quickstart
+
+Recommended first run:
+- editor: Cursor
+- goal: feel safe parallel agent work in under 10 minutes
+- proof: status stays clear, agents stay separated, and the repo gate passes
 
 ```bash
 cd my-project
@@ -42,7 +71,48 @@ What `switchman setup` gives you:
 - linked workspaces for each agent
 - local MCP config for Claude Code and Cursor
 
+Fastest path to success:
+1. Use Cursor for the first run.
+2. Open one Cursor window per generated workspace.
+3. Let each agent pick up one clearly separate task.
+4. Keep `switchman status --watch` open in another terminal.
+5. Run `switchman gate ci` when the tasks finish.
+
+If you want the recommended editor setup guide, start here:
+- [docs/setup-cursor.md](/Users/ned/Documents/GitHub/switchman/docs/setup-cursor.md)
+
 If you want a guided demo, see [examples/README.md](/Users/ned/Documents/GitHub/switchman/examples/README.md).
+
+## What good looks like
+
+You know the first run is working when:
+- agents claim different files instead of stepping on each other
+- `switchman status` stays calm and readable instead of filling with blocked work
+- the landing queue moves finished work safely back toward `main`
+- `switchman gate ci` passes cleanly
+
+That is the moment Switchman should feel different from “just using a few branches.”
+
+## Why not just use branches or worktrees?
+
+Because branches and worktrees solve isolation, not coordination.
+
+They help you create separate places to work, but they do not answer:
+- which task should each agent take next
+- who already owns a file
+- whether two agents are overlapping in risky ways
+- whether an abandoned session should be cleaned up
+- whether a finished branch is still safe to land
+
+Experienced developers can absolutely manage this by hand for a while.
+
+The pain shows up when you run several agents at once:
+- duplicated work
+- overlapping edits
+- stale half-finished branches
+- merge cleanup at the end instead of coordination at the start
+
+Switchman is for that moment.
 
 ## Choose your setup
 
