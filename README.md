@@ -38,7 +38,7 @@ In short:
 ## Quickstart
 
 Recommended first run:
-- editor: Cursor
+- editor: Claude Code
 - goal: feel safe parallel agent work in under 10 minutes
 - proof: status stays clear, agents stay separated, and the repo gate passes
 
@@ -62,15 +62,15 @@ What `switchman setup` gives you:
 - local MCP config for Claude Code and Cursor
 
 Fastest path to success:
-1. Use Cursor for the first run.
+1. Use Claude Code for the first run.
 2. Run `switchman verify-setup` once so editor wiring is confirmed before you start.
-3. Open one Cursor window per generated workspace.
+3. Open one Claude Code window per generated workspace.
 4. Let each agent pick up one clearly separate task.
 5. Keep `switchman status --watch` open in another terminal.
 6. Run `switchman gate ci` when the tasks finish.
 
 If you want the recommended editor setup guide, start here:
-- [Cursor setup](docs/setup-cursor.md)
+- [Claude Code setup](docs/setup-claude-code.md)
 
 If you want a guided demo, see [examples/README.md](examples/README.md).
 
