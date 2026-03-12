@@ -5,8 +5,8 @@
 
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'fs';
+import { join, resolve } from 'path';
 
 const SWITCHMAN_DIR = '.switchman';
 const DB_FILE = 'switchman.db';
@@ -39,6 +39,14 @@ function withBusyRetry(fn, { attempts = CLAIM_RETRY_ATTEMPTS, delayMs = CLAIM_RE
       }
       throw err;
     }
+  }
+}
+
+function normalizeWorktreePath(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
   }
 }
 
@@ -1793,7 +1801,8 @@ export function checkFileConflicts(db, filePaths, excludeWorktree) {
 // ─── Worktrees ────────────────────────────────────────────────────────────────
 
 export function registerWorktree(db, { name, path, branch, agent }) {
-  const existingByPath = db.prepare(`SELECT name FROM worktrees WHERE path=?`).get(path);
+  const normalizedPath = normalizeWorktreePath(path);
+  const existingByPath = db.prepare(`SELECT name FROM worktrees WHERE path=?`).get(normalizedPath);
   const canonicalName = existingByPath?.name || name;
   db.prepare(`
     INSERT INTO worktrees (name, path, branch, agent)
@@ -1801,7 +1810,7 @@ export function registerWorktree(db, { name, path, branch, agent }) {
     ON CONFLICT(name) DO UPDATE SET
       path=excluded.path, branch=excluded.branch,
       agent=excluded.agent, last_seen=datetime('now'), status='idle'
-  `).run(canonicalName, path, branch, agent || null);
+  `).run(canonicalName, normalizedPath, branch, agent || null);
 }
 
 export function listWorktrees(db) {

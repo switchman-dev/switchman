@@ -236,6 +236,25 @@ test('Worktree registration deduplicates repeated paths under one canonical name
   pathDb.close();
 });
 
+test('Worktree registration normalizes aliased paths to one canonical worktree', () => {
+  const repoDir = join(tmpdir(), `sw-worktree-realpath-${Date.now()}`);
+  const aliasDir = join(tmpdir(), `sw-worktree-realpath-alias-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync(`ln -s "${repoDir}" "${aliasDir}"`);
+
+  const pathDb = initDb(join(tmpdir(), `sw-worktree-path-norm-${Date.now()}`));
+  registerWorktree(pathDb, { name: 'agent11', path: repoDir, branch: 'switchman/agent11' });
+  registerWorktree(pathDb, { name: 'repo-agent11', path: aliasDir, branch: 'switchman/agent11' });
+
+  const worktrees = listWorktrees(pathDb);
+  assert(worktrees.length === 1, 'Aliased real paths do not create duplicate worktrees');
+  assert(worktrees[0].name === 'agent11', 'Canonical name is preserved when the same worktree is registered through an alias path');
+  assert(worktrees[0].path === realpathSync(repoDir), 'Stored worktree path is normalized to its real path');
+  pathDb.close();
+  rmSync(aliasDir, { force: true });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('File claims - happy path', () => {
   const taskId = createTask(db, { title: 'Refactor auth module' });
   assignTask(db, taskId, 'feature-auth');
@@ -353,6 +372,49 @@ test('Fix 1b: parallel CLI task acquisition avoids transient database lock failu
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 1c: CLI task done succeeds while a transient SQLite write lock is present', () => {
+  const repoDir = join(tmpdir(), `sw-task-done-retry-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Complete under transient lock' });
+  assignTask(db, taskId, 'main');
+  db.close();
+
+  const lockScript = `
+    const { DatabaseSync } = require('node:sqlite');
+    const path = require('node:path');
+    const db = new DatabaseSync(path.join(${JSON.stringify(repoDir)}, '.switchman', 'switchman.db'));
+    db.exec('PRAGMA busy_timeout=10000; BEGIN IMMEDIATE;');
+    setTimeout(() => {
+      db.exec('COMMIT;');
+      db.close();
+    }, 300);
+  `;
+  execSync(`${JSON.stringify(process.execPath)} -e ${JSON.stringify(lockScript)} >/dev/null 2>&1 & sleep 0.1`, {
+    cwd: repoDir,
+    shell: '/bin/zsh',
+  });
+
+  execFileSync(process.execPath, [cliPath, 'task', 'done', taskId], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const verifyDb = openDb(repoDir);
+  assert(getTask(verifyDb, taskId).status === 'done', 'task done reaches completion even when a transient lock is present');
+  verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 2: SWITCHMAN_DIR constant (no stale AGENTQ_DIR)', () => {
   // Verify the database is created at the correct path using the renamed constant
   const fixDir = join(tmpdir(), `sw-const-${Date.now()}`);
@@ -387,6 +449,48 @@ test('Fix 2b: task add warns when a task looks too broad for a first parallel ru
 
   assert(cliOutput.includes('warning:'), 'task add warns when a task looks broad');
   assert(cliOutput.includes('pipeline start'), 'task add points users toward pipeline planning for broad work');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 2c: blocked claim returns a non-zero exit code for shell automation', () => {
+  const repoDir = join(tmpdir(), `sw-claim-exit-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const claimDb = initDb(repoDir);
+  registerWorktree(claimDb, { name: 'agent1', path: repoDir, branch: 'main' });
+  registerWorktree(claimDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'switchman/agent2' });
+  const firstTask = createTask(claimDb, { title: 'Task one' });
+  const secondTask = createTask(claimDb, { title: 'Task two' });
+  assignTask(claimDb, firstTask, 'agent1');
+  assignTask(claimDb, secondTask, 'agent2');
+  claimFiles(claimDb, firstTask, 'agent1', ['src/shared.js']);
+  claimDb.close();
+
+  let error = null;
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'claim',
+      secondTask,
+      'agent2',
+      'src/shared.js',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+  } catch (err) {
+    error = err;
+  }
+
+  assert(error?.status === 1, 'Blocked claim exits with status 1');
+  assert(String(error?.stdout || '').includes('Claim conflicts detected'), 'Blocked claim still prints the conflict explanation');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -1315,7 +1419,7 @@ test('Fix 20: wrapper mode launches commands with Switchman lease context', () =
   assert(wrappedEnv.task === taskId, 'Wrapper injects SWITCHMAN_TASK_ID');
   assert(wrappedEnv.worktree === 'main', 'Wrapper injects SWITCHMAN_WORKTREE');
   assert(wrappedEnv.repo === repoDir, 'Wrapper injects SWITCHMAN_REPO_ROOT');
-  assert(wrappedEnv.worktreePath === repoDir, 'Wrapper injects SWITCHMAN_WORKTREE_PATH');
+  assert(wrappedEnv.worktreePath === realpathSync(repoDir), 'Wrapper injects SWITCHMAN_WORKTREE_PATH');
   wrapDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });

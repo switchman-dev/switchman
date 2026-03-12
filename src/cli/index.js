@@ -501,6 +501,28 @@ function acquireNextTaskLeaseWithRetries(repoRoot, worktreeName, agent, attempts
   throw lastError;
 }
 
+function completeTaskWithRetries(repoRoot, taskId, attempts = 20) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let db = null;
+    try {
+      db = openDb(repoRoot);
+      completeTask(db, taskId);
+      releaseFileClaims(db, taskId);
+      db.close();
+      return;
+    } catch (err) {
+      lastError = err;
+      try { db?.close(); } catch { /* no-op */ }
+      if (!isBusyError(err) || attempt === attempts) {
+        throw err;
+      }
+      sleepSync(100 * attempt);
+    }
+  }
+  throw lastError;
+}
+
 // ─── Program ──────────────────────────────────────────────────────────────────
 
 program
@@ -717,11 +739,13 @@ taskCmd
   .description('Mark a task as complete and release all file claims')
   .action((taskId) => {
     const repoRoot = getRepo();
-    const db = getDb(repoRoot);
-    completeTask(db, taskId);
-    releaseFileClaims(db, taskId);
-    db.close();
-    console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
+    try {
+      completeTaskWithRetries(repoRoot, taskId);
+      console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
+    } catch (err) {
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
   });
 
 taskCmd
@@ -1300,6 +1324,7 @@ program
           console.log(`  ${chalk.yellow(c.file)} → already claimed by worktree ${chalk.cyan(c.claimedBy.worktree)} (task: ${c.claimedBy.task_title})`);
         }
         console.log(chalk.dim('\nUse --force to claim anyway, or resolve conflicts first.'));
+        process.exitCode = 1;
         return;
       }
 
