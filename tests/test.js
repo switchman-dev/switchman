@@ -19,6 +19,7 @@ import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 import { buildTaskSpec } from '../src/core/planner.js';
 import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../src/core/policy.js';
+import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 const TEST_ZDOTDIR = join(tmpdir(), `switchman-zdotdir-${Date.now()}`);
@@ -997,6 +998,99 @@ test('Lease policy writes and reloads persisted settings', () => {
   assert(policy.reap_on_status_check === true, 'Lease policy persists auto-reap-on-status');
   assert(policy.requeue_task_on_reap === false, 'Lease policy persists requeue-on-reap');
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Telemetry config defaults to disabled until the user chooses', () => {
+  const fakeHome = join(tmpdir(), `sw-telemetry-home-${Date.now()}`);
+  mkdirSync(fakeHome, { recursive: true });
+  const config = loadTelemetryConfig(fakeHome);
+  assert(config.telemetry_enabled === null, 'Telemetry starts unset before opt-in');
+  assert(config.telemetry_install_id === null, 'Telemetry has no install ID before opt-in');
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
+test('Telemetry enable/disable persists an anonymous install ID', () => {
+  const fakeHome = join(tmpdir(), `sw-telemetry-home-${Date.now()}`);
+  mkdirSync(fakeHome, { recursive: true });
+
+  const enabled = enableTelemetry(fakeHome).config;
+  assert(enabled.telemetry_enabled === true, 'Telemetry enable persists an enabled flag');
+  assert(Boolean(enabled.telemetry_install_id), 'Telemetry enable creates an anonymous install ID');
+
+  const disabled = disableTelemetry(fakeHome).config;
+  assert(disabled.telemetry_enabled === false, 'Telemetry disable persists a disabled flag');
+  assert(disabled.telemetry_install_id === enabled.telemetry_install_id, 'Telemetry disable keeps the same anonymous install ID');
+  assert(existsSync(getTelemetryConfigPath(fakeHome)), 'Telemetry config is written to the expected path');
+
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
+test('Telemetry CLI reports config status and can be enabled explicitly', () => {
+  const fakeHome = join(tmpdir(), `sw-telemetry-cli-home-${Date.now()}`);
+  mkdirSync(fakeHome, { recursive: true });
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+
+  execFileSync(process.execPath, [
+    cliPath,
+    'telemetry',
+    'enable',
+    '--home',
+    fakeHome,
+  ], {
+    cwd: TEST_DIR,
+    env: {
+      ...process.env,
+      SWITCHMAN_TELEMETRY_API_KEY: 'test-posthog-key',
+      SWITCHMAN_TELEMETRY_HOST: 'https://example.test',
+    },
+    encoding: 'utf8',
+  });
+
+  const statusOutput = execFileSync(process.execPath, [
+    cliPath,
+    'telemetry',
+    'status',
+    '--home',
+    fakeHome,
+  ], {
+    cwd: TEST_DIR,
+    env: {
+      ...process.env,
+      SWITCHMAN_TELEMETRY_API_KEY: 'test-posthog-key',
+      SWITCHMAN_TELEMETRY_HOST: 'https://example.test',
+    },
+    encoding: 'utf8',
+  });
+
+  assert(statusOutput.includes('Telemetry: enabled'), 'Telemetry status reports when telemetry is enabled');
+  assert(statusOutput.includes('https://example.test'), 'Telemetry status reports the configured destination');
+
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
+test('Telemetry send reports not-configured and disabled states clearly', async () => {
+  const fakeHome = join(tmpdir(), `sw-telemetry-send-home-${Date.now()}`);
+  mkdirSync(fakeHome, { recursive: true });
+
+  const notConfigured = await sendTelemetryEvent('telemetry_test', {}, {
+    homeDir: fakeHome,
+    env: {},
+  });
+  assert(notConfigured.ok === false, 'Telemetry send reports failure when no destination is configured');
+  assert(notConfigured.reason === 'not_configured', 'Telemetry send reports a not_configured reason');
+
+  disableTelemetry(fakeHome);
+  const disabled = await sendTelemetryEvent('telemetry_test', {}, {
+    homeDir: fakeHome,
+    env: {
+      SWITCHMAN_TELEMETRY_API_KEY: 'test-posthog-key',
+      SWITCHMAN_TELEMETRY_HOST: 'https://example.test',
+    },
+  });
+  assert(disabled.ok === false, 'Telemetry send reports failure when telemetry is disabled');
+  assert(disabled.reason === 'not_enabled', 'Telemetry send reports a not_enabled reason');
+
+  rmSync(fakeHome, { recursive: true, force: true });
 });
 
 test('Stale lease reaping releases claims and re-queues the task', () => {
