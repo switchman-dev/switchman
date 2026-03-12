@@ -45,6 +45,7 @@ Recommended first run:
 ```bash
 cd my-project
 switchman setup --agents 5
+switchman verify-setup
 
 switchman task add "Implement auth helper" --priority 9
 switchman task add "Add auth tests" --priority 8
@@ -62,10 +63,11 @@ What `switchman setup` gives you:
 
 Fastest path to success:
 1. Use Cursor for the first run.
-2. Open one Cursor window per generated workspace.
-3. Let each agent pick up one clearly separate task.
-4. Keep `switchman status --watch` open in another terminal.
-5. Run `switchman gate ci` when the tasks finish.
+2. Run `switchman verify-setup` once so editor wiring is confirmed before you start.
+3. Open one Cursor window per generated workspace.
+4. Let each agent pick up one clearly separate task.
+5. Keep `switchman status --watch` open in another terminal.
+6. Run `switchman gate ci` when the tasks finish.
 
 If you want the recommended editor setup guide, start here:
 - [Cursor setup](docs/setup-cursor.md)

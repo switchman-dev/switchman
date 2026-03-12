@@ -7,9 +7,11 @@ Cursor has native MCP support, and Switchman now writes project-local Cursor con
 ```bash
 cd my-project
 switchman setup --agents 5
+switchman verify-setup
 ```
 
 This writes `.cursor/mcp.json` into the repo root and each generated workspace.
+`switchman verify-setup` confirms the project database, workspaces, and local editor config are all ready before you open Cursor windows.
 
 ## 2. Add your tasks
 

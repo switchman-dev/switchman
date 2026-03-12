@@ -27,6 +27,7 @@ switchman mcp install --windsurf --json
 ```bash
 cd my-project
 switchman setup --agents 5
+switchman verify-setup
 ```
 
 ## 3. Add your tasks

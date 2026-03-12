@@ -179,6 +179,32 @@ function renderSignalStrip(signals) {
   return signals.join(chalk.dim('  '));
 }
 
+function formatClockTime(isoString) {
+  if (!isoString) return null;
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+}
+
+function buildWatchSignature(report) {
+  return JSON.stringify({
+    health: report.health,
+    summary: report.summary,
+    counts: report.counts,
+    active_work: report.active_work,
+    attention: report.attention,
+    queue_summary: report.queue?.summary || null,
+    next_up: report.next_up || null,
+    next_steps: report.next_steps,
+    suggested_commands: report.suggested_commands,
+  });
+}
+
 function formatRelativePolicy(policy) {
   return `stale ${policy.stale_after_minutes}m • heartbeat ${policy.heartbeat_interval_seconds}s • auto-reap ${policy.reap_on_status_check ? 'on' : 'off'}`;
 }
@@ -1529,9 +1555,17 @@ queueCmd
   .description('Show an operator-friendly merge queue summary')
   .option('--json', 'Output raw JSON')
   .addHelpText('after', `
+Plain English:
+  Use this when finished branches are waiting to land and you want one safe queue view.
+
 Examples:
   switchman queue status
   switchman queue status --json
+
+What it helps you answer:
+  - what lands next
+  - what is blocked
+  - what command should I run now
 `)
   .action((opts) => {
     const repoRoot = getRepo();
@@ -1788,6 +1822,14 @@ pipelineCmd
   .command('status <pipelineId>')
   .description('Show task status for a pipeline')
   .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Plain English:
+  Use this when one goal has been split into several tasks and you want to see what is running, stuck, or next.
+
+Examples:
+  switchman pipeline status pipe-123
+  switchman pipeline status pipe-123 --json
+`)
   .action((pipelineId, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -2759,6 +2801,7 @@ Use this first when the repo feels stuck.
     const watchIntervalMs = Math.max(100, Number.parseInt(opts.watchIntervalMs, 10) || 2000);
     const maxCycles = Math.max(0, Number.parseInt(opts.maxCycles, 10) || 0);
     let cycles = 0;
+    let lastSignature = null;
 
     while (true) {
       if (watch && process.stdout.isTTY && !opts.json) {
@@ -2773,8 +2816,16 @@ Use this first when the repo feels stuck.
       } else {
         renderUnifiedStatusReport(report);
         if (watch) {
+          const signature = buildWatchSignature(report);
+          const watchState = lastSignature === null
+            ? chalk.cyan('baseline snapshot')
+            : signature === lastSignature
+              ? chalk.dim('no repo changes since last refresh')
+              : chalk.green('change detected');
+          const updatedAt = formatClockTime(report.generated_at);
+          lastSignature = signature;
           console.log('');
-          console.log(chalk.dim(`Watching every ${watchIntervalMs}ms${maxCycles > 0 ? ` • cycle ${cycles}/${maxCycles}` : ''}`));
+          console.log(chalk.dim(`Live watch • updated ${updatedAt || 'just now'} • ${watchState}${maxCycles > 0 ? ` • cycle ${cycles}/${maxCycles}` : ''} • refresh ${watchIntervalMs}ms`));
         }
       }
 
@@ -2789,6 +2840,14 @@ program
   .command('doctor')
   .description('Show one operator-focused health view: what is running, what is blocked, and what to do next')
   .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Plain English:
+  Use this when the repo feels risky, noisy, or stuck and you want the health summary plus exact next moves.
+
+Examples:
+  switchman doctor
+  switchman doctor --json
+`)
   .action(async (opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);

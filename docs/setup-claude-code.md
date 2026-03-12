@@ -7,12 +7,14 @@ Claude Code has a native Switchman integration via MCP, so your agents can coord
 ```bash
 cd my-project
 switchman setup --agents 5
+switchman verify-setup
 ```
 
 This creates:
 - isolated workspaces, one per agent
 - a shared Switchman database
 - project-local `.mcp.json` files so Claude Code can discover Switchman automatically
+- a quick readiness check so you can confirm the setup before opening Claude Code
 
 ## 2. Optional global fallback
 

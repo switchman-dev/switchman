@@ -2832,6 +2832,50 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('docs/setup-cursor.md'), 'Top-level help points users to the recommended setup guide');
 });
 
+test('Queue status help explains when to use it', () => {
+  const helpOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--help',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+
+  assert(helpOutput.includes('Use this when finished branches are waiting to land'), 'Queue status help explains its operator use case');
+  assert(helpOutput.includes('what lands next'), 'Queue status help explains the questions it answers');
+});
+
+test('Pipeline status help explains when to use it', () => {
+  const helpOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'status',
+    '--help',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+
+  assert(helpOutput.includes('Use this when one goal has been split into several tasks'), 'Pipeline status help explains its operator use case');
+  assert(helpOutput.includes('switchman pipeline status pipe-123 --json'), 'Pipeline status help includes a JSON example');
+});
+
+test('Doctor help explains when to use it', () => {
+  const helpOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--help',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+
+  assert(helpOutput.includes('Use this when the repo feels risky, noisy, or stuck'), 'Doctor help explains its operator use case');
+  assert(helpOutput.includes('switchman doctor --json'), 'Doctor help includes a JSON example');
+});
+
 test('Lease help explains the term and shows examples', () => {
   const helpOutput = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
