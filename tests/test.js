@@ -29,7 +29,9 @@ import {
   assignTask,
   startTaskLease,
   completeTask,
+  completeLeaseTask,
   failTask,
+  failLeaseTask,
   getTaskSpec,
   upsertTaskSpec,
   listTasks,
@@ -37,6 +39,7 @@ import {
   getNextPendingTask,
   listLeases,
   getLease,
+  getLeaseExecutionContext,
   getActiveLeaseForTask,
   heartbeatLease,
   getStaleLeases,
@@ -48,6 +51,8 @@ import {
   checkFileConflicts,
   getActiveFileClaims,
   listAuditEvents,
+  logAuditEvent,
+  verifyAuditTrail,
 } from '../src/core/db.js';
 
 let passed = 0;
@@ -152,6 +157,52 @@ test('Task assignment and status flow', () => {
   assert(doneTasks.length === 1, 'Task marked as done');
   const completedLease = getLease(db, lease.id);
   assert(completedLease?.status === 'completed', 'Completing a task closes its active lease');
+});
+
+test('Lease execution context exposes task, worktree, spec, and claims as one execution object', () => {
+  const leaseDir = join(tmpdir(), `sw-lease-context-${Date.now()}`);
+  mkdirSync(leaseDir, { recursive: true });
+  const leaseDb = initDb(leaseDir);
+  registerWorktree(leaseDb, { name: 'lease-context-wt', path: leaseDir, branch: 'main' });
+  const taskId = createTask(leaseDb, { title: 'Lease-centric work' });
+  upsertTaskSpec(leaseDb, taskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/**'],
+    required_deliverables: ['source'],
+  });
+  const lease = startTaskLease(leaseDb, taskId, 'lease-context-wt', 'codex');
+  claimFiles(leaseDb, taskId, 'lease-context-wt', ['src/lease-context.js'], 'codex');
+
+  const context = getLeaseExecutionContext(leaseDb, lease.id);
+
+  assert(context.lease.id === lease.id, 'Lease execution context returns the active lease');
+  assert(context.task.id === taskId, 'Lease execution context returns the assigned task');
+  assert(context.worktree.name === 'lease-context-wt', 'Lease execution context returns the assigned worktree');
+  assert(context.task_spec.task_type === 'implementation', 'Lease execution context returns the structured task spec');
+  assert(context.claims.some((claim) => claim.file_path === 'src/lease-context.js'), 'Lease execution context returns active claims for the lease');
+  leaseDb.close();
+  rmSync(leaseDir, { recursive: true, force: true });
+});
+
+test('Lease-scoped completion and failure finalize execution by lease identity', () => {
+  const leaseDir = join(tmpdir(), `sw-lease-finalize-${Date.now()}`);
+  mkdirSync(leaseDir, { recursive: true });
+  const leaseDb = initDb(leaseDir);
+  registerWorktree(leaseDb, { name: 'lease-finalize-wt', path: leaseDir, branch: 'main' });
+
+  const completeTaskId = createTask(leaseDb, { title: 'Complete by lease' });
+  const completeLease = startTaskLease(leaseDb, completeTaskId, 'lease-finalize-wt', 'codex');
+  const completed = completeLeaseTask(leaseDb, completeLease.id);
+  assert(completed.status === 'done', 'Lease-scoped completion marks the task done');
+  assert(getActiveLeaseForTask(leaseDb, completeTaskId) === null, 'Lease-scoped completion closes the active lease');
+
+  const failTaskId = createTask(leaseDb, { title: 'Fail by lease' });
+  const failedLease = startTaskLease(leaseDb, failTaskId, 'lease-finalize-wt', 'codex');
+  const failed = failLeaseTask(leaseDb, failedLease.id, 'lease scoped failure');
+  assert(failed.status === 'failed', 'Lease-scoped failure marks the task failed');
+  assert(getTask(leaseDb, failTaskId).description.includes('lease scoped failure'), 'Lease-scoped failure records the reason on the task');
+  leaseDb.close();
+  rmSync(leaseDir, { recursive: true, force: true });
 });
 
 test('Worktree registration', () => {
@@ -1347,7 +1398,8 @@ test('Fix 28: pipeline PR summary combines task status with gate results', () =>
     pipelineId: 'pipe-pr',
     priority: 5,
   });
-  completeTask(pipelineDb, 'pipe-pr-01');
+  const lease = startTaskLease(pipelineDb, 'pipe-pr-01', 'main', 'pipeline-reviewer');
+  completeLeaseTask(pipelineDb, lease.id);
   pipelineDb.close();
 
   const result = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'pipeline', 'pr', 'pipe-pr', '--json'], {
@@ -1361,6 +1413,7 @@ test('Fix 28: pipeline PR summary combines task status with gate results', () =>
   assert(result.pr_artifact.title === 'Refresh docs', 'Pipeline PR summary generates a reviewer-facing PR title');
   assert(result.pr_artifact.body.includes('## Reviewer Checklist'), 'Pipeline PR summary generates a structured PR body');
   assert(Array.isArray(result.pr_artifact.provenance), 'Pipeline PR summary includes provenance entries for reviewers');
+  assert(result.pr_artifact.provenance[0].lease_id === lease.id, 'Pipeline PR summary includes completed lease provenance');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -1597,6 +1650,7 @@ test('Fix 28d: pipeline bundle exports reviewer-ready files to disk', () => {
   assert(existsSync(result.files.summary_markdown), 'Pipeline bundle writes the markdown summary file');
   assert(existsSync(result.files.pr_body_markdown), 'Pipeline bundle writes the PR body markdown file');
   assert(readFileSync(result.files.pr_body_markdown, 'utf8').includes('## Reviewer Checklist'), 'Pipeline bundle writes reviewer checklist content into the PR body file');
+  assert(readFileSync(result.files.summary_markdown, 'utf8').includes('lease '), 'Pipeline bundle summary markdown includes lease provenance for completed work');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -2095,6 +2149,39 @@ test('Fix 37: task outcome evaluator accepts in-scope claimed source changes', (
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 37aa: task outcome evaluator can resolve execution from lease identity', () => {
+  const repoDir = join(tmpdir(), `sw-outcome-lease-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Implement: update auth helper via lease' });
+  const lease = startTaskLease(db, taskId, 'main', 'codex');
+  execSync('mkdir -p src', { cwd: repoDir, shell: '/bin/zsh' });
+  claimFiles(db, taskId, 'main', ['src/auth-helper.js']);
+  upsertTaskSpec(db, taskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/auth-helper.js'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+    objective_keywords: ['auth'],
+  });
+  writeFileSync(join(repoDir, 'src/auth-helper.js'), 'export const authHelper = true;\n');
+
+  const result = evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
+  assert(result.status === 'accepted', 'Outcome evaluator accepts lease-resolved execution context');
+  assert(result.lease_id === lease.id, 'Outcome evaluator returns the evaluated lease ID');
+  assert(result.task_id === taskId, 'Outcome evaluator returns the task behind the lease');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 37b: task outcome evaluator enforces structured task scope', () => {
   const repoDir = join(tmpdir(), `sw-outcome-scope-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -2376,6 +2463,96 @@ test('Fix 40: pipeline exec resumes previously failed tasks when retries remain'
   assert(result.status === 'ready', 'Pipeline exec resumes a previously failed task when retry budget remains');
   assert(result.iterations[0].resumed_retries === 1, 'Pipeline exec reports resumed retry work in the iteration summary');
   cleanupPipelineExecRepo(repoDir, agentPath);
+});
+
+test('Fix 53: audit events are chained and signed with a project audit key', () => {
+  const repoDir = join(tmpdir(), `switchman-audit-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const auditDb = initDb(repoDir);
+
+  logAuditEvent(auditDb, {
+    eventType: 'test_event_started',
+    status: 'allowed',
+    worktree: 'agent1',
+    taskId: 'task-1',
+    details: JSON.stringify({ step: 1 }),
+  });
+  logAuditEvent(auditDb, {
+    eventType: 'test_event_finished',
+    status: 'allowed',
+    worktree: 'agent1',
+    taskId: 'task-1',
+    details: JSON.stringify({ step: 2 }),
+  });
+
+  const events = listAuditEvents(auditDb, { limit: 10 });
+  const verification = verifyAuditTrail(auditDb);
+
+  assert(existsSync(join(repoDir, '.switchman', 'audit.key')), 'Audit key file is created alongside the project database');
+  assert(events.length >= 2, 'Audit log stores the signed test events');
+  assert(events[0].sequence !== null, 'Audit events include a chain sequence number');
+  assert(Boolean(events[0].entry_hash), 'Audit events store an entry hash');
+  assert(Boolean(events[0].signature), 'Audit events store a signature');
+  assert(verification.ok, 'Audit verification succeeds for an untampered audit trail');
+
+  auditDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 53b: audit verification detects tampering and CLI exits non-zero', () => {
+  const repoDir = join(tmpdir(), `switchman-audit-tamper-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  const auditDb = initDb(repoDir);
+
+  logAuditEvent(auditDb, {
+    eventType: 'tamper_target',
+    status: 'allowed',
+    worktree: 'agent2',
+    taskId: 'task-2',
+    details: JSON.stringify({ original: true }),
+  });
+  logAuditEvent(auditDb, {
+    eventType: 'tamper_followup',
+    status: 'allowed',
+    worktree: 'agent2',
+    taskId: 'task-2',
+    details: JSON.stringify({ original: false }),
+  });
+  auditDb.close();
+
+  const rawDb = new DatabaseSync(join(repoDir, '.switchman', 'switchman.db'));
+  rawDb.prepare(`UPDATE audit_log SET details=? WHERE sequence=1`).run('tampered');
+  rawDb.close();
+
+  const tamperedDb = openDb(repoDir);
+  const verification = verifyAuditTrail(tamperedDb);
+  tamperedDb.close();
+
+  assert(!verification.ok, 'Audit verification fails after a stored event is modified');
+  assert(verification.failures.some((failure) => failure.reason_code === 'entry_hash_mismatch'), 'Audit verification reports an entry hash mismatch after tampering');
+
+  let cliFailed = false;
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'audit',
+      'verify',
+      '--json',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    cliFailed = true;
+    const output = String(err.stdout || err.stderr || '');
+    assert(output.includes('entry_hash_mismatch'), 'CLI audit verify surfaces the tamper reason code');
+  }
+  assert(cliFailed, 'CLI audit verify exits non-zero when the audit trail has been tampered with');
+
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 // ─── Cleanup & Results ────────────────────────────────────────────────────────

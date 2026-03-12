@@ -51,6 +51,8 @@ If you want the shortest path:
 5. **Agent 2 tries to claim a conflicting file** — Switchman blocks it
 6. **Agent 2 adapts** — claims only the safe files instead
 7. **Agent 1 finishes** — marks task done, releases file claims
+
+Under the hood, Switchman now treats the lease as the execution record. That means reviewer artifacts and audit history can point back to the exact lease that performed the work, not just the task title.
 8. **Final status** — queue updated, readable status output, no lingering conflicts
 
 ## What a good demo run looks like

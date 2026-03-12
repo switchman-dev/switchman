@@ -335,9 +335,11 @@ Expire stale leases, release their claims, and return their tasks to `pending`.
 
 ### `switchman task done <taskId>`
 Mark a task complete and automatically release all file claims.
+When the task has an active lease, Switchman finalises the execution through that lease so provenance stays tied to the live session.
 
 ### `switchman task fail <taskId>`
 Mark a task failed and automatically release all file claims.
+When the task has an active lease, Switchman records the failure against that lease so execution history stays lease-first.
 
 ### `switchman claim <taskId> <worktree> [files...]`
 Lock files before editing. Warns immediately if any file is already claimed by another agent.
@@ -407,6 +409,7 @@ switchman pipeline pr pipe-123 --json
 ```
 
 Use this to inspect the current PR-ready summary, gate results, risk notes, and provenance.
+Completed work provenance now includes the lease that executed the work, not just the task and worktree.
 
 ### Export a PR bundle
 
@@ -419,6 +422,8 @@ This writes:
 - `pr-summary.json`
 - `pr-summary.md`
 - `pr-body.md`
+
+The exported reviewer bundle includes lease-aware provenance, so a reviewer can see which execution session produced each completed task.
 
 ### Publish a GitHub PR
 
