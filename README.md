@@ -471,6 +471,45 @@ This writes `.github/workflows/switchman-gate.yml`, which runs the Switchman CI 
 
 ---
 
+## Tamper-evident audit trail
+
+Switchman now keeps a signed audit trail for governed work.
+
+Every audit event is:
+- appended with a monotonic sequence number
+- chained to the previous event with `prev_hash`
+- hashed into its own `entry_hash`
+- signed with a per-project audit key stored at `.switchman/audit.key`
+
+That means Switchman can detect if someone edits stored audit history after the fact.
+
+### Verify the audit trail
+
+```bash
+switchman audit verify
+switchman audit verify --json
+```
+
+Use this when you want proof that the recorded history still matches the project audit key and the stored event chain.
+
+What a successful verification means:
+- every event is still in the expected sequence
+- every `prev_hash` still matches the prior event
+- every event payload still matches its stored `entry_hash`
+- every signature still matches the project audit key
+
+If verification fails, Switchman exits non-zero and reports the reason, for example:
+- `sequence_gap`
+- `prev_hash_mismatch`
+- `entry_hash_mismatch`
+- `signature_mismatch`
+
+This is different from normal CI:
+- `switchman gate ci` answers whether the repo is safe and governed right now
+- `switchman audit verify` answers whether the recorded audit history has been tampered with
+
+---
+
 ## MCP tools (Claude Code)
 
 | Tool | What it does |
