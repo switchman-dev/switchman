@@ -20,6 +20,44 @@ Requirements:
 npm install -g @switchman-dev
 ```
 
+## 2 minute proof
+
+If you want the fastest possible “does this actually work?” run:
+
+```bash
+switchman demo
+```
+
+That creates a throwaway repo and shows:
+- one agent claiming `src/auth.js`
+- another agent getting blocked from claiming the same file
+- that second agent rerouting to a safe docs file instead
+- both branches landing back through the queue cleanly
+
+Typical proof output looks like:
+
+```text
+$ switchman demo
+✓ Created Switchman demo repo
+  /tmp/switchman-demo-1234567890
+  proof: agent2 was blocked from src/auth.js
+  safe reroute: agent2 claimed docs/auth-flow.md instead
+  landing: 2 queue item(s) merged safely
+
+Try these next:
+  cd /tmp/switchman-demo-1234567890
+  switchman status
+  switchman queue status
+```
+
+Then inspect it:
+
+```bash
+cd /tmp/switchman-demo-...
+switchman status
+switchman queue status
+```
+
 ## Why Switchman?
 
 Git worktrees, branches, and raw coding agents are useful, but they do not coordinate themselves.
@@ -132,6 +170,25 @@ More help:
 - [Merge queue](docs/merge-queue.md)
 - [Stale lease policy](docs/stale-lease-policy.md)
 - [Telemetry](docs/telemetry.md)
+
+## Turn On PR Checks
+
+If you want GitHub to block risky changes the same way your local terminal does:
+
+```bash
+switchman gate install-ci
+```
+
+That installs `.github/workflows/switchman-gate.yml`, which:
+- runs `switchman gate ci --github` on pushes and pull requests
+- publishes a readable Switchman summary into the GitHub job output
+- fails the PR check when Switchman detects unmanaged changes, stale work, or risky overlap
+
+For pipeline-specific landing state in GitHub job summaries or PR checks, use:
+
+```bash
+switchman pipeline bundle pipe-123 --github
+```
 
 ## More docs
 

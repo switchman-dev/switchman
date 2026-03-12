@@ -2567,6 +2567,9 @@ test('Fix 22c: gate install-ci writes a GitHub Actions workflow', () => {
   const workflow = readFileSync(workflowPath, 'utf8');
   assert(existsSync(workflowPath), 'gate install-ci writes the GitHub Actions workflow file');
   assert(workflow.includes('switchman gate ci --github'), 'Installed workflow runs the Switchman CI gate in GitHub Actions');
+  assert(workflow.includes('id: switchman_gate'), 'Installed workflow exposes the gate step outputs for follow-up workflow logic');
+  assert(workflow.includes('continue-on-error: true'), 'Installed workflow keeps running long enough to publish a readable result');
+  assert(workflow.includes('Enforce Switchman gate'), 'Installed workflow includes an explicit enforcement step for the PR check');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -3050,6 +3053,76 @@ test('Fix 25db: task retry CLI resets stale completed work back to pending', () 
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 25dc: task retry-stale resets all stale tasks for one pipeline together', () => {
+  const repoDir = join(tmpdir(), `sw-task-retry-stale-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const staleA = createTask(db, { title: 'Revalidate auth A' });
+  upsertTaskSpec(db, staleA, {
+    pipeline_id: 'pipe-stale-group',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, staleA, 'main');
+  completeLeaseTask(db, getActiveLeaseForTask(db, staleA).id);
+
+  const staleB = createTask(db, { title: 'Revalidate auth B' });
+  upsertTaskSpec(db, staleB, {
+    pipeline_id: 'pipe-stale-group',
+    task_type: 'docs',
+    allowed_paths: ['docs/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['docs'],
+    required_deliverables: ['docs'],
+  });
+  assignTask(db, staleB, 'main');
+  completeLeaseTask(db, getActiveLeaseForTask(db, staleB).id);
+
+  const sourceTask = createTask(db, { title: 'Fresh auth change' });
+  upsertTaskSpec(db, sourceTask, {
+    pipeline_id: 'pipe-fresh-change',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, sourceTask, 'main');
+  const sourceLease = getActiveLeaseForTask(db, sourceTask);
+  execSync('mkdir -p src/auth && printf "new\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
+  evaluateTaskOutcome(db, repoDir, { leaseId: sourceLease.id });
+  db.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'task',
+    'retry-stale',
+    '--pipeline',
+    'pipe-stale-group',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const verifyDb = openDb(repoDir);
+  assert(output.includes('Reset 2 stale task(s) to pending'), 'task retry-stale reports how many pipeline tasks were reset');
+  assert(getTask(verifyDb, staleA).status === 'pending', 'task retry-stale resets the first stale task to pending');
+  assert(getTask(verifyDb, staleB).status === 'pending', 'task retry-stale resets the second stale task to pending');
+  assert(listDependencyInvalidations(verifyDb, { pipelineId: 'pipe-stale-group' }).length === 0, 'task retry-stale clears active dependency invalidations for the pipeline');
+  verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 26: AI merge gate passes isolated worktree changes', () => {
   const repoDir = join(tmpdir(), `sw-ai-gate-pass-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -3367,8 +3440,34 @@ test('CLI help includes examples for the main entrypoint', () => {
   });
 
   assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
+  assert(helpOutput.includes('switchman demo'), 'Top-level help includes the shortest proof command');
   assert(helpOutput.includes('switchman status --watch'), 'Top-level help includes a practical status example');
   assert(helpOutput.includes('docs/setup-cursor.md'), 'Top-level help points users to the recommended setup guide');
+});
+
+test('Fix 28k: demo command creates a self-contained proof repo with blocked overlap and safe landing', () => {
+  const demoDir = join(tmpdir(), `sw-demo-cli-${Date.now()}`);
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'demo',
+    '--path',
+    demoDir,
+    '--json',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  }));
+
+  assert(result.repo_path === demoDir, 'Demo returns the requested repo path');
+  assert(existsSync(demoDir), 'Demo leaves the proof repo on disk by default');
+  assert(result.overlap_demo.blocked_path === 'src/auth.js', 'Demo identifies the overlapping file it blocked');
+  assert(result.overlap_demo.blocked_message && result.overlap_demo.blocked_message.length > 0, 'Demo records the blocked overlap explanation');
+  assert(result.queue.processed.every((entry) => entry.status === 'merged'), 'Demo lands the queued work safely through the queue');
+  assert(result.final_gate.ok, 'Demo finishes with a clean final gate summary');
+  assert(existsSync(join(demoDir, 'src', 'auth.js')), 'Demo repo includes the merged implementation change on main');
+  assert(existsSync(join(demoDir, 'docs', 'auth-flow.md')), 'Demo repo includes the merged docs change on main');
+
+  rmSync(demoDir, { recursive: true, force: true });
 });
 
 test('Queue status help explains when to use it', () => {
@@ -3552,7 +3651,7 @@ test('Fix 28ab: doctor and repo gate surface stale dependency invalidations', ()
   }));
   assert(doctorJson.attention.some((item) => item.kind === 'dependency_invalidation'), 'Doctor includes stale dependency invalidations in the attention list');
   assert(doctorJson.merge_readiness.dependency_invalidations.some((item) => item.affected_task_id === oldTaskId), 'Doctor surfaces stale dependency invalidations in merge readiness');
-  assert(doctorJson.attention.some((item) => item.command === `switchman task retry ${oldTaskId}`), 'Doctor points stale work at the exact retry command');
+  assert(doctorJson.attention.some((item) => item.command === 'switchman task retry-stale --pipeline pipe-old-doc'), 'Doctor points stale work at the exact retry command');
 
   let ciStdout = '';
   try {
@@ -3719,8 +3818,120 @@ test('Fix 28d: pipeline bundle exports reviewer-ready files to disk', () => {
   assert(existsSync(result.files.summary_json), 'Pipeline bundle writes the JSON summary file');
   assert(existsSync(result.files.summary_markdown), 'Pipeline bundle writes the markdown summary file');
   assert(existsSync(result.files.pr_body_markdown), 'Pipeline bundle writes the PR body markdown file');
+  assert(existsSync(result.files.landing_summary_json), 'Pipeline bundle writes the landing summary JSON artifact');
+  assert(existsSync(result.files.landing_summary_markdown), 'Pipeline bundle writes the landing summary markdown artifact');
   assert(readFileSync(result.files.pr_body_markdown, 'utf8').includes('## Reviewer Checklist'), 'Pipeline bundle writes reviewer checklist content into the PR body file');
   assert(readFileSync(result.files.summary_markdown, 'utf8').includes('lease '), 'Pipeline bundle summary markdown includes lease provenance for completed work');
+  assert(readFileSync(result.files.landing_summary_markdown, 'utf8').includes('## Component Branches'), 'Pipeline landing summary markdown includes assembled component branches');
+  const landingSummary = JSON.parse(readFileSync(result.files.landing_summary_json, 'utf8'));
+  assert(landingSummary.queue_state.status === 'not_queued', 'Pipeline landing summary JSON reports when the pipeline is not queued yet');
+  assert(landingSummary.recovery_state === null, 'Pipeline landing summary JSON reports that no recovery worktree is active by default');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28d1: pipeline bundle writes GitHub Actions landing summary and outputs', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-bundle-github-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-bundle-github',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-bundle-github-01');
+  pipelineDb.close();
+
+  const stepSummaryPath = join(repoDir, 'pipeline-step-summary.md');
+  const outputPath = join(repoDir, 'pipeline-output.txt');
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'bundle',
+    'pipe-bundle-github',
+    '--github-step-summary',
+    stepSummaryPath,
+    '--github-output',
+    outputPath,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const stepSummary = readFileSync(stepSummaryPath, 'utf8');
+  const output = readFileSync(outputPath, 'utf8');
+  assert(stepSummary.includes('# Switchman Pipeline Landing'), 'Pipeline bundle writes a GitHub step summary for landing state');
+  assert(stepSummary.includes('## Check Summary'), 'Pipeline bundle step summary includes a dedicated check summary section');
+  assert(stepSummary.includes('- Name: Switchman Pipeline Landing'), 'Pipeline bundle step summary includes a stable check name');
+  assert(stepSummary.includes('- Title: '), 'Pipeline bundle step summary includes a check-friendly title');
+  assert(stepSummary.includes('- Summary: '), 'Pipeline bundle step summary includes a one-line check summary');
+  assert(stepSummary.includes('## Queue State'), 'Pipeline bundle step summary includes queue state for PR-facing checks');
+  assert(output.includes('switchman_pipeline_id=pipe-bundle-github'), 'Pipeline bundle writes the pipeline ID to GitHub outputs');
+  assert(output.includes('switchman_landing_branch='), 'Pipeline bundle writes the landing branch to GitHub outputs');
+  assert(output.includes('switchman_check_name='), 'Pipeline bundle writes a reusable check name to GitHub outputs');
+  assert(output.includes('switchman_check_status='), 'Pipeline bundle writes a reusable check status to GitHub outputs');
+  assert(output.includes('switchman_check_title='), 'Pipeline bundle writes a reusable check title to GitHub outputs');
+  assert(output.includes('switchman_check_summary='), 'Pipeline bundle writes a reusable check summary to GitHub outputs');
+  assert(output.includes('switchman_queue_status='), 'Pipeline bundle writes queue status to GitHub outputs');
+  assert(output.includes('switchman_queue_target_branch='), 'Pipeline bundle writes queue target branch to GitHub outputs');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28d2: pipeline bundle reflects queued pipeline state in GitHub check outputs', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-bundle-queued-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-bundle-queued',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-bundle-queued-01');
+  const queued = enqueueMergeItem(pipelineDb, {
+    sourceType: 'pipeline',
+    sourceRef: 'pipe-bundle-queued',
+    sourcePipelineId: 'pipe-bundle-queued',
+    targetBranch: 'main',
+  });
+  pipelineDb.close();
+
+  const stepSummaryPath = join(repoDir, 'pipeline-step-summary.md');
+  const outputPath = join(repoDir, 'pipeline-output.txt');
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'bundle',
+    'pipe-bundle-queued',
+    '--github-step-summary',
+    stepSummaryPath,
+    '--github-output',
+    outputPath,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const stepSummary = readFileSync(stepSummaryPath, 'utf8');
+  const output = readFileSync(outputPath, 'utf8');
+  assert(stepSummary.includes('- Status: pending'), 'Queued pipelines render a pending check status for GitHub summaries');
+  assert(stepSummary.includes('- Title: Pipeline is in the landing queue'), 'Queued pipelines explain that landing is already queued');
+  assert(stepSummary.includes(`- Item: ${queued.id}`), 'Queued pipelines include the active queue item in the step summary');
+  assert(output.includes('switchman_queue_status=queued'), 'Queued pipelines export the queue status for GitHub checks');
+  assert(output.includes(`switchman_queue_item_id=${queued.id}`), 'Queued pipelines export the queue item id for GitHub checks');
+
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -3867,6 +4078,184 @@ printf 'https://github.com/example/repo/pull/123\n'
   assert(invocation.args.includes('pr') && invocation.args.includes('create'), 'Pipeline publish invokes gh pr create');
   assert(invocation.args.includes('--body-file'), 'Pipeline publish passes the generated PR body file to gh');
   assert(invocation.args.includes('--title') && invocation.args.includes('Refresh docs'), 'Pipeline publish passes the generated PR title to gh');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28e1: pipeline comment posts the landing summary to a GitHub PR', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-comment-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git checkout -b feature/docs-refresh', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'feature/docs-refresh' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-comment',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-comment-01');
+  pipelineDb.close();
+
+  const ghCapturePath = join(repoDir, 'gh-comment-invocation.json');
+  const fakeGhPath = join(repoDir, 'fake-gh-comment');
+  writeFileSync(fakeGhPath, `#!/bin/sh
+printf '%s\n' "$@" > /dev/null
+printf '{"args":[' > ${JSON.stringify(ghCapturePath)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(ghCapturePath)}; fi
+  first=0
+  printf '%s' "$(printf '%s' "$arg" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/$/\"/; s/^/\"/')" >> ${JSON.stringify(ghCapturePath)}
+done
+printf ']}' >> ${JSON.stringify(ghCapturePath)}
+printf 'commented\n'
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'comment',
+    'pipe-comment',
+    '--pr',
+    '123',
+    '--gh-command',
+    fakeGhPath,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const invocation = JSON.parse(readFileSync(ghCapturePath, 'utf8'));
+  assert(result.pr_number === '123', 'Pipeline comment returns the PR number');
+  assert(invocation.args.includes('pr') && invocation.args.includes('comment'), 'Pipeline comment invokes gh pr comment');
+  assert(invocation.args.includes('--body-file'), 'Pipeline comment passes the landing summary markdown file to gh');
+  assert(invocation.args.includes('123'), 'Pipeline comment targets the requested PR number');
+  assert(result.bundle.files.landing_summary_markdown.endsWith('pipeline-landing-summary.md'), 'Pipeline comment reuses the landing summary artifact');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28e2: pipeline comment can update an existing GitHub PR comment', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-comment-update-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git checkout -b feature/docs-refresh', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'feature/docs-refresh' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-comment-update',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-comment-update-01');
+  pipelineDb.close();
+
+  const ghCapturePath = join(repoDir, 'gh-comment-update-invocation.json');
+  const fakeGhPath = join(repoDir, 'fake-gh-comment-update');
+  writeFileSync(fakeGhPath, `#!/bin/sh
+printf '%s\n' "$@" > /dev/null
+printf '{"args":[' > ${JSON.stringify(ghCapturePath)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(ghCapturePath)}; fi
+  first=0
+  printf '%s' "$(printf '%s' "$arg" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/$/\"/; s/^/\"/')" >> ${JSON.stringify(ghCapturePath)}
+done
+printf ']}' >> ${JSON.stringify(ghCapturePath)}
+printf 'updated\n'
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'comment',
+    'pipe-comment-update',
+    '--pr',
+    '456',
+    '--gh-command',
+    fakeGhPath,
+    '--update-existing',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const invocation = JSON.parse(readFileSync(ghCapturePath, 'utf8'));
+  assert(result.updated_existing, 'Pipeline comment reports when it is updating an existing comment');
+  assert(invocation.args.includes('--edit-last'), 'Pipeline comment can update the last GitHub comment');
+  assert(invocation.args.includes('--create-if-none'), 'Pipeline comment can create the comment if none exists yet');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28e3: pipeline comment can resolve the PR number from GitHub Actions env', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-comment-env-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git checkout -b feature/docs-refresh', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const ghLogPath = join(repoDir, 'gh-log.txt');
+  const ghScriptPath = join(repoDir, 'gh-stub.sh');
+  writeFileSync(ghScriptPath, `#!/bin/sh
+echo "$@" >> "${ghLogPath}"
+`, 'utf8');
+  execSync(`chmod +x "${ghScriptPath}"`);
+
+  const eventPath = join(repoDir, 'github-event.json');
+  writeFileSync(eventPath, `${JSON.stringify({ pull_request: { number: 77 } }, null, 2)}\n`);
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-comment-env',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-comment-env-01');
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'comment',
+    'pipe-comment-env',
+    '--pr-from-env',
+    '--gh-command',
+    ghScriptPath,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_EVENT_PATH: eventPath,
+    },
+  }));
+
+  const ghLog = readFileSync(ghLogPath, 'utf8');
+  assert(result.pr_number === '77', 'pipeline comment resolves the PR number from the GitHub event payload');
+  assert(ghLog.includes('pr comment 77'), 'pipeline comment uses the resolved PR number when calling gh');
+
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -4158,6 +4547,615 @@ test('Fix 28fd: pipeline land reuses an up-to-date synthetic branch without rewr
 
   execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
   execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fe: explain landing reports merge-conflict refresh failures with the blocked branch and next step', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-conflict-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-conflict-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-conflict-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-conflict-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-conflict-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-conflict-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-conflict-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-conflict-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-conflict', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-conflict-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-conflict', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  let refreshError = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline',
+      'land',
+      'pipe-land-conflict',
+      '--refresh',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    refreshError = `${err.stdout || ''}${err.stderr || ''}`;
+  }
+
+  const explainText = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'landing',
+    'pipe-land-conflict',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const explainJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'landing',
+    'pipe-land-conflict',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'status',
+    'pipe-land-conflict',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(refreshError.includes('next: switchman explain landing pipe-land-conflict'), 'Landing refresh failure points the operator at explain landing');
+  assert(explainText.includes('failure:'), 'Explain landing reports the landing failure');
+  assert(explainText.includes('feature/pipeline-conflict-b'), 'Explain landing names the component branch that blocked the merge');
+  assert(explainText.includes('switchman pipeline land pipe-land-conflict --recover'), 'Explain landing gives the exact recovery command');
+  assert(explainJson.landing.last_failure.reason_code === 'landing_branch_merge_conflict', 'Explain landing JSON classifies merge conflicts explicitly');
+  assert(explainJson.landing.last_failure.failed_branch === 'feature/pipeline-conflict-b', 'Explain landing JSON reports the blocked component branch');
+  assert(explainJson.landing.last_failure.command === 'switchman pipeline land pipe-land-conflict --recover', 'Explain landing JSON points merge conflicts at recovery mode');
+  assert(explainJson.landing.last_failure.conflicting_files.includes('README.md'), 'Explain landing JSON includes the conflicting file list');
+  assert(statusJson.landing_branch.last_failure.reason_code === 'landing_branch_merge_conflict', 'Pipeline status JSON surfaces the landing failure classification');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fg: pipeline land recover creates a conflict-ready recovery worktree', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-recover-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-recover-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-recover-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-recover-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-recover-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-recover-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-recover-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-recover-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-recover', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-recover-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-recover', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline',
+      'land',
+      'pipe-land-recover',
+      '--refresh',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    // Expected conflict; recovery path depends on the recorded failure.
+  }
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-recover',
+    '--recover',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const recoveryStatus = execSync('git status --short', {
+    cwd: recovery.recovery_path,
+    encoding: 'utf8',
+  });
+  const recoveryBranch = execSync('git branch --show-current', {
+    cwd: recovery.recovery_path,
+    encoding: 'utf8',
+  }).trim();
+
+  assert(recovery.failed_branch === 'feature/pipeline-recover-b', 'Recovery worktree reports the component branch that blocked landing');
+  assert(recovery.conflicting_files.includes('README.md'), 'Recovery worktree reports the conflicting file');
+  assert(recovery.inspect_command.includes(recovery.recovery_path), 'Recovery worktree returns an exact inspect command');
+  assert(recovery.resume_command === 'switchman queue add --pipeline pipe-land-recover', 'Recovery worktree returns the resume command');
+  assert(recoveryStatus.includes('UU README.md'), 'Recovery worktree leaves the conflict in progress for manual resolution');
+  assert(recoveryBranch === 'switchman/pipeline-landing/pipe-land-recover', 'Recovery worktree checks out the landing branch for the operator');
+
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fga: pipeline land recover blocks duplicate recovery worktrees unless replaced', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-dup-recover-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-dup-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-dup-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-dup-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-dup-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-dup-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-dup-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-dup-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-dup', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-dup-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-dup', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline',
+      'land',
+      'pipe-land-dup',
+      '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const firstRecovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-dup',
+    '--recover',
+    '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  let duplicateError = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline',
+      'land',
+      'pipe-land-dup',
+      '--recover',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (err) {
+    duplicateError = `${err.stdout || ''}${err.stderr || ''}`;
+  }
+
+  const replacedRecovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-dup',
+    '--recover',
+    '--replace-recovery',
+    '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(duplicateError.includes('already exists'), 'Duplicate recovery creation is blocked until the old recovery is cleared or replaced');
+  assert(!existsSync(firstRecovery.recovery_path), 'Replacing recovery removes the previous recovery worktree');
+  assert(existsSync(replacedRecovery.recovery_path), 'Replacing recovery creates a fresh recovery worktree');
+
+  execSync(`git worktree remove "${replacedRecovery.recovery_path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fh: pipeline land resume marks a resolved recovery branch ready for queueing', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-resume-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-resume-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-resume-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-resume-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-resume-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-resume-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-resume-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-resume-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-resume', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-resume-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-resume', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline',
+      'land',
+      'pipe-land-resume',
+      '--refresh',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    // Expected merge conflict before recovery.
+  }
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-resume',
+    '--recover',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  writeFileSync(join(recovery.recovery_path, 'README.md'), 'resolved\n');
+  execSync('git add README.md', { cwd: recovery.recovery_path });
+  execSync('git commit -m "Resolve landing conflict"', { cwd: recovery.recovery_path });
+
+  const resumed = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-resume',
+    '--resume',
+    recovery.recovery_path,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const explainJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'landing',
+    'pipe-land-resume',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'status',
+    'pipe-land-resume',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const queueAdd = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'add',
+    '--pipeline',
+    'pipe-land-resume',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(resumed.branch === 'switchman/pipeline-landing/pipe-land-resume', 'Resume keeps the synthetic landing branch as the governed head');
+  assert(resumed.resume_command === 'switchman queue add --pipeline pipe-land-resume', 'Resume returns the exact queue follow-up command');
+  assert(explainJson.landing.last_failure === null, 'Explain landing clears the previous merge failure once recovery is resumed');
+  assert(explainJson.next_action === 'switchman queue add --pipeline pipe-land-resume', 'Explain landing points resumed recovery at queueing');
+  assert(statusJson.landing_branch.last_failure === null, 'Pipeline status clears the previous landing failure after resume');
+  assert(statusJson.landing_branch.last_materialized.head_commit === resumed.head_commit, 'Pipeline status tracks the resolved landing commit as the current head');
+  assert(queueAdd.source_ref === 'switchman/pipeline-landing/pipe-land-resume', 'Queue add uses the resumed landing branch');
+
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fi: pipeline land cleanup removes recorded recovery worktrees and clears landing state', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-cleanup-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-cleanup-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-cleanup-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-cleanup-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-cleanup-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-cleanup-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-cleanup-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-cleanup-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-cleanup', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-cleanup-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-cleanup', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-land-cleanup', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-land-cleanup', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  const cleanup = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-land-cleanup', '--cleanup', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  const explain = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain', 'landing', 'pipe-land-cleanup', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(cleanup.removed, 'Cleanup removes an on-disk recovery worktree');
+  assert(cleanup.recovery_path === recovery.recovery_path, 'Cleanup targets the recorded recovery path by default');
+  assert(!existsSync(recovery.recovery_path), 'Cleanup removes the recorded recovery path from disk');
+  assert(explain.landing.last_recovery === null, 'Cleanup clears the recorded recovery state from explain landing');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fj: pipeline land cleanup clears missing recorded recovery paths without failing', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-cleanup-missing-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-cleanup-missing-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-cleanup-missing-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-cleanup-missing-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-cleanup-missing-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-cleanup-missing-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-cleanup-missing-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-cleanup-missing-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-cleanup-missing', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-cleanup-missing-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-cleanup-missing', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-land-cleanup-missing', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-land-cleanup-missing', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+
+  const cleanup = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-land-cleanup-missing', '--cleanup', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  const explain = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain', 'landing', 'pipe-land-cleanup-missing', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(!cleanup.removed, 'Cleanup does not fail when the recovery worktree was already removed');
+  assert(!cleanup.existed, 'Cleanup reports that the recorded recovery path was already gone');
+  assert(explain.landing.last_recovery === null, 'Cleanup clears missing recovery paths from landing state too');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28ff: explain landing reports missing component branches clearly', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-missing-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-missing-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-missing-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-missing-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-missing-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'a.txt'), 'A\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'b.txt'), 'B\n');
+  execSync('git add b.txt', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-missing-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-missing-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-missing-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-missing', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-missing-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-missing', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  execSync('git branch -D feature/pipeline-missing-b', { cwd: repoDir });
+
+  let refreshError = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline',
+      'land',
+      'pipe-land-missing',
+      '--refresh',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    refreshError = `${err.stdout || ''}${err.stderr || ''}`;
+  }
+
+  const explainJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'landing',
+    'pipe-land-missing',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(refreshError.includes('switchman explain landing pipe-land-missing'), 'Missing branch failures point at explain landing');
+  assert(explainJson.landing.last_failure.reason_code === 'landing_branch_missing_component', 'Explain landing JSON classifies missing component branches');
+  assert(explainJson.landing.last_failure.command === 'switchman pipeline land pipe-land-missing --refresh', 'Explain landing preserves the exact retry command');
+  assert(explainJson.next_action.includes('restore the missing branch'), 'Explain landing tells the operator to restore the missing branch first');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
 });
 

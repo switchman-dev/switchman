@@ -40,6 +40,21 @@ If one of the component branches moves later, Switchman marks the synthetic bran
 switchman pipeline land pipe-123 --refresh
 ```
 
+If the refresh hits a merge conflict, open a recovery worktree on the landing branch:
+
+```bash
+switchman pipeline land pipe-123 --recover
+```
+
+That worktree keeps the landing merge in progress so you can resolve the conflicts there and commit the result.
+
+Then tell Switchman to adopt that resolved landing commit:
+
+```bash
+switchman pipeline land pipe-123 --resume
+switchman queue add --pipeline pipe-123
+```
+
 ## Export a PR bundle
 
 ```bash
@@ -50,3 +65,52 @@ This writes:
 - `pr-summary.json`
 - `pr-summary.md`
 - `pr-body.md`
+- `pipeline-landing-summary.json`
+- `pipeline-landing-summary.md`
+
+If you want the landing summary to show up in GitHub Actions too:
+
+```bash
+switchman pipeline bundle pipe-123 --github
+```
+
+That writes both a human-readable step summary and reusable GitHub output keys such as:
+- `switchman_check_name`
+- `switchman_check_status`
+- `switchman_check_title`
+- `switchman_check_summary`
+- `switchman_queue_status`
+- `switchman_queue_item_id`
+- `switchman_queue_target_branch`
+
+The step summary now includes dedicated `Check Summary`, `Recovery State`, and `Queue State` sections so GitHub Actions can surface the same landing state cleanly in PR checks and workflow summaries.
+
+A simple GitHub Actions pattern is:
+
+```yaml
+- name: Build Switchman pipeline bundle
+  id: switchman
+  run: switchman pipeline bundle pipe-123 --github
+
+- name: Fail when Switchman needs action
+  if: ${{ steps.switchman.outputs.switchman_check_status == 'action_required' }}
+  run: |
+    echo "${{ steps.switchman.outputs.switchman_check_title }}"
+    echo "${{ steps.switchman.outputs.switchman_check_summary }}"
+    exit 1
+```
+
+That lets one job or PR check show whether the pipeline is ready, already queued, retrying, blocked, or fully merged, plus the next exact operator command.
+
+If you want reviewers to see the current landing state directly on the PR:
+
+```bash
+switchman pipeline comment pipe-123 --pr 42
+switchman pipeline comment pipe-123 --pr 42 --update-existing
+```
+
+In GitHub Actions you can let Switchman resolve the PR number from `GITHUB_EVENT_PATH` instead:
+
+```bash
+switchman pipeline comment pipe-123 --pr-from-env --update-existing
+```

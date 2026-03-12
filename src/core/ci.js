@@ -40,6 +40,58 @@ export function formatCiGateMarkdown(result) {
   ].join('\n');
 }
 
+function getPipelineLandingCheckInfo(result) {
+  if (result.queue_state?.status === 'merged') {
+    return {
+      status: 'success',
+      title: 'Pipeline merged to target branch',
+      summary: result.queue_state.merged_commit
+        ? `Merged as ${result.queue_state.merged_commit}.`
+        : 'Merged successfully.',
+    };
+  }
+
+  if (['queued', 'validating', 'rebasing', 'merging', 'retrying'].includes(result.queue_state?.status)) {
+    return {
+      status: result.queue_state.status === 'retrying' ? 'action_required' : 'pending',
+      title: result.queue_state.status === 'retrying'
+        ? 'Pipeline is retrying in the landing queue'
+        : 'Pipeline is in the landing queue',
+      summary: result.queue_state.next_action || result.next_action,
+    };
+  }
+
+  if (result.ready_to_queue) {
+    return {
+      status: 'success',
+      title: 'Pipeline ready to queue',
+      summary: result.queue_state?.next_action || result.next_action,
+    };
+  }
+
+  if (result.landing_error || result.landing?.last_failure) {
+    return {
+      status: 'action_required',
+      title: 'Pipeline landing needs attention',
+      summary: result.queue_state?.next_action || result.next_action,
+    };
+  }
+
+  if (result.landing?.stale) {
+    return {
+      status: 'action_required',
+      title: 'Pipeline landing is stale',
+      summary: result.queue_state?.next_action || result.next_action,
+    };
+  }
+
+  return {
+    status: 'action_required',
+    title: 'Pipeline not ready to queue',
+    summary: result.queue_state?.next_action || result.next_action,
+  };
+}
+
 export function writeGitHubCiStatus({ result, stepSummaryPath = null, outputPath = null }) {
   const markdown = formatCiGateMarkdown(result);
 
@@ -56,6 +108,103 @@ export function writeGitHubCiStatus({ result, stepSummaryPath = null, outputPath
       `switchman_unclaimed_changes=${result.unclaimed_changes?.length ?? 0}`,
       `switchman_file_conflicts=${result.file_conflicts?.length ?? 0}`,
       `switchman_branch_conflicts=${result.branch_conflicts?.length ?? 0}`,
+    ];
+    writeFileSync(outputPath, `${lines.join('\n')}\n`);
+  }
+
+  return {
+    markdown,
+    wrote_step_summary: Boolean(stepSummaryPath),
+    wrote_output: Boolean(outputPath),
+  };
+}
+
+export function formatPipelineLandingMarkdown(result) {
+  const checkInfo = getPipelineLandingCheckInfo(result);
+  const landingStateLines = result.landing_error
+    ? [`- ${result.landing_error}`]
+    : result.landing?.last_failure
+      ? [
+        `- Failure: ${result.landing.last_failure.reason_code || 'landing_branch_materialization_failed'}`,
+        ...(result.landing.last_failure.failed_branch ? [`- Failed branch: ${result.landing.last_failure.failed_branch}`] : []),
+        ...(result.landing.last_failure.conflicting_files?.length
+          ? [`- Conflicts: ${result.landing.last_failure.conflicting_files.join(', ')}`]
+          : []),
+      ]
+      : result.landing?.stale
+        ? (result.landing.stale_reasons?.length
+          ? result.landing.stale_reasons.map((reason) => `- Stale: ${reason.summary}`)
+          : ['- Landing branch is stale and needs refresh'])
+        : ['- Current and ready for queueing'];
+  return [
+    '# Switchman Pipeline Landing',
+    '',
+    '## Check Summary',
+    `- Name: Switchman Pipeline Landing`,
+    `- Status: ${checkInfo.status}`,
+    `- Title: ${checkInfo.title}`,
+    `- Summary: ${checkInfo.summary}`,
+    '',
+    '## Pipeline',
+    `- Pipeline: ${result.pipeline_id}`,
+    `- Ready to queue: ${result.ready_to_queue ? 'yes' : 'no'}`,
+    `- Landing branch: ${result.landing.branch}`,
+    `- Strategy: ${result.landing.strategy}`,
+    `- Synthetic: ${result.landing.synthetic ? 'yes' : 'no'}`,
+    '',
+    '## Component Branches',
+    ...(result.landing.component_branches?.length
+      ? result.landing.component_branches.map((branch) => `- ${branch}`)
+      : ['- None']),
+    '',
+    '## Landing State',
+    ...landingStateLines,
+    '',
+    '## Recovery State',
+    ...(result.recovery_state
+      ? [
+        `- Status: ${result.recovery_state.status}`,
+        ...(result.recovery_state.recovery_path ? [`- Path: ${result.recovery_state.recovery_path}`] : []),
+        ...(result.recovery_state.resume_command ? [`- Resume: ${result.recovery_state.resume_command}`] : []),
+      ]
+      : ['- No active recovery worktree']),
+    '',
+    '## Queue State',
+    `- Status: ${result.queue_state?.status || 'not_queued'}`,
+    ...(result.queue_state?.item_id ? [`- Item: ${result.queue_state.item_id}`] : []),
+    `- Target branch: ${result.queue_state?.target_branch || 'main'}`,
+    ...(result.queue_state?.merged_commit ? [`- Merged commit: ${result.queue_state.merged_commit}`] : []),
+    ...(result.queue_state?.last_error_summary ? [`- Queue error: ${result.queue_state.last_error_summary}`] : []),
+    '',
+    '## Next Action',
+    `- ${result.next_action}`,
+  ].join('\n');
+}
+
+export function writeGitHubPipelineLandingStatus({ result, stepSummaryPath = null, outputPath = null }) {
+  const markdown = formatPipelineLandingMarkdown(result);
+  const checkInfo = getPipelineLandingCheckInfo(result);
+
+  if (stepSummaryPath) {
+    writeFileSync(stepSummaryPath, `${markdown}\n`);
+  }
+
+  if (outputPath) {
+    const lines = [
+      `switchman_pipeline_id=${result.pipeline_id}`,
+      `switchman_pipeline_ready=${result.ready_to_queue ? 'true' : 'false'}`,
+      `switchman_landing_branch=${result.landing.branch}`,
+      `switchman_landing_strategy=${result.landing.strategy}`,
+      `switchman_landing_synthetic=${result.landing.synthetic ? 'true' : 'false'}`,
+      `switchman_queue_status=${result.queue_state?.status || 'not_queued'}`,
+      `switchman_queue_item_id=${result.queue_state?.item_id || ''}`,
+      `switchman_queue_target_branch=${result.queue_state?.target_branch || 'main'}`,
+      `switchman_queue_merged_commit=${result.queue_state?.merged_commit || ''}`,
+      `switchman_landing_next_action=${JSON.stringify(result.next_action)}`,
+      `switchman_check_name=${JSON.stringify('Switchman Pipeline Landing')}`,
+      `switchman_check_status=${checkInfo.status}`,
+      `switchman_check_title=${JSON.stringify(checkInfo.title)}`,
+      `switchman_check_summary=${JSON.stringify(checkInfo.summary)}`,
     ];
     writeFileSync(outputPath, `${lines.join('\n')}\n`);
   }
@@ -84,6 +233,7 @@ on:
 
 jobs:
   switchman-gate:
+    name: Switchman Gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -98,7 +248,24 @@ jobs:
         run: npm install -g switchman-dev
 
       - name: Run Switchman CI gate
+        id: switchman_gate
+        continue-on-error: true
         run: switchman gate ci --github
+
+      - name: Summarize Switchman result
+        if: always()
+        run: |
+          echo "Switchman status: \${{ steps.switchman_gate.outputs.switchman_ok }}"
+          echo "Switchman summary: \${{ steps.switchman_gate.outputs.switchman_summary }}"
+
+      - name: Enforce Switchman gate
+        if: always()
+        run: |
+          if [ "\${{ steps.switchman_gate.outputs.switchman_ok }}" != "true" ]; then
+            echo "Switchman blocked this change."
+            echo "\${{ steps.switchman_gate.outputs.switchman_summary }}"
+            exit 1
+          fi
 `;
 
   writeFileSync(workflowPath, workflow);

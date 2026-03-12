@@ -2,6 +2,11 @@
 
 ## Setup
 
+### `switchman demo`
+- creates a self-contained demo repo
+- proves an overlapping claim gets blocked
+- lands the demo work safely through the queue
+
 ### `switchman setup`
 - creates agent workspaces
 - initialises the database
@@ -22,6 +27,10 @@ Plain-English note:
 
 ### `switchman task add <title>`
 ### `switchman task list`
+### `switchman task retry <taskId>`
+### `switchman task retry-stale`
+- resets all stale tasks, or all stale tasks for one pipeline, back to `pending`
+- useful after shared-boundary changes invalidate several completed tasks at once
 ### `switchman task done <taskId>`
 ### `switchman task fail <taskId>`
 ### `switchman lease next`
@@ -53,6 +62,11 @@ Plain-English note:
 ### `switchman pipeline status`
 ### `switchman pipeline pr`
 ### `switchman pipeline bundle`
+- writes reviewer-ready bundle artifacts for a pipeline
+- adds GitHub-friendly step summary and output keys with `--github`
+### `switchman pipeline comment`
+- posts or updates the landing summary on a PR
+- can read the PR number from GitHub Actions with `--pr-from-env`
 ### `switchman pipeline publish`
 
 ## MCP and CI
@@ -60,4 +74,6 @@ Plain-English note:
 ### `switchman mcp install --windsurf`
 ### `switchman gate ci`
 ### `switchman gate install-ci`
+- installs a GitHub Actions workflow with a named Switchman PR check
+- keeps the Switchman summary visible before the workflow fails the check
 ### `switchman audit verify`

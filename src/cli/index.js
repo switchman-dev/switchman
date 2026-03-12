@@ -19,8 +19,9 @@
 import { program } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { existsSync } from 'fs';
-import { join, posix } from 'path';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname, join, posix } from 'path';
 import { execSync, spawn } from 'child_process';
 
 import { findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.js';
@@ -40,8 +41,8 @@ import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcp
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
-import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineStatus, materializePipelineLandingBranch, preparePipelineLandingTarget, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
-import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus } from '../core/ci.js';
+import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, resumePipelineLandingRecovery, runPipeline, startPipeline } from '../core/pipeline.js';
+import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus, writeGitHubPipelineLandingStatus } from '../core/ci.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, resolveQueueSource, runMergeQueue } from '../core/queue.js';
 import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../core/policy.js';
@@ -78,6 +79,47 @@ function getDb(repoRoot) {
     console.error(chalk.red(err.message));
     process.exit(1);
   }
+}
+
+function resolvePrNumberFromEnv(env = process.env) {
+  if (env.SWITCHMAN_PR_NUMBER) return String(env.SWITCHMAN_PR_NUMBER);
+  if (env.GITHUB_PR_NUMBER) return String(env.GITHUB_PR_NUMBER);
+
+  if (env.GITHUB_EVENT_PATH && existsSync(env.GITHUB_EVENT_PATH)) {
+    try {
+      const payload = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'));
+      const prNumber = payload.pull_request?.number || payload.issue?.number || null;
+      if (prNumber) return String(prNumber);
+    } catch {
+      // Ignore malformed GitHub event payloads.
+    }
+  }
+
+  return null;
+}
+
+function retryStaleTasks(db, { pipelineId = null, reason = 'bulk stale retry' } = {}) {
+  const invalidations = listDependencyInvalidations(db, { pipelineId });
+  const staleTaskIds = [...new Set(invalidations.map((item) => item.affected_task_id).filter(Boolean))];
+  const retried = [];
+  const skipped = [];
+
+  for (const taskId of staleTaskIds) {
+    const task = retryTask(db, taskId, reason);
+    if (task) {
+      retried.push(task);
+    } else {
+      skipped.push(taskId);
+    }
+  }
+
+  return {
+    pipeline_id: pipelineId,
+    stale_task_ids: staleTaskIds,
+    retried,
+    skipped,
+    invalidation_count: invalidations.length,
+  };
 }
 
 function statusBadge(status) {
@@ -232,6 +274,154 @@ function printErrorWithNext(message, nextCommand = null) {
   console.error(chalk.red(message));
   if (nextCommand) {
     console.error(`${chalk.yellow('next:')} ${nextCommand}`);
+  }
+}
+
+function writeDemoFile(filePath, contents) {
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, contents);
+}
+
+function gitCommitAll(worktreePath, message) {
+  execSync('git add .', {
+    cwd: worktreePath,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  execSync(`git -c user.email="demo@switchman.dev" -c user.name="Switchman Demo" commit -m ${JSON.stringify(message)}`, {
+    cwd: worktreePath,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+async function runDemoScenario({ repoPath = null, cleanup = false } = {}) {
+  const repoDir = repoPath || join(tmpdir(), `switchman-demo-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+
+  try {
+    execSync('git init -b main', { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] });
+    execSync('git config user.email "demo@switchman.dev"', { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] });
+    execSync('git config user.name "Switchman Demo"', { cwd: repoDir, stdio: ['ignore', 'pipe', 'pipe'] });
+
+    writeDemoFile(join(repoDir, 'README.md'), '# Switchman demo repo\n');
+    writeDemoFile(join(repoDir, 'src', 'index.js'), 'export function ready() {\n  return true;\n}\n');
+    writeDemoFile(join(repoDir, 'docs', 'overview.md'), '# Demo\n');
+    gitCommitAll(repoDir, 'Initial demo repo');
+
+    const db = initDb(repoDir);
+    registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+    const agent1Path = createGitWorktree(repoDir, 'agent1', 'switchman/demo-agent1');
+    const agent2Path = createGitWorktree(repoDir, 'agent2', 'switchman/demo-agent2');
+    registerWorktree(db, { name: 'agent1', path: agent1Path, branch: 'switchman/demo-agent1' });
+    registerWorktree(db, { name: 'agent2', path: agent2Path, branch: 'switchman/demo-agent2' });
+
+    const taskAuth = createTask(db, {
+      id: 'demo-01',
+      title: 'Add auth helper',
+      priority: 9,
+    });
+    const taskDocs = createTask(db, {
+      id: 'demo-02',
+      title: 'Document auth flow',
+      priority: 8,
+    });
+
+    const lease1 = startTaskLease(db, taskAuth, 'agent1');
+    claimFiles(db, taskAuth, 'agent1', ['src/auth.js']);
+
+    const lease2 = startTaskLease(db, taskDocs, 'agent2');
+    let blockedClaimMessage = null;
+    try {
+      claimFiles(db, taskDocs, 'agent2', ['src/auth.js']);
+    } catch (err) {
+      blockedClaimMessage = String(err.message || 'Claim blocked.');
+    }
+    claimFiles(db, taskDocs, 'agent2', ['docs/auth-flow.md']);
+
+    writeDemoFile(join(agent1Path, 'src', 'auth.js'), 'export function authHeader(token) {\n  return `Bearer ${token}`;\n}\n');
+    gitCommitAll(agent1Path, 'Add auth helper');
+    completeTask(db, taskAuth);
+
+    writeDemoFile(join(agent2Path, 'docs', 'auth-flow.md'), '# Auth flow\n\n- claims stop overlap early\n');
+    gitCommitAll(agent2Path, 'Document auth flow');
+    completeTask(db, taskDocs);
+
+    enqueueMergeItem(db, {
+      sourceType: 'worktree',
+      sourceRef: 'agent1',
+      sourceWorktree: 'agent1',
+      targetBranch: 'main',
+    });
+    enqueueMergeItem(db, {
+      sourceType: 'worktree',
+      sourceRef: 'agent2',
+      sourceWorktree: 'agent2',
+      targetBranch: 'main',
+    });
+
+    const queueRun = await runMergeQueue(db, repoDir, {
+      maxItems: 2,
+      targetBranch: 'main',
+    });
+    const queueItems = listMergeQueue(db);
+    const gateReport = await scanAllWorktrees(db, repoDir);
+    const aiGate = await runAiMergeGate(db, repoDir);
+
+    const result = {
+      repo_path: repoDir,
+      worktrees: listWorktrees(db).map((worktree) => ({
+        name: worktree.name,
+        path: worktree.path,
+        branch: worktree.branch,
+      })),
+      tasks: listTasks(db).map((task) => ({
+        id: task.id,
+        title: task.title,
+        status: task.status,
+      })),
+      overlap_demo: {
+        blocked_path: 'src/auth.js',
+        blocked_message: blockedClaimMessage,
+        safe_path: 'docs/auth-flow.md',
+        leases: [lease1.id, lease2.id],
+      },
+      queue: {
+        processed: queueRun.processed.map((entry) => ({
+          status: entry.status,
+          item_id: entry.item?.id || null,
+          source_ref: entry.item?.source_ref || null,
+        })),
+        final_items: queueItems.map((item) => ({
+          id: item.id,
+          status: item.status,
+          source_ref: item.source_ref,
+        })),
+      },
+      final_gate: {
+        ok: gateReport.conflicts.length === 0
+          && gateReport.fileConflicts.length === 0
+          && gateReport.unclaimedChanges.length === 0
+          && gateReport.complianceSummary.non_compliant === 0
+          && aiGate.status !== 'blocked',
+        ai_gate_status: aiGate.status,
+      },
+      next_steps: [
+        `cd ${repoDir}`,
+        'switchman status',
+        'switchman queue status',
+      ],
+    };
+
+    db.close();
+    if (cleanup) {
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+    return result;
+  } catch (err) {
+    if (cleanup) {
+      rmSync(repoDir, { recursive: true, force: true });
+    }
+    throw err;
   }
 }
 
@@ -779,12 +969,17 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
   }
 
   for (const invalidation of aiGate.dependency_invalidations || []) {
+    const retryCommand = invalidation.affected_pipeline_id
+      ? `switchman task retry-stale --pipeline ${invalidation.affected_pipeline_id}`
+      : `switchman task retry ${invalidation.affected_task_id}`;
     attention.push({
       kind: 'dependency_invalidation',
       title: invalidation.summary,
       detail: `${invalidation.source_worktree || 'unknown'} -> ${invalidation.affected_worktree || 'unknown'} (${invalidation.stale_area})`,
-      next_step: 'requeue the stale task so it can be revalidated before merge',
-      command: `switchman task retry ${invalidation.affected_task_id}`,
+      next_step: invalidation.affected_pipeline_id
+        ? 'retry the stale pipeline tasks so they can be revalidated before merge'
+        : 'requeue the stale task so it can be revalidated before merge',
+      command: retryCommand,
       severity: invalidation.severity === 'blocked' ? 'block' : 'warn',
     });
   }
@@ -1222,6 +1417,7 @@ program
 program.showHelpAfterError('(run with --help for usage examples)');
 program.addHelpText('after', `
 Start here:
+  switchman demo
   switchman setup --agents 5
   switchman status --watch
   switchman gate ci
@@ -1235,6 +1431,50 @@ Docs:
   README.md
   docs/setup-cursor.md
 `);
+
+program
+  .command('demo')
+  .description('Create a throwaway repo that proves overlapping claims are blocked and safe landing works')
+  .option('--path <dir>', 'Directory to create the demo repo in')
+  .option('--cleanup', 'Delete the demo repo after the run finishes')
+  .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Examples:
+  switchman demo
+  switchman demo --path /tmp/switchman-demo
+`)
+  .action(async (opts) => {
+    try {
+      const result = await runDemoScenario({
+        repoPath: opts.path || null,
+        cleanup: Boolean(opts.cleanup),
+      });
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Demo repo ready`);
+      console.log(`  ${chalk.dim('path:')} ${result.repo_path}`);
+      console.log(`  ${chalk.dim('proof:')} agent2 was blocked from ${chalk.cyan(result.overlap_demo.blocked_path)}`);
+      console.log(`  ${chalk.dim('safe reroute:')} agent2 claimed ${chalk.cyan(result.overlap_demo.safe_path)} instead`);
+      console.log(`  ${chalk.dim('landing:')} ${result.queue.processed.filter((entry) => entry.status === 'merged').length} queue item(s) merged safely`);
+      console.log(`  ${chalk.dim('final gate:')} ${result.final_gate.ok ? chalk.green('clean') : chalk.red('attention needed')}`);
+      console.log('');
+      console.log(chalk.bold('Try it yourself:'));
+      for (const step of result.next_steps) {
+        console.log(`  ${chalk.cyan(step)}`);
+      }
+      if (!opts.cleanup) {
+        console.log('');
+        console.log(chalk.dim('This demo repo stays on disk so you can inspect it or record it.'));
+      }
+    } catch (err) {
+      printErrorWithNext(err.message, 'switchman demo --json');
+      process.exitCode = 1;
+    }
+  });
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
@@ -1649,6 +1889,40 @@ taskCmd
     console.log(`${chalk.green('✓')} Reset ${chalk.cyan(task.id)} to pending`);
     console.log(`  ${chalk.dim('title:')} ${task.title}`);
     console.log(`${chalk.yellow('next:')} switchman task assign ${task.id} <workspace>`);
+  });
+
+taskCmd
+  .command('retry-stale')
+  .description('Return all currently stale tasks to pending so they can be revalidated together')
+  .option('--pipeline <id>', 'Only retry stale tasks for one pipeline')
+  .option('--reason <text>', 'Reason to record for the retry', 'bulk stale retry')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = retryStaleTasks(db, {
+      pipelineId: opts.pipeline || null,
+      reason: opts.reason,
+    });
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    if (result.retried.length === 0) {
+      const scope = result.pipeline_id ? ` for ${result.pipeline_id}` : '';
+      console.log(chalk.dim(`No stale tasks to retry${scope}.`));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Reset ${result.retried.length} stale task(s) to pending`);
+    if (result.pipeline_id) {
+      console.log(`  ${chalk.dim('pipeline:')} ${result.pipeline_id}`);
+    }
+    console.log(`  ${chalk.dim('tasks:')} ${result.retried.map((task) => task.id).join(', ')}`);
+    console.log(`${chalk.yellow('next:')} switchman status`);
   });
 
 taskCmd
@@ -2228,6 +2502,61 @@ explainCmd
     }
   });
 
+explainCmd
+  .command('landing <pipelineId>')
+  .description('Explain the current landing branch state for a pipeline')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const report = getPipelineLandingExplainReport(db, repoRoot, pipelineId);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold(`Landing status for ${report.pipeline_id}`));
+      console.log(`  ${chalk.dim('branch:')} ${report.landing.branch}`);
+      console.log(`  ${chalk.dim('strategy:')} ${report.landing.strategy}`);
+      if (report.landing.last_failure) {
+        console.log(`  ${chalk.red('failure:')} ${humanizeReasonCode(report.landing.last_failure.reason_code || 'landing_branch_materialization_failed')}`);
+        if (report.landing.last_failure.failed_branch) {
+          console.log(`  ${chalk.dim('failed branch:')} ${report.landing.last_failure.failed_branch}`);
+        }
+        if (report.landing.last_failure.conflicting_files?.length > 0) {
+          console.log(`  ${chalk.dim('conflicts:')} ${report.landing.last_failure.conflicting_files.join(', ')}`);
+        }
+        if (report.landing.last_failure.output) {
+          console.log(`  ${chalk.dim('details:')} ${report.landing.last_failure.output.split('\n')[0]}`);
+        }
+      } else if (report.landing.last_recovery?.recovery_path) {
+        console.log(`  ${chalk.dim('recovery path:')} ${report.landing.last_recovery.recovery_path}`);
+        if (report.landing.last_recovery.state?.status) {
+          console.log(`  ${chalk.dim('recovery state:')} ${report.landing.last_recovery.state.status}`);
+        }
+      } else if (report.landing.last_materialized?.head_commit) {
+        console.log(`  ${chalk.green('head:')} ${report.landing.last_materialized.head_commit.slice(0, 12)}`);
+      } else if (report.landing.stale_reasons.length > 0) {
+        for (const reason of report.landing.stale_reasons) {
+          console.log(`  ${chalk.red('why:')} ${reason.summary}`);
+        }
+      } else if (report.landing.last_materialized) {
+        console.log(`  ${chalk.green('state:')} landing branch is current`);
+      } else {
+        console.log(`  ${chalk.yellow('state:')} landing branch has not been materialized yet`);
+      }
+      console.log(`  ${chalk.yellow('next:')} ${report.next_action}`);
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, `switchman pipeline status ${pipelineId}`);
+      process.exitCode = 1;
+    }
+  });
+
 // ── pipeline ──────────────────────────────────────────────────────────────────
 
 const pipelineCmd = program.command('pipeline').description('Create and summarize issue-to-PR execution pipelines');
@@ -2362,12 +2691,25 @@ Examples:
       const landingLines = landing.synthetic
         ? [
           `${renderChip(landing.stale ? 'STALE' : 'LAND', landing.branch, landing.stale ? chalk.red : chalk.green)} ${chalk.dim(`base ${landing.base_branch}`)}`,
+          ...(landing.last_failure
+            ? [
+              `  ${chalk.red('failure:')} ${humanizeReasonCode(landing.last_failure.reason_code || 'landing_branch_materialization_failed')}`,
+              ...(landing.last_failure.failed_branch ? [`  ${chalk.dim('failed branch:')} ${landing.last_failure.failed_branch}`] : []),
+            ]
+            : []),
+          ...(landing.last_recovery?.state?.status
+            ? [
+              `  ${chalk.dim('recovery:')} ${landing.last_recovery.state.status} ${landing.last_recovery.recovery_path}`,
+            ]
+            : []),
           ...(landing.stale_reasons.length > 0
             ? landing.stale_reasons.slice(0, 3).map((reason) => `  ${chalk.red('why:')} ${reason.summary}`)
             : [landing.last_materialized
               ? `  ${chalk.green('state:')} ready to queue`
               : `  ${chalk.yellow('next:')} switchman pipeline land ${result.pipeline_id}`]),
-          (landing.stale
+          (landing.last_failure?.command
+            ? `  ${chalk.yellow('next:')} ${landing.last_failure.command}`
+            : landing.stale
             ? `  ${chalk.yellow('next:')} switchman pipeline land ${result.pipeline_id} --refresh`
             : `  ${chalk.yellow('next:')} switchman queue add --pipeline ${result.pipeline_id}`),
         ]
@@ -2376,6 +2718,7 @@ Examples:
       const commandLines = [
         `${chalk.cyan('$')} switchman pipeline exec ${result.pipeline_id} "/path/to/agent-command"`,
         `${chalk.cyan('$')} switchman pipeline pr ${result.pipeline_id}`,
+        ...(landing.last_failure?.command ? [`${chalk.cyan('$')} ${landing.last_failure.command}`] : []),
         ...(landing.synthetic && landing.stale ? [`${chalk.cyan('$')} switchman pipeline land ${result.pipeline_id} --refresh`] : []),
         ...(result.counts.failed > 0 ? [`${chalk.cyan('$')} switchman pipeline status ${result.pipeline_id}`] : []),
       ];
@@ -2426,6 +2769,9 @@ pipelineCmd
 pipelineCmd
   .command('bundle <pipelineId> [outputDir]')
   .description('Export a reviewer-ready PR bundle for a pipeline to disk')
+  .option('--github', 'Write GitHub Actions step summary/output when GITHUB_* env vars are present')
+  .option('--github-step-summary <path>', 'Path to write GitHub Actions step summary markdown')
+  .option('--github-output <path>', 'Path to write GitHub Actions outputs')
   .option('--json', 'Output raw JSON')
   .action(async (pipelineId, outputDir, opts) => {
     const repoRoot = getRepo();
@@ -2434,6 +2780,15 @@ pipelineCmd
     try {
       const result = await exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir || null);
       db.close();
+
+      const githubTargets = resolveGitHubOutputTargets(opts);
+      if (githubTargets.stepSummaryPath || githubTargets.outputPath) {
+        writeGitHubPipelineLandingStatus({
+          result: result.landing_summary,
+          stepSummaryPath: githubTargets.stepSummaryPath,
+          outputPath: githubTargets.outputPath,
+        });
+      }
 
       if (opts.json) {
         console.log(JSON.stringify(result, null, 2));
@@ -2445,6 +2800,8 @@ pipelineCmd
       console.log(`  ${chalk.dim('json:')} ${result.files.summary_json}`);
       console.log(`  ${chalk.dim('summary:')} ${result.files.summary_markdown}`);
       console.log(`  ${chalk.dim('body:')} ${result.files.pr_body_markdown}`);
+      console.log(`  ${chalk.dim('landing json:')} ${result.files.landing_summary_json}`);
+      console.log(`  ${chalk.dim('landing md:')} ${result.files.landing_summary_markdown}`);
     } catch (err) {
       db.close();
       console.error(chalk.red(err.message));
@@ -2458,12 +2815,84 @@ pipelineCmd
   .option('--base <branch>', 'Base branch for the landing branch', 'main')
   .option('--branch <branch>', 'Custom landing branch name')
   .option('--refresh', 'Rebuild the landing branch when a source branch or base branch has moved')
+  .option('--recover', 'Create a recovery worktree for an unresolved landing merge conflict')
+  .option('--replace-recovery', 'Replace an existing recovery worktree when creating a new one')
+  .option('--resume [path]', 'Validate a resolved recovery worktree and mark the landing branch ready again')
+  .option('--cleanup [path]', 'Remove a recorded recovery worktree after it is resolved or abandoned')
   .option('--json', 'Output raw JSON')
   .action((pipelineId, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
 
     try {
+      const selectedModes = [opts.refresh, opts.recover, Boolean(opts.resume), Boolean(opts.cleanup)].filter(Boolean).length;
+      if (selectedModes > 1) {
+        throw new Error('Choose only one of --refresh, --recover, --resume, or --cleanup.');
+      }
+      if (opts.recover) {
+        const result = preparePipelineLandingRecovery(db, repoRoot, pipelineId, {
+          baseBranch: opts.base,
+          landingBranch: opts.branch || null,
+          replaceExisting: Boolean(opts.replaceRecovery),
+        });
+        db.close();
+
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+
+        console.log(`${chalk.green('✓')} Recovery worktree ready for ${chalk.cyan(result.pipeline_id)}`);
+        console.log(`  ${chalk.dim('branch:')} ${chalk.cyan(result.branch)}`);
+        console.log(`  ${chalk.dim('path:')} ${result.recovery_path}`);
+        console.log(`  ${chalk.dim('blocked by:')} ${result.failed_branch}`);
+        if (result.conflicting_files.length > 0) {
+          console.log(`  ${chalk.dim('conflicts:')} ${result.conflicting_files.join(', ')}`);
+        }
+        console.log(`  ${chalk.yellow('inspect:')} ${result.inspect_command}`);
+        console.log(`  ${chalk.yellow('after resolving + commit:')} ${result.resume_command}`);
+        return;
+      }
+      if (opts.cleanup) {
+        const result = cleanupPipelineLandingRecovery(db, repoRoot, pipelineId, {
+          baseBranch: opts.base,
+          landingBranch: opts.branch || null,
+          recoveryPath: typeof opts.cleanup === 'string' ? opts.cleanup : null,
+        });
+        db.close();
+
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+
+        console.log(`${chalk.green('✓')} Recovery worktree cleared for ${chalk.cyan(result.pipeline_id)}`);
+        console.log(`  ${chalk.dim('path:')} ${result.recovery_path}`);
+        console.log(`  ${chalk.dim('removed:')} ${result.removed ? 'yes' : 'no'}`);
+        console.log(`  ${chalk.yellow('next:')} switchman explain landing ${result.pipeline_id}`);
+        return;
+      }
+      if (opts.resume) {
+        const result = resumePipelineLandingRecovery(db, repoRoot, pipelineId, {
+          baseBranch: opts.base,
+          landingBranch: opts.branch || null,
+          recoveryPath: typeof opts.resume === 'string' ? opts.resume : null,
+        });
+        db.close();
+
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+
+        console.log(`${chalk.green('✓')} Landing recovery resumed for ${chalk.cyan(result.pipeline_id)}`);
+        console.log(`  ${chalk.dim('branch:')} ${chalk.cyan(result.branch)}`);
+        console.log(`  ${chalk.dim('head:')} ${result.head_commit}`);
+        console.log(`  ${chalk.dim('recovery path:')} ${result.recovery_path}`);
+        console.log(`  ${chalk.yellow('next:')} ${result.resume_command}`);
+        return;
+      }
+
       const result = materializePipelineLandingBranch(db, repoRoot, pipelineId, {
         baseBranch: opts.base,
         landingBranch: opts.branch || null,
@@ -2527,6 +2956,49 @@ pipelineCmd
       console.log(`  ${chalk.dim('head:')} ${result.head_branch}`);
       if (result.output) {
         console.log(`  ${chalk.dim(result.output)}`);
+      }
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('comment <pipelineId> [outputDir]')
+  .description('Post or update a GitHub PR comment with the pipeline landing summary')
+  .option('--pr <number>', 'Pull request number to comment on')
+  .option('--pr-from-env', 'Read the pull request number from GitHub Actions environment variables')
+  .option('--gh-command <command>', 'Executable to use for GitHub CLI', 'gh')
+  .option('--update-existing', 'Edit the last comment from this user instead of creating a new one')
+  .option('--json', 'Output raw JSON')
+  .action(async (pipelineId, outputDir, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const prNumber = opts.pr || (opts.prFromEnv ? resolvePrNumberFromEnv() : null);
+
+    try {
+      if (!prNumber) {
+        throw new Error('A pull request number is required. Pass `--pr <number>` or `--pr-from-env`.');
+      }
+      const result = await commentPipelinePr(db, repoRoot, pipelineId, {
+        prNumber,
+        ghCommand: opts.ghCommand,
+        outputDir: outputDir || null,
+        updateExisting: Boolean(opts.updateExisting),
+      });
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Posted pipeline comment for ${chalk.cyan(result.pipeline_id)}`);
+      console.log(`  ${chalk.dim('pr:')} #${result.pr_number}`);
+      console.log(`  ${chalk.dim('body:')} ${result.bundle.files.landing_summary_markdown}`);
+      if (result.updated_existing) {
+        console.log(`  ${chalk.dim('mode:')} update existing comment`);
       }
     } catch (err) {
       db.close();

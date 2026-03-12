@@ -1,13 +1,14 @@
 import { spawn, spawnSync } from 'child_process';
-import { mkdirSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { basename, join } from 'path';
 
-import { completeLeaseTask, createTask, failLeaseTask, getTaskSpec, listAuditEvents, listLeases, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease, upsertTaskSpec } from './db.js';
+import { completeLeaseTask, createTask, failLeaseTask, getTaskSpec, listAuditEvents, listLeases, listMergeQueue, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease, upsertTaskSpec } from './db.js';
 import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
 import { buildTaskSpec, planPipelineTasks } from './planner.js';
-import { getWorktreeBranch, gitBranchExists, gitMaterializeIntegrationBranch, gitRevParse } from './git.js';
+import { getWorktreeBranch, gitBranchExists, gitMaterializeIntegrationBranch, gitPrepareIntegrationRecoveryWorktree, gitRemoveWorktree, gitRevParse, listGitWorktrees } from './git.js';
 
 function sleepSync(ms) {
   if (ms > 0) {
@@ -752,18 +753,140 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   };
 }
 
+export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
+  const status = getPipelineStatus(db, pipelineId);
+  let landing;
+  let landingError = null;
+  try {
+    landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+      requireCompleted: false,
+    });
+  } catch (err) {
+    landingError = String(err.message || 'Landing branch is not ready yet.');
+    landing = {
+      branch: null,
+      strategy: 'unavailable',
+      synthetic: false,
+      component_branches: [],
+      stale: false,
+      last_failure: null,
+    };
+  }
+  const readyToQueue = status.counts.failed === 0
+    && status.counts.pending === 0
+    && status.counts.in_progress === 0
+    && status.counts.done > 0
+    && !landingError
+    && !landing.stale
+    && !landing.last_failure;
+  const nextAction = landingError
+    ? `switchman pipeline status ${pipelineId}`
+    : landing.last_failure?.command
+      || (landing.stale
+        ? `switchman pipeline land ${pipelineId} --refresh`
+        : `switchman queue add --pipeline ${pipelineId}`);
+  const queueItems = listMergeQueue(db)
+    .filter((item) => item.source_pipeline_id === pipelineId)
+    .sort((a, b) => Number.parseInt(b.id.slice(1), 10) - Number.parseInt(a.id.slice(1), 10));
+  const currentQueueItem = queueItems[0] || null;
+  const queueState = {
+    status: currentQueueItem?.status || 'not_queued',
+    item_id: currentQueueItem?.id || null,
+    target_branch: currentQueueItem?.target_branch || 'main',
+    merged_commit: currentQueueItem?.merged_commit || null,
+    next_action: currentQueueItem?.next_action || (currentQueueItem
+      ? null
+      : (readyToQueue ? `switchman queue add --pipeline ${pipelineId}` : nextAction)),
+    last_error_code: currentQueueItem?.last_error_code || null,
+    last_error_summary: currentQueueItem?.last_error_summary || null,
+  };
+  const recoveryState = landing.last_recovery
+    ? {
+      status: landing.last_recovery.state?.status || 'prepared',
+      recovery_path: landing.last_recovery.recovery_path || null,
+      inspect_command: landing.last_recovery.inspect_command || null,
+      resume_command: landing.last_recovery.resume_command || null,
+    }
+    : null;
+
+  const markdown = [
+    `# Pipeline Landing Summary: ${status.title}`,
+    '',
+    `- Pipeline: \`${pipelineId}\``,
+    `- Ready to queue: ${readyToQueue ? 'yes' : 'no'}`,
+    `- Landing branch: ${landing.branch ? `\`${landing.branch}\`` : 'not resolved yet'}`,
+    `- Strategy: ${landing.strategy}`,
+    `- Synthetic: ${landing.synthetic ? 'yes' : 'no'}`,
+    '',
+    '## Component Branches',
+    ...(landing.component_branches.length > 0
+      ? landing.component_branches.map((branch) => `- ${branch}`)
+      : ['- None inferred yet']),
+    '',
+    '## Landing State',
+    ...(landingError
+      ? [`- ${landingError}`]
+      : landing.last_failure
+      ? [
+        `- Failure: ${landing.last_failure.reason_code || 'landing_branch_materialization_failed'}`,
+        ...(landing.last_failure.failed_branch ? [`- Failed branch: ${landing.last_failure.failed_branch}`] : []),
+        ...(landing.last_failure.conflicting_files?.length ? [`- Conflicts: ${landing.last_failure.conflicting_files.join(', ')}`] : []),
+      ]
+      : landing.stale
+        ? landing.stale_reasons.map((reason) => `- Stale: ${reason.summary}`)
+        : ['- Current and ready for queueing']),
+    '',
+    '## Recovery State',
+    ...(recoveryState
+      ? [
+        `- Status: ${recoveryState.status}`,
+        ...(recoveryState.recovery_path ? [`- Path: ${recoveryState.recovery_path}`] : []),
+        ...(recoveryState.resume_command ? [`- Resume: ${recoveryState.resume_command}`] : []),
+      ]
+      : ['- No active recovery worktree']),
+    '',
+    '## Queue State',
+    `- Status: ${queueState.status}`,
+    ...(queueState.item_id ? [`- Item: ${queueState.item_id}`] : []),
+    `- Target branch: ${queueState.target_branch}`,
+    ...(queueState.merged_commit ? [`- Merged commit: ${queueState.merged_commit}`] : []),
+    ...(queueState.last_error_summary ? [`- Queue error: ${queueState.last_error_summary}`] : []),
+    '',
+    `## Next Action`,
+    `- ${queueState.next_action || nextAction}`,
+  ].join('\n');
+
+  return {
+    pipeline_id: pipelineId,
+    title: status.title,
+    ready_to_queue: readyToQueue,
+    counts: status.counts,
+    landing,
+    recovery_state: recoveryState,
+    queue_state: queueState,
+    landing_error: landingError,
+    next_action: queueState.next_action || nextAction,
+    markdown,
+  };
+}
+
 export async function exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir = null) {
   const summary = await buildPipelinePrSummary(db, repoRoot, pipelineId);
+  const landingSummary = buildPipelineLandingSummary(db, repoRoot, pipelineId);
   const bundleDir = outputDir || join(repoRoot, '.switchman', 'pipelines', pipelineId);
   mkdirSync(bundleDir, { recursive: true });
 
   const summaryJsonPath = join(bundleDir, 'pr-summary.json');
   const summaryMarkdownPath = join(bundleDir, 'pr-summary.md');
   const prBodyPath = join(bundleDir, 'pr-body.md');
+  const landingSummaryJsonPath = join(bundleDir, 'pipeline-landing-summary.json');
+  const landingSummaryMarkdownPath = join(bundleDir, 'pipeline-landing-summary.md');
 
   writeFileSync(summaryJsonPath, `${JSON.stringify(summary, null, 2)}\n`);
   writeFileSync(summaryMarkdownPath, `${summary.markdown}\n`);
   writeFileSync(prBodyPath, `${summary.pr_artifact.body}\n`);
+  writeFileSync(landingSummaryJsonPath, `${JSON.stringify(landingSummary, null, 2)}\n`);
+  writeFileSync(landingSummaryMarkdownPath, `${landingSummary.markdown}\n`);
 
   logAuditEvent(db, {
     eventType: 'pipeline_pr_bundle_exported',
@@ -772,7 +895,7 @@ export async function exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir
     details: JSON.stringify({
       pipeline_id: pipelineId,
       output_dir: bundleDir,
-      files: [summaryJsonPath, summaryMarkdownPath, prBodyPath],
+      files: [summaryJsonPath, summaryMarkdownPath, prBodyPath, landingSummaryJsonPath, landingSummaryMarkdownPath],
     }),
   });
 
@@ -783,8 +906,11 @@ export async function exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir
       summary_json: summaryJsonPath,
       summary_markdown: summaryMarkdownPath,
       pr_body_markdown: prBodyPath,
+      landing_summary_json: landingSummaryJsonPath,
+      landing_summary_markdown: landingSummaryMarkdownPath,
     },
     summary,
+    landing_summary: landingSummary,
   };
 }
 
@@ -838,6 +964,7 @@ function getPipelineLandingBranchName(pipelineId, landingBranch = null) {
 function listPipelineLandingEvents(db, pipelineId, branch) {
   return listAuditEvents(db, {
     eventType: 'pipeline_landing_branch_materialized',
+    status: 'allowed',
     limit: 500,
   }).flatMap((event) => {
     try {
@@ -854,6 +981,114 @@ function listPipelineLandingEvents(db, pipelineId, branch) {
       return [];
     }
   });
+}
+
+function getLatestLandingResolvedEvent(db, pipelineId, branch) {
+  return listAuditEvents(db, {
+    eventType: 'pipeline_landing_recovery_resumed',
+    status: 'allowed',
+    limit: 200,
+  }).flatMap((event) => {
+    try {
+      const details = JSON.parse(event.details || '{}');
+      if (details.pipeline_id !== pipelineId || details.branch !== branch) {
+        return [];
+      }
+      return [{
+        audit_id: event.id,
+        created_at: event.created_at,
+        ...details,
+      }];
+    } catch {
+      return [];
+    }
+  })[0] || null;
+}
+
+function getLatestLandingRecoveryPrepared(db, pipelineId, branch) {
+  return listAuditEvents(db, {
+    eventType: 'pipeline_landing_recovery_prepared',
+    status: 'allowed',
+    limit: 200,
+  }).flatMap((event) => {
+    try {
+      const details = JSON.parse(event.details || '{}');
+      if (details.pipeline_id !== pipelineId || details.branch !== branch) {
+        return [];
+      }
+      return [{
+        audit_id: event.id,
+        created_at: event.created_at,
+        ...details,
+      }];
+    } catch {
+      return [];
+    }
+  })[0] || null;
+}
+
+function getLatestLandingRecoveryCleared(db, pipelineId, branch) {
+  return listAuditEvents(db, {
+    eventType: 'pipeline_landing_recovery_cleared',
+    status: 'allowed',
+    limit: 200,
+  }).flatMap((event) => {
+    try {
+      const details = JSON.parse(event.details || '{}');
+      if (details.pipeline_id !== pipelineId || details.branch !== branch) {
+        return [];
+      }
+      return [{
+        audit_id: event.id,
+        created_at: event.created_at,
+        ...details,
+      }];
+    } catch {
+      return [];
+    }
+  })[0] || null;
+}
+
+function buildRecoveryState(repoRoot, recoveryRecord, latestResolved) {
+  if (!recoveryRecord) return null;
+  const recoveryPath = recoveryRecord.recovery_path || null;
+  const pathExists = recoveryPath ? existsSync(recoveryPath) : false;
+  const normalizedRecoveryPath = recoveryPath
+    ? (pathExists ? realpathSync(recoveryPath) : recoveryPath)
+    : null;
+  const tracked = recoveryPath
+    ? listGitWorktrees(repoRoot).some((worktree) => worktree.path === recoveryPath || worktree.path === normalizedRecoveryPath)
+    : false;
+  const resolved = Boolean(latestResolved && latestResolved.audit_id > recoveryRecord.audit_id);
+  return {
+    path: recoveryPath,
+    exists: pathExists,
+    tracked,
+    status: resolved ? (pathExists ? 'resolved' : 'resolved_missing') : (pathExists ? 'active' : 'missing'),
+  };
+}
+
+function getLatestLandingFailure(db, pipelineId, branch) {
+  return listAuditEvents(db, {
+    eventType: 'pipeline_landing_branch_materialized',
+    status: 'denied',
+    limit: 200,
+  }).flatMap((event) => {
+    try {
+      const details = JSON.parse(event.details || '{}');
+      if (details.pipeline_id !== pipelineId || details.branch !== branch) {
+        return [];
+      }
+      return [{
+        audit_id: event.id,
+        created_at: event.created_at,
+        reason_code: event.reason_code || null,
+        ...details,
+      }];
+    } catch {
+      return [];
+    }
+  })[0] || null;
 }
 
 function collectBranchHeadCommits(repoRoot, branches) {
@@ -908,7 +1143,22 @@ export function getPipelineLandingBranchStatus(
   const branchHeadCommit = branchExists ? gitRevParse(repoRoot, resolvedLandingBranch) : null;
   const baseCommit = gitRevParse(repoRoot, baseBranch);
   const componentCommits = collectBranchHeadCommits(repoRoot, prioritizedBranches);
-  const latestEvent = listPipelineLandingEvents(db, pipelineId, resolvedLandingBranch)[0] || null;
+  const latestMaterialized = listPipelineLandingEvents(db, pipelineId, resolvedLandingBranch)[0] || null;
+  const latestResolved = getLatestLandingResolvedEvent(db, pipelineId, resolvedLandingBranch);
+  const latestRecoveryPreparedCandidate = getLatestLandingRecoveryPrepared(db, pipelineId, resolvedLandingBranch);
+  const latestRecoveryCleared = getLatestLandingRecoveryCleared(db, pipelineId, resolvedLandingBranch);
+  const latestRecoveryPrepared = latestRecoveryPreparedCandidate
+    && (!latestRecoveryCleared || latestRecoveryPreparedCandidate.audit_id > latestRecoveryCleared.audit_id)
+    ? latestRecoveryPreparedCandidate
+    : null;
+  const recoveryState = buildRecoveryState(repoRoot, latestRecoveryPrepared, latestResolved);
+  const latestEvent = latestResolved && (!latestMaterialized || latestResolved.audit_id > latestMaterialized.audit_id)
+    ? latestResolved
+    : latestMaterialized;
+  const latestFailureCandidate = getLatestLandingFailure(db, pipelineId, resolvedLandingBranch);
+  const latestFailure = latestFailureCandidate && (!latestEvent || latestFailureCandidate.audit_id > latestEvent.audit_id)
+    ? latestFailureCandidate
+    : null;
   const staleReasons = [];
 
   if (!latestEvent) {
@@ -978,6 +1228,26 @@ export function getPipelineLandingBranchStatus(
     strategy: 'synthetic_integration_branch',
     stale: staleReasons.some((reason) => reason.code !== 'not_materialized'),
     stale_reasons: staleReasons.filter((reason) => reason.code !== 'not_materialized'),
+    last_failure: latestFailure ? {
+      audit_id: latestFailure.audit_id,
+      created_at: latestFailure.created_at,
+      reason_code: latestFailure.reason_code || null,
+      failed_branch: latestFailure.failed_branch || null,
+      conflicting_files: Array.isArray(latestFailure.conflicting_files) ? latestFailure.conflicting_files : [],
+      output: latestFailure.output || null,
+      command: latestFailure.command || null,
+      next_action: latestFailure.next_action || null,
+    } : null,
+    last_recovery: latestRecoveryPrepared ? {
+      audit_id: latestRecoveryPrepared.audit_id,
+      created_at: latestRecoveryPrepared.created_at,
+      recovery_path: latestRecoveryPrepared.recovery_path || null,
+      failed_branch: latestRecoveryPrepared.failed_branch || null,
+      conflicting_files: Array.isArray(latestRecoveryPrepared.conflicting_files) ? latestRecoveryPrepared.conflicting_files : [],
+      inspect_command: latestRecoveryPrepared.inspect_command || null,
+      resume_command: latestRecoveryPrepared.resume_command || null,
+      state: recoveryState,
+    } : null,
     last_materialized: latestEvent ? {
       audit_id: latestEvent.audit_id,
       created_at: latestEvent.created_at,
@@ -1070,7 +1340,7 @@ export function materializePipelineLandingBranch(
     };
   }
 
-  if (landingStatus.last_materialized && !landingStatus.stale && !refresh) {
+  if (landingStatus.last_materialized && !landingStatus.stale) {
     return {
       pipeline_id: pipelineId,
       branch: landingStatus.branch,
@@ -1095,11 +1365,44 @@ export function materializePipelineLandingBranch(
   }
 
   const resolvedLandingBranch = getPipelineLandingBranchName(pipelineId, landingBranch);
-  const materialized = gitMaterializeIntegrationBranch(repoRoot, {
-    branch: resolvedLandingBranch,
-    baseBranch,
-    mergeBranches: prioritizedBranches,
-  });
+  let materialized;
+  try {
+    materialized = gitMaterializeIntegrationBranch(repoRoot, {
+      branch: resolvedLandingBranch,
+      baseBranch,
+      mergeBranches: prioritizedBranches,
+    });
+  } catch (err) {
+    const reasonCode = err?.code || 'landing_branch_materialization_failed';
+    const nextAction = reasonCode === 'landing_branch_merge_conflict'
+      ? `open a recovery worktree with switchman pipeline land ${pipelineId} --recover`
+      : reasonCode === 'landing_branch_missing_component'
+        ? `restore the missing branch and rerun switchman pipeline land ${pipelineId} --refresh`
+        : reasonCode === 'landing_branch_missing_base'
+          ? `restore ${baseBranch} and rerun switchman pipeline land ${pipelineId} --refresh`
+          : `inspect the landing failure and rerun switchman pipeline land ${pipelineId} --refresh`;
+    logAuditEvent(db, {
+      eventType: 'pipeline_landing_branch_materialized',
+      status: 'denied',
+      reasonCode,
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        branch: resolvedLandingBranch,
+        base_branch: baseBranch,
+        component_branches: prioritizedBranches,
+        failed_branch: err?.details?.failed_branch || null,
+        conflicting_files: err?.details?.conflicting_files || [],
+        output: err?.details?.output || String(err.message || '').slice(0, 1000),
+        command: reasonCode === 'landing_branch_merge_conflict'
+          ? `switchman pipeline land ${pipelineId} --recover`
+          : `switchman pipeline land ${pipelineId} --refresh`,
+        next_action: nextAction,
+      }),
+    });
+    const wrapped = new Error(`${String(err.message || 'Landing branch materialization failed.')}\nnext: switchman explain landing ${pipelineId}`);
+    wrapped.code = reasonCode;
+    throw wrapped;
+  }
   const baseCommit = gitRevParse(repoRoot, baseBranch);
   const componentCommits = collectBranchHeadCommits(repoRoot, prioritizedBranches);
 
@@ -1137,6 +1440,235 @@ export function materializePipelineLandingBranch(
       component_branches: prioritizedBranches,
       component_commits: componentCommits,
     },
+  };
+}
+
+export function getPipelineLandingExplainReport(
+  db,
+  repoRoot,
+  pipelineId,
+  options = {},
+) {
+  const landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+    requireCompleted: false,
+    ...options,
+  });
+  const nextAction = landing.last_failure?.next_action
+    || (landing.stale
+      ? `switchman pipeline land ${pipelineId} --refresh`
+      : landing.synthetic
+        ? `switchman queue add --pipeline ${pipelineId}`
+        : `switchman queue add ${landing.branch}`);
+  return {
+    pipeline_id: pipelineId,
+    landing,
+    next_action: nextAction,
+  };
+}
+
+export function preparePipelineLandingRecovery(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    baseBranch = 'main',
+    landingBranch = null,
+    recoveryPath = null,
+    replaceExisting = false,
+  } = {},
+) {
+  const landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+    baseBranch,
+    landingBranch,
+    requireCompleted: true,
+  });
+  if (!landing.synthetic) {
+    throw new Error(`Pipeline ${pipelineId} does not need a synthetic landing recovery worktree.`);
+  }
+  if (landing.last_failure?.reason_code !== 'landing_branch_merge_conflict') {
+    throw new Error(`Pipeline ${pipelineId} does not have a merge-conflict landing failure to recover.`);
+  }
+  if (landing.last_recovery?.state?.status && !replaceExisting) {
+    throw new Error(`Recovery worktree already exists for ${pipelineId} at ${landing.last_recovery.recovery_path}. Reuse it or rerun with \`switchman pipeline land ${pipelineId} --recover --replace-recovery\`.`);
+  }
+  if (landing.last_recovery?.state?.path && replaceExisting) {
+    cleanupPipelineLandingRecovery(db, repoRoot, pipelineId, {
+      baseBranch,
+      landingBranch,
+      recoveryPath: landing.last_recovery.state.path,
+      reason: 'replaced',
+    });
+  }
+
+  const resolvedRecoveryPath = recoveryPath || join(
+    tmpdir(),
+    `${basename(repoRoot)}-landing-recover-${pipelineId}-${Date.now()}`,
+  );
+  const prepared = gitPrepareIntegrationRecoveryWorktree(repoRoot, {
+    branch: landing.branch,
+    baseBranch,
+    mergeBranches: landing.component_branches,
+    recoveryPath: resolvedRecoveryPath,
+  });
+  if (prepared.ok) {
+    throw new Error(`Pipeline ${pipelineId} no longer has an unresolved landing merge conflict to recover.`);
+  }
+
+  const inspectCommand = `git -C ${JSON.stringify(prepared.recovery_path)} status`;
+  const resumeCommand = `switchman queue add --pipeline ${pipelineId}`;
+
+  logAuditEvent(db, {
+    eventType: 'pipeline_landing_recovery_prepared',
+    status: 'allowed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      base_branch: baseBranch,
+      recovery_path: prepared.recovery_path,
+      failed_branch: prepared.failed_branch,
+      conflicting_files: prepared.conflicting_files,
+      inspect_command: inspectCommand,
+      resume_command: resumeCommand,
+    }),
+  });
+
+  return {
+    pipeline_id: pipelineId,
+    branch: landing.branch,
+    base_branch: baseBranch,
+    recovery_path: prepared.recovery_path,
+    failed_branch: prepared.failed_branch,
+    conflicting_files: prepared.conflicting_files,
+    inspect_command: inspectCommand,
+    resume_command: resumeCommand,
+  };
+}
+
+export function resumePipelineLandingRecovery(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    baseBranch = 'main',
+    landingBranch = null,
+    recoveryPath = null,
+  } = {},
+) {
+  const landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+    baseBranch,
+    landingBranch,
+    requireCompleted: true,
+  });
+  if (!landing.synthetic) {
+    throw new Error(`Pipeline ${pipelineId} does not need a synthetic landing recovery worktree.`);
+  }
+
+  const resolvedRecoveryPath = recoveryPath || landing.last_recovery?.recovery_path || null;
+  if (!resolvedRecoveryPath) {
+    throw new Error(`No recovery worktree is recorded for ${pipelineId}. Run \`switchman pipeline land ${pipelineId} --recover\` first.`);
+  }
+
+  const currentBranch = getWorktreeBranch(resolvedRecoveryPath);
+  if (currentBranch !== landing.branch) {
+    throw new Error(`Recovery worktree must be on ${landing.branch}, but is on ${currentBranch || 'no branch'}.`);
+  }
+
+  const statusResult = spawnSync('git', ['status', '--porcelain'], {
+    cwd: resolvedRecoveryPath,
+    encoding: 'utf8',
+  });
+  if (statusResult.status !== 0) {
+    throw new Error(`Could not inspect recovery worktree ${resolvedRecoveryPath}.`);
+  }
+  const pendingChanges = String(statusResult.stdout || '').trim();
+  if (pendingChanges) {
+    throw new Error(`Recovery worktree ${resolvedRecoveryPath} still has unresolved or uncommitted changes. Commit the resolved landing branch first.`);
+  }
+
+  const recoveredHead = gitRevParse(resolvedRecoveryPath, 'HEAD');
+  const branchHead = gitRevParse(repoRoot, landing.branch);
+  if (!recoveredHead || !branchHead || recoveredHead !== branchHead) {
+    throw new Error(`Recovery worktree ${resolvedRecoveryPath} is not aligned with ${landing.branch}. Push or commit the resolved landing branch there first.`);
+  }
+
+  const componentCommits = collectBranchHeadCommits(repoRoot, landing.component_branches);
+  logAuditEvent(db, {
+    eventType: 'pipeline_landing_recovery_resumed',
+    status: 'allowed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      base_branch: baseBranch,
+      base_commit: gitRevParse(repoRoot, baseBranch),
+      head_commit: branchHead,
+      component_branches: landing.component_branches,
+      component_commits: componentCommits,
+      recovery_path: resolvedRecoveryPath,
+      resume_command: `switchman queue add --pipeline ${pipelineId}`,
+    }),
+  });
+
+  return {
+    pipeline_id: pipelineId,
+    branch: landing.branch,
+    base_branch: baseBranch,
+    recovery_path: resolvedRecoveryPath,
+    head_commit: branchHead,
+    resume_command: `switchman queue add --pipeline ${pipelineId}`,
+  };
+}
+
+export function cleanupPipelineLandingRecovery(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    baseBranch = 'main',
+    landingBranch = null,
+    recoveryPath = null,
+    reason = 'manual_cleanup',
+  } = {},
+) {
+  const landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+    baseBranch,
+    landingBranch,
+    requireCompleted: true,
+  });
+  const targetPath = recoveryPath || landing.last_recovery?.recovery_path || null;
+  if (!targetPath) {
+    throw new Error(`No recovery worktree is recorded for ${pipelineId}.`);
+  }
+
+  const exists = existsSync(targetPath);
+  const normalizedTargetPath = exists ? realpathSync(targetPath) : targetPath;
+  const tracked = listGitWorktrees(repoRoot).some((worktree) =>
+    worktree.path === targetPath || worktree.path === normalizedTargetPath,
+  );
+  if (tracked && exists) {
+    gitRemoveWorktree(repoRoot, targetPath);
+  }
+
+  logAuditEvent(db, {
+    eventType: 'pipeline_landing_recovery_cleared',
+    status: 'allowed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      recovery_path: targetPath,
+      existed: exists,
+      tracked,
+      reason,
+    }),
+  });
+
+  return {
+    pipeline_id: pipelineId,
+    branch: landing.branch,
+    recovery_path: targetPath,
+    existed: exists,
+    tracked,
+    removed: tracked && exists,
+    reason,
   };
 }
 
@@ -1264,6 +1796,70 @@ export async function publishPipelinePr(
     draft,
     bundle,
     output,
+  };
+}
+
+export async function commentPipelinePr(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    prNumber,
+    ghCommand = 'gh',
+    outputDir = null,
+    updateExisting = false,
+  } = {},
+) {
+  if (!prNumber) {
+    throw new Error('A pull request number is required.');
+  }
+
+  const bundle = await exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir);
+  const args = [
+    'pr',
+    'comment',
+    String(prNumber),
+    '--body-file',
+    bundle.files.landing_summary_markdown,
+  ];
+
+  if (updateExisting) {
+    args.push('--edit-last', '--create-if-none');
+  }
+
+  const result = spawnSync(ghCommand, args, {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+
+  const ok = !result.error && result.status === 0;
+  const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+
+  logAuditEvent(db, {
+    eventType: 'pipeline_pr_commented',
+    status: ok ? 'allowed' : 'denied',
+    reasonCode: ok ? null : 'pr_comment_failed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      pr_number: String(prNumber),
+      gh_command: ghCommand,
+      update_existing: updateExisting,
+      body_file: bundle.files.landing_summary_markdown,
+      exit_code: result.status,
+      output: output.slice(0, 500),
+    }),
+  });
+
+  if (!ok) {
+    throw new Error(result.error?.message || output || `gh pr comment failed with status ${result.status}`);
+  }
+
+  return {
+    pipeline_id: pipelineId,
+    pr_number: String(prNumber),
+    bundle,
+    output,
+    updated_existing: updateExisting,
   };
 }
 
