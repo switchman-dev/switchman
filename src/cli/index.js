@@ -41,11 +41,11 @@ import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcp
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
-import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, resumePipelineLandingRecovery, runPipeline, startPipeline } from '../core/pipeline.js';
+import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, evaluatePipelinePolicyGate, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, resumePipelineLandingRecovery, runPipeline, startPipeline, summarizePipelinePolicyState, syncPipelinePr } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus, writeGitHubPipelineLandingStatus } from '../core/ci.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, resolveQueueSource, runMergeQueue } from '../core/queue.js';
-import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../core/policy.js';
+import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, getChangePolicyPath, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../core/policy.js';
 import {
   captureTelemetryEvent,
   disableTelemetry,
@@ -537,6 +537,97 @@ function buildStaleTaskExplainReport(db, taskId) {
   };
 }
 
+function normalizeDependencyInvalidation(item) {
+  const details = item.details || {};
+  return {
+    ...item,
+    details,
+    stale_area: item.reason_type === 'subsystem_overlap'
+      ? `subsystem:${item.subsystem_tag}`
+      : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
+    summary: `${details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
+  };
+}
+
+function buildStaleClusters(invalidations = []) {
+  const clusters = new Map();
+  for (const invalidation of invalidations.map(normalizeDependencyInvalidation)) {
+    const clusterKey = invalidation.affected_pipeline_id
+      ? `pipeline:${invalidation.affected_pipeline_id}`
+      : `task:${invalidation.affected_task_id}`;
+    if (!clusters.has(clusterKey)) {
+      clusters.set(clusterKey, {
+        key: clusterKey,
+        affected_pipeline_id: invalidation.affected_pipeline_id || null,
+        affected_task_ids: new Set(),
+        source_task_ids: new Set(),
+        source_task_titles: new Set(),
+        source_worktrees: new Set(),
+        affected_worktrees: new Set(),
+        stale_areas: new Set(),
+        invalidations: [],
+        severity: 'warn',
+      });
+    }
+    const cluster = clusters.get(clusterKey);
+    cluster.invalidations.push(invalidation);
+    cluster.affected_task_ids.add(invalidation.affected_task_id);
+    if (invalidation.source_task_id) cluster.source_task_ids.add(invalidation.source_task_id);
+    if (invalidation.details?.source_task_title) cluster.source_task_titles.add(invalidation.details.source_task_title);
+    if (invalidation.source_worktree) cluster.source_worktrees.add(invalidation.source_worktree);
+    if (invalidation.affected_worktree) cluster.affected_worktrees.add(invalidation.affected_worktree);
+    cluster.stale_areas.add(invalidation.stale_area);
+    if (invalidation.severity === 'blocked') cluster.severity = 'block';
+  }
+
+  return [...clusters.values()]
+    .map((cluster) => {
+      const affectedTaskIds = [...cluster.affected_task_ids];
+      const sourceTaskTitles = [...cluster.source_task_titles];
+      const staleAreas = [...cluster.stale_areas];
+      const sourceWorktrees = [...cluster.source_worktrees];
+      const affectedWorktrees = [...cluster.affected_worktrees];
+      return {
+        key: cluster.key,
+        affected_pipeline_id: cluster.affected_pipeline_id,
+        affected_task_ids: affectedTaskIds,
+        invalidation_count: cluster.invalidations.length,
+        source_task_ids: [...cluster.source_task_ids],
+        source_task_titles: sourceTaskTitles,
+        source_worktrees: sourceWorktrees,
+        affected_worktrees: affectedWorktrees,
+        stale_areas: staleAreas,
+        severity: cluster.severity,
+        invalidations: cluster.invalidations,
+        title: cluster.affected_pipeline_id
+          ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale dependency invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
+          : `${affectedTaskIds[0]} has ${cluster.invalidations.length} stale dependency invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
+        detail: `${sourceTaskTitles[0] || cluster.invalidations[0]?.source_task_id || 'unknown source'} -> ${affectedWorktrees.join(', ') || 'unknown target'} (${staleAreas.join(', ')})`,
+        next_step: cluster.affected_pipeline_id
+          ? 'retry the stale pipeline tasks together so the whole cluster can be revalidated before merge'
+          : 'retry the stale task so it can be revalidated before merge',
+        command: cluster.affected_pipeline_id
+          ? `switchman task retry-stale --pipeline ${cluster.affected_pipeline_id}`
+          : `switchman task retry ${affectedTaskIds[0]}`,
+      };
+    })
+    .sort((a, b) => b.invalidation_count - a.invalidation_count || String(a.affected_pipeline_id || a.affected_task_ids[0]).localeCompare(String(b.affected_pipeline_id || b.affected_task_ids[0])));
+}
+
+function buildStalePipelineExplainReport(db, pipelineId) {
+  const invalidations = listDependencyInvalidations(db, { pipelineId });
+  const staleClusters = buildStaleClusters(invalidations)
+    .filter((cluster) => cluster.affected_pipeline_id === pipelineId);
+  return {
+    pipeline_id: pipelineId,
+    invalidations: invalidations.map(normalizeDependencyInvalidation),
+    stale_clusters: staleClusters,
+    next_action: staleClusters.length > 0
+      ? `switchman task retry-stale --pipeline ${pipelineId}`
+      : null,
+  };
+}
+
 function buildLandingStateLabel(landing) {
   if (!landing) return null;
   if (!landing.synthetic) {
@@ -832,6 +923,7 @@ function commandForFailedTask(task, failure) {
 }
 
 function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, scanReport, aiGate }) {
+  const changePolicy = loadChangePolicy(repoRoot);
   const failedTasks = tasks
     .filter((task) => task.status === 'failed')
     .map((task) => {
@@ -881,6 +973,7 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     next_step: 'review the overlapping branches before merge',
   }));
 
+  const staleClusters = buildStaleClusters(aiGate.dependency_invalidations || []);
   const attention = [
     ...staleLeases.map((lease) => ({
       kind: 'stale_lease',
@@ -968,19 +1061,17 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     });
   }
 
-  for (const invalidation of aiGate.dependency_invalidations || []) {
-    const retryCommand = invalidation.affected_pipeline_id
-      ? `switchman task retry-stale --pipeline ${invalidation.affected_pipeline_id}`
-      : `switchman task retry ${invalidation.affected_task_id}`;
+  for (const cluster of staleClusters) {
     attention.push({
       kind: 'dependency_invalidation',
-      title: invalidation.summary,
-      detail: `${invalidation.source_worktree || 'unknown'} -> ${invalidation.affected_worktree || 'unknown'} (${invalidation.stale_area})`,
-      next_step: invalidation.affected_pipeline_id
-        ? 'retry the stale pipeline tasks so they can be revalidated before merge'
-        : 'requeue the stale task so it can be revalidated before merge',
-      command: retryCommand,
-      severity: invalidation.severity === 'blocked' ? 'block' : 'warn',
+      title: cluster.title,
+      detail: cluster.detail,
+      next_step: cluster.next_step,
+      command: cluster.command,
+      severity: cluster.severity,
+      affected_pipeline_id: cluster.affected_pipeline_id,
+      affected_task_ids: cluster.affected_task_ids,
+      invalidation_count: cluster.invalidation_count,
     });
   }
 
@@ -989,6 +1080,16 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     : attention.some((item) => item.severity === 'warn')
       ? 'warn'
       : 'healthy';
+
+  const repoPolicyState = summarizePipelinePolicyState({
+    tasks,
+    counts: {
+      done: tasks.filter((task) => task.status === 'done').length,
+      in_progress: tasks.filter((task) => task.status === 'in_progress').length,
+      pending: tasks.filter((task) => task.status === 'pending').length,
+      failed: tasks.filter((task) => task.status === 'failed').length,
+    },
+  }, changePolicy, aiGate.boundary_validations || []);
 
   return {
     repo_root: repoRoot,
@@ -1029,8 +1130,10 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       ai_gate_status: aiGate.status,
       boundary_validations: aiGate.boundary_validations || [],
       dependency_invalidations: aiGate.dependency_invalidations || [],
+      stale_clusters: staleClusters,
       compliance: scanReport.complianceSummary,
       semantic_conflicts: scanReport.semanticConflicts || [],
+      policy_state: repoPolicyState,
     },
     next_steps: attention.length > 0
       ? [...new Set(attention.map((item) => item.next_step))].slice(0, 5)
@@ -1238,6 +1341,9 @@ function renderUnifiedStatusReport(report) {
   ]));
   console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
   console.log(chalk.dim(`policy: ${formatRelativePolicy(report.lease_policy)} • requeue on reap ${report.lease_policy.requeue_task_on_reap ? 'on' : 'off'}`));
+  if (report.merge_readiness.policy_state?.active) {
+    console.log(chalk.dim(`change policy: ${report.merge_readiness.policy_state.domains.join(', ')} • ${report.merge_readiness.policy_state.enforcement} • missing ${report.merge_readiness.policy_state.missing_task_types.join(', ') || 'none'}`));
+  }
 
   const runningLines = report.active_work.length > 0
     ? report.active_work.slice(0, 5).map((item) => {
@@ -1291,6 +1397,29 @@ function renderUnifiedStatusReport(report) {
     ]
     : [chalk.dim('No queued merges.')];
 
+  const staleClusterLines = report.merge_readiness.stale_clusters?.length > 0
+    ? report.merge_readiness.stale_clusters.slice(0, 4).flatMap((cluster) => {
+      const lines = [`${renderChip(cluster.severity === 'block' ? 'STALE' : 'WATCH', cluster.affected_pipeline_id || cluster.affected_task_ids[0], cluster.severity === 'block' ? chalk.red : chalk.yellow)} ${cluster.title}`];
+      lines.push(`  ${chalk.dim(cluster.detail)}`);
+      lines.push(`  ${chalk.dim('areas:')} ${cluster.stale_areas.join(', ')}`);
+      lines.push(`  ${chalk.yellow('next:')} ${cluster.next_step}`);
+      lines.push(`  ${chalk.cyan('run:')} ${cluster.command}`);
+      return lines;
+    })
+    : [chalk.green('No stale dependency clusters.')];
+
+  const policyLines = report.merge_readiness.policy_state?.active
+    ? [
+      `${renderChip(report.merge_readiness.policy_state.enforcement.toUpperCase(), report.merge_readiness.policy_state.domains.join(','), report.merge_readiness.policy_state.enforcement === 'blocked' ? chalk.red : chalk.yellow)} ${report.merge_readiness.policy_state.summary}`,
+      `  ${chalk.dim('required:')} ${report.merge_readiness.policy_state.required_task_types.join(', ') || 'none'}`,
+      `  ${chalk.dim('missing:')} ${report.merge_readiness.policy_state.missing_task_types.join(', ') || 'none'}`,
+      ...report.merge_readiness.policy_state.requirement_status
+        .filter((requirement) => requirement.evidence.length > 0)
+        .slice(0, 3)
+        .map((requirement) => `  ${chalk.dim(`${requirement.task_type}:`)} ${requirement.evidence.map((entry) => entry.artifact_path ? `${entry.task_id} (${entry.artifact_path})` : entry.task_id).join(', ')}`),
+    ]
+    : [chalk.green('No explicit change policy requirements are active.')];
+
   const nextActionLines = [
     ...(report.next_up.length > 0
       ? report.next_up.map((task) => `${renderChip('NEXT', `p${task.priority}`, chalk.green)} ${task.title} ${chalk.dim(task.id)}`)
@@ -1303,6 +1432,8 @@ function renderUnifiedStatusReport(report) {
     renderPanel('Running now', runningLines, chalk.cyan),
     renderPanel('Blocked', blockedLines, blockedItems.length > 0 ? chalk.red : chalk.green),
     renderPanel('Warnings', warningLines, warningItems.length > 0 ? chalk.yellow : chalk.green),
+    renderPanel('Stale clusters', staleClusterLines, (report.merge_readiness.stale_clusters?.some((cluster) => cluster.severity === 'block') ? chalk.red : (report.merge_readiness.stale_clusters?.length || 0) > 0 ? chalk.yellow : chalk.green)),
+    renderPanel('Policy', policyLines, report.merge_readiness.policy_state?.active && report.merge_readiness.policy_state.missing_task_types.length > 0 ? chalk.red : chalk.green),
     renderPanel('Landing queue', queueLines, queueCounts.blocked > 0 ? chalk.red : chalk.blue),
     renderPanel('Next action', nextActionLines, chalk.green),
   ];
@@ -2018,7 +2149,7 @@ Pipeline landing rule:
   lands the pipeline's inferred landing branch.
   If completed work spans multiple branches, Switchman creates one synthetic landing branch first.
 `)
-  .action((branch, opts) => {
+  .action(async (branch, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
 
@@ -2038,6 +2169,10 @@ Pipeline landing rule:
           submittedBy: opts.submittedBy || null,
         };
       } else if (opts.pipeline) {
+        const policyGate = await evaluatePipelinePolicyGate(db, repoRoot, opts.pipeline);
+        if (!policyGate.ok) {
+          throw new Error(`${policyGate.summary} Next: ${policyGate.next_action}`);
+        }
         const landingTarget = preparePipelineLandingTarget(db, repoRoot, opts.pipeline, {
           baseBranch: opts.target || 'main',
           requireCompleted: true,
@@ -2466,19 +2601,41 @@ explainCmd
   });
 
 explainCmd
-  .command('stale <taskId>')
-  .description('Explain why a task is stale and how to revalidate it')
+  .command('stale [taskId]')
+  .description('Explain why a task or pipeline is stale and how to revalidate it')
+  .option('--pipeline <pipelineId>', 'Explain stale invalidations for a whole pipeline')
   .option('--json', 'Output raw JSON')
   .action((taskId, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
 
     try {
-      const report = buildStaleTaskExplainReport(db, taskId);
+      if (!opts.pipeline && !taskId) {
+        throw new Error('Pass a task id or `--pipeline <id>`.');
+      }
+      const report = opts.pipeline
+        ? buildStalePipelineExplainReport(db, opts.pipeline)
+        : buildStaleTaskExplainReport(db, taskId);
       db.close();
 
       if (opts.json) {
         console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      if (opts.pipeline) {
+        console.log(chalk.bold(`Stale status for pipeline ${report.pipeline_id}`));
+        if (report.stale_clusters.length === 0) {
+          console.log(`  ${chalk.green('state:')} no active dependency invalidations`);
+          return;
+        }
+        for (const cluster of report.stale_clusters) {
+          console.log(`  ${cluster.severity === 'block' ? chalk.red('why:') : chalk.yellow('why:')} ${cluster.title}`);
+          console.log(`  ${chalk.dim('source worktrees:')} ${cluster.source_worktrees.join(', ') || 'unknown'}`);
+          console.log(`  ${chalk.dim('affected tasks:')} ${cluster.affected_task_ids.join(', ')}`);
+          console.log(`  ${chalk.dim('stale areas:')} ${cluster.stale_areas.join(', ')}`);
+        }
+        console.log(`  ${chalk.yellow('next:')} ${report.next_action}`);
         return;
       }
 
@@ -2497,7 +2654,7 @@ explainCmd
       console.log(`  ${chalk.yellow('next:')} ${report.next_action}`);
     } catch (err) {
       db.close();
-      printErrorWithNext(err.message, 'switchman doctor');
+      printErrorWithNext(err.message, opts.pipeline ? 'switchman doctor' : 'switchman doctor');
       process.exitCode = 1;
     }
   });
@@ -2618,15 +2775,32 @@ Examples:
 
     try {
       const result = getPipelineStatus(db, pipelineId);
-      const landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
-        requireCompleted: false,
-      });
+      let landing;
+      let landingError = null;
+      try {
+        landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+          requireCompleted: false,
+        });
+      } catch (err) {
+        landingError = String(err.message || 'Landing branch is not ready yet.');
+        landing = {
+          branch: null,
+          synthetic: false,
+          stale: false,
+          stale_reasons: [],
+          last_failure: null,
+          last_recovery: null,
+        };
+      }
+      const policyState = summarizePipelinePolicyState(result, loadChangePolicy(repoRoot), []);
       db.close();
 
       if (opts.json) {
         console.log(JSON.stringify({
           ...result,
           landing_branch: landing,
+          landing_error: landingError,
+          policy_state: policyState,
         }, null, 2));
         return;
       }
@@ -2662,6 +2836,8 @@ Examples:
       console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
       if (landingLabel) {
         console.log(`${chalk.bold('Landing:')} ${landingLabel}`);
+      } else if (landingError) {
+        console.log(`${chalk.bold('Landing:')} ${chalk.yellow('not ready yet')} ${chalk.dim(landingError)}`);
       }
 
       const runningLines = result.tasks.filter((task) => task.status === 'in_progress').slice(0, 4).map((task) => {
@@ -2715,6 +2891,19 @@ Examples:
         ]
         : [];
 
+      const policyLines = policyState.active
+        ? [
+          `${renderChip(policyState.enforcement.toUpperCase(), policyState.domains.join(','), policyState.enforcement === 'blocked' ? chalk.red : chalk.yellow)} ${policyState.summary}`,
+          `  ${chalk.dim('required:')} ${policyState.required_task_types.join(', ') || 'none'}`,
+          `  ${chalk.dim('satisfied:')} ${policyState.satisfied_task_types.join(', ') || 'none'}`,
+          `  ${chalk.dim('missing:')} ${policyState.missing_task_types.join(', ') || 'none'}`,
+          ...policyState.requirement_status
+            .filter((requirement) => requirement.evidence.length > 0)
+            .slice(0, 4)
+            .map((requirement) => `  ${chalk.dim(`${requirement.task_type}:`)} ${requirement.evidence.map((entry) => entry.artifact_path ? `${entry.task_id} (${entry.artifact_path})` : entry.task_id).join(', ')}`),
+        ]
+        : [chalk.green('No explicit change policy requirements are active for this pipeline.')];
+
       const commandLines = [
         `${chalk.cyan('$')} switchman pipeline exec ${result.pipeline_id} "/path/to/agent-command"`,
         `${chalk.cyan('$')} switchman pipeline pr ${result.pipeline_id}`,
@@ -2728,6 +2917,7 @@ Examples:
         renderPanel('Running now', runningLines.length > 0 ? runningLines : [chalk.dim('No tasks are actively running.')], runningLines.length > 0 ? chalk.cyan : chalk.green),
         renderPanel('Blocked', blockedLines.length > 0 ? blockedLines : [chalk.green('Nothing blocked.')], blockedLines.length > 0 ? chalk.red : chalk.green),
         renderPanel('Next up', nextLines.length > 0 ? nextLines : [chalk.dim('No pending tasks left.')], chalk.green),
+        renderPanel('Policy', policyLines, policyState.active ? (policyState.missing_task_types.length > 0 ? chalk.red : chalk.green) : chalk.green),
         ...(landing.synthetic ? [renderPanel('Landing branch', landingLines, landing.stale ? chalk.red : chalk.cyan)] : []),
         renderPanel('Next commands', commandLines, chalk.cyan),
       ]) {
@@ -2999,6 +3189,65 @@ pipelineCmd
       console.log(`  ${chalk.dim('body:')} ${result.bundle.files.landing_summary_markdown}`);
       if (result.updated_existing) {
         console.log(`  ${chalk.dim('mode:')} update existing comment`);
+      }
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('sync-pr <pipelineId> [outputDir]')
+  .description('Build PR artifacts, emit GitHub outputs, and update the PR comment in one command')
+  .option('--pr <number>', 'Pull request number to comment on')
+  .option('--pr-from-env', 'Read the pull request number from GitHub Actions environment variables')
+  .option('--gh-command <command>', 'Executable to use for GitHub CLI', 'gh')
+  .option('--github', 'Write GitHub Actions step summary/output when GITHUB_* env vars are present')
+  .option('--github-step-summary <path>', 'Path to write GitHub Actions step summary markdown')
+  .option('--github-output <path>', 'Path to write GitHub Actions outputs')
+  .option('--no-comment', 'Skip updating the PR comment')
+  .option('--json', 'Output raw JSON')
+  .action(async (pipelineId, outputDir, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const prNumber = opts.pr || (opts.prFromEnv ? resolvePrNumberFromEnv() : null);
+
+    try {
+      if (opts.comment !== false && !prNumber) {
+        throw new Error('A pull request number is required for comment sync. Pass `--pr <number>`, `--pr-from-env`, or `--no-comment`.');
+      }
+
+      const result = await syncPipelinePr(db, repoRoot, pipelineId, {
+        prNumber: opts.comment === false ? null : prNumber,
+        ghCommand: opts.ghCommand,
+        outputDir: outputDir || null,
+        updateExisting: true,
+      });
+      db.close();
+
+      const githubTargets = resolveGitHubOutputTargets(opts);
+      if (githubTargets.stepSummaryPath || githubTargets.outputPath) {
+        writeGitHubPipelineLandingStatus({
+          result: result.bundle.landing_summary,
+          stepSummaryPath: githubTargets.stepSummaryPath,
+          outputPath: githubTargets.outputPath,
+        });
+      }
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Synced PR artifacts for ${chalk.cyan(result.pipeline_id)}`);
+      console.log(`  ${chalk.dim('bundle:')} ${result.bundle.output_dir}`);
+      if (result.comment) {
+        console.log(`  ${chalk.dim('pr:')} #${result.comment.pr_number}`);
+        console.log(`  ${chalk.dim('comment:')} updated existing`);
+      }
+      if (githubTargets.stepSummaryPath || githubTargets.outputPath) {
+        console.log(`  ${chalk.dim('github:')} wrote PR check artifacts`);
       }
     } catch (err) {
       db.close();
@@ -3923,6 +4172,17 @@ Examples:
       })
       : [chalk.green('Nothing urgent.')];
 
+    const staleClusterLines = report.merge_readiness.stale_clusters?.length > 0
+      ? report.merge_readiness.stale_clusters.slice(0, 5).flatMap((cluster) => {
+        const lines = [`${cluster.severity === 'block' ? renderChip('STALE', cluster.affected_pipeline_id || cluster.affected_task_ids[0], chalk.red) : renderChip('WATCH', cluster.affected_pipeline_id || cluster.affected_task_ids[0], chalk.yellow)} ${cluster.title}`];
+        lines.push(`  ${chalk.dim(cluster.detail)}`);
+        lines.push(`  ${chalk.dim('areas:')} ${cluster.stale_areas.join(', ')}`);
+        lines.push(`  ${chalk.yellow('next:')} ${cluster.next_step}`);
+        lines.push(`  ${chalk.cyan('run:')} ${cluster.command}`);
+        return lines;
+      })
+      : [chalk.green('No stale dependency clusters.')];
+
     const nextStepLines = [
       ...report.next_steps.slice(0, 4).map((step) => `- ${step}`),
       '',
@@ -3934,6 +4194,7 @@ Examples:
     for (const block of [
       renderPanel('Running now', runningLines, chalk.cyan),
       renderPanel('Attention now', attentionLines, report.attention.some((item) => item.severity === 'block') ? chalk.red : report.attention.length > 0 ? chalk.yellow : chalk.green),
+      renderPanel('Stale clusters', staleClusterLines, report.merge_readiness.stale_clusters?.some((cluster) => cluster.severity === 'block') ? chalk.red : (report.merge_readiness.stale_clusters?.length || 0) > 0 ? chalk.yellow : chalk.green),
       renderPanel('Recommended next steps', nextStepLines, chalk.green),
     ]) {
       for (const line of block) console.log(line);
@@ -4510,7 +4771,7 @@ monitorCmd
 
 // ── policy ───────────────────────────────────────────────────────────────────
 
-const policyCmd = program.command('policy').description('Manage enforcement policy exceptions');
+const policyCmd = program.command('policy').description('Manage enforcement and change-governance policy');
 
 policyCmd
   .command('init')
@@ -4525,6 +4786,37 @@ policyCmd
       ],
     });
     console.log(`${chalk.green('✓')} Wrote enforcement policy to ${chalk.cyan(policyPath)}`);
+  });
+
+policyCmd
+  .command('init-change')
+  .description('Write a starter change policy file for governed domains like auth, payments, and schema')
+  .action(() => {
+    const repoRoot = getRepo();
+    const policyPath = writeChangePolicy(repoRoot, DEFAULT_CHANGE_POLICY);
+    console.log(`${chalk.green('✓')} Wrote change policy to ${chalk.cyan(policyPath)}`);
+  });
+
+policyCmd
+  .command('show-change')
+  .description('Show the active change policy for this repo')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const policy = loadChangePolicy(repoRoot);
+    const policyPath = getChangePolicyPath(repoRoot);
+
+    if (opts.json) {
+      console.log(JSON.stringify({ path: policyPath, policy }, null, 2));
+      return;
+    }
+
+    console.log(chalk.bold('Change policy'));
+    console.log(`  ${chalk.dim('path:')} ${policyPath}`);
+    for (const [domain, rule] of Object.entries(policy.domain_rules || {})) {
+      console.log(`  ${chalk.cyan(domain)} ${chalk.dim(rule.enforcement)}`);
+      console.log(`    ${chalk.dim('requires:')} ${(rule.required_completed_task_types || []).join(', ') || 'none'}`);
+    }
   });
 
 program.parse();

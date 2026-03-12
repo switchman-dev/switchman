@@ -18,7 +18,7 @@ import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorStat
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 import { buildTaskSpec } from '../src/core/planner.js';
-import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../src/core/policy.js';
+import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../src/core/policy.js';
 import { resolveQueueSource } from '../src/core/queue.js';
 import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
 
@@ -103,6 +103,8 @@ function setupPipelineExecRepo(prefix, branchName) {
   writeFileSync(join(repoDir, 'README.md'), 'init\n');
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init"', { cwd: repoDir });
+  execSync('git branch switchman/agent1', { cwd: repoDir });
+  execSync('git branch switchman/agent2', { cwd: repoDir });
 
   const agentPath = join(tmpdir(), `${prefix}-agent-${Date.now()}`);
   execSync(`git worktree add -b ${branchName} "${agentPath}"`, { cwd: repoDir });
@@ -424,6 +426,73 @@ test('Merge queue add materializes a synthetic landing branch for multi-branch p
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 29a: queue add blocks pipeline landing when policy requirements are still missing', () => {
+  const repoDir = join(tmpdir(), `sw-queue-add-policy-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init on main"', { cwd: repoDir });
+  execSync('git checkout -b feature/policy-queue-add', { cwd: repoDir });
+  execSync('git checkout main', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'feature/policy-queue-add' });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      schema: {
+        required_completed_task_types: ['tests', 'docs', 'governance'],
+        enforcement: 'blocked',
+        rationale: ['schema changes require explicit evidence before landing'],
+      },
+    },
+  });
+
+  const taskId = createTask(queueDb, { id: 'pipe-policy-queue-add-01', title: 'Implement schema change' });
+  upsertTaskSpec(queueDb, taskId, {
+    pipeline_id: 'pipe-policy-queue-add',
+    task_type: 'implementation',
+    subsystem_tags: ['schema'],
+    validation_rules: {
+      required_completed_task_types: ['tests', 'docs', 'governance'],
+      enforcement: 'blocked',
+      rationale: ['schema changes require explicit evidence before landing'],
+    },
+  });
+  assignTask(queueDb, taskId, 'agent1');
+  completeTask(queueDb, taskId);
+  queueDb.close();
+
+  let commandError = null;
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'queue',
+      'add',
+      '--pipeline',
+      'pipe-policy-queue-add',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+  } catch (err) {
+    commandError = err;
+  }
+
+  const verifyDb = openDb(repoDir);
+  const queueItems = listMergeQueue(verifyDb);
+  const output = `${commandError?.stdout || ''}${commandError?.stderr || ''}`;
+
+  assert(Boolean(commandError), 'queue add exits non-zero when policy blocks landing');
+  assert(output.includes('Policy blocked landing'), 'queue add explains that the landing block comes from policy');
+  assert(output.includes('switchman pipeline review pipe-policy-queue-add'), 'queue add points at pipeline review as the remediation command');
+  assert(queueItems.length === 0, 'queue add does not enqueue a policy-blocked pipeline');
+  verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Explain queue reports the blocker, resolved source, and next action', () => {
   const repoDir = join(tmpdir(), `sw-explain-queue-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -666,6 +735,68 @@ test('Merge queue run blocks missing source branches with a clear reason', () =>
   assert(cliResult.processed[0].status === 'blocked', 'Queue runner blocks missing source branches');
   assert(updated.last_error_code === 'source_missing', 'Blocked queue item records the missing-source error code');
   assert(updated.next_action.includes('switchman queue retry'), 'Blocked queue item provides an exact retry command');
+  queueDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 29b: merge queue run blocks queued pipelines on explicit policy failures', () => {
+  const repoDir = join(tmpdir(), `sw-queue-run-policy-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init on main"', { cwd: repoDir });
+  execSync('git checkout -b feature/policy-queue-run', { cwd: repoDir });
+  execSync('git checkout main', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'feature/policy-queue-run' });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      auth: {
+        required_completed_task_types: ['tests', 'governance'],
+        enforcement: 'blocked',
+        rationale: ['auth changes require policy-backed tests and review'],
+      },
+    },
+  });
+
+  const taskId = createTask(queueDb, { id: 'pipe-policy-queue-run-01', title: 'Implement auth hardening' });
+  upsertTaskSpec(queueDb, taskId, {
+    pipeline_id: 'pipe-policy-queue-run',
+    task_type: 'implementation',
+    subsystem_tags: ['auth'],
+    validation_rules: {
+      required_completed_task_types: ['tests', 'governance'],
+      enforcement: 'blocked',
+      rationale: ['auth changes require policy-backed tests and review'],
+    },
+  });
+  assignTask(queueDb, taskId, 'agent1');
+  completeTask(queueDb, taskId);
+  enqueueMergeItem(queueDb, {
+    sourceType: 'pipeline',
+    sourceRef: 'pipe-policy-queue-run',
+    sourcePipelineId: 'pipe-policy-queue-run',
+    targetBranch: 'main',
+  });
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const updated = listMergeQueue(queueDb)[0];
+
+  assert(cliResult.processed[0].status === 'blocked', 'Queue runner blocks the item when pipeline policy is incomplete');
+  assert(updated.last_error_code === 'policy_requirements_incomplete', 'Blocked queue item records a policy-specific error code');
+  assert(updated.last_error_summary.includes('Policy blocked landing'), 'Blocked queue item stores a policy-specific summary');
+  assert(updated.next_action === 'switchman pipeline review pipe-policy-queue-run', 'Blocked queue item gives the exact policy remediation command');
   queueDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -3017,6 +3148,88 @@ test('Fix 25da: explain stale reports why a task is stale and points at task ret
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 25db0: explain stale can summarize a whole stale pipeline cluster', () => {
+  const repoDir = join(tmpdir(), `sw-explain-stale-pipeline-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const staleA = createTask(db, { title: 'Revalidate auth A' });
+  upsertTaskSpec(db, staleA, {
+    pipeline_id: 'pipe-stale-cluster',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, staleA, 'main');
+  completeLeaseTask(db, getActiveLeaseForTask(db, staleA).id);
+
+  const staleB = createTask(db, { title: 'Revalidate auth docs' });
+  upsertTaskSpec(db, staleB, {
+    pipeline_id: 'pipe-stale-cluster',
+    task_type: 'docs',
+    allowed_paths: ['docs/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['docs'],
+    required_deliverables: ['docs'],
+  });
+  assignTask(db, staleB, 'main');
+  completeLeaseTask(db, getActiveLeaseForTask(db, staleB).id);
+
+  const sourceTask = createTask(db, { title: 'Fresh auth change' });
+  upsertTaskSpec(db, sourceTask, {
+    pipeline_id: 'pipe-fresh-cluster',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, sourceTask, 'main');
+  const sourceLease = getActiveLeaseForTask(db, sourceTask);
+  execSync('mkdir -p src/auth && printf "new\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
+  evaluateTaskOutcome(db, repoDir, { leaseId: sourceLease.id });
+  db.close();
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'stale',
+    '--pipeline',
+    'pipe-stale-cluster',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'stale',
+    '--pipeline',
+    'pipe-stale-cluster',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(textOutput.includes('Stale status for pipeline pipe-stale-cluster'), 'Explain stale pipeline prints the pipeline header');
+  assert(textOutput.includes('affected tasks:'), 'Explain stale pipeline prints the affected task list');
+  assert(textOutput.includes('switchman task retry-stale --pipeline pipe-stale-cluster'), 'Explain stale pipeline points at bulk retry');
+  assert(jsonOutput.stale_clusters.length === 1, 'Explain stale pipeline JSON groups invalidations into one cluster');
+  assert(jsonOutput.stale_clusters[0].affected_task_ids.length === 2, 'Explain stale pipeline JSON returns the grouped affected tasks');
+  assert(jsonOutput.next_action === 'switchman task retry-stale --pipeline pipe-stale-cluster', 'Explain stale pipeline JSON returns the exact retry command');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 25db: task retry CLI resets stale completed work back to pending', () => {
   const repoDir = join(tmpdir(), `sw-task-retry-cli-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -3193,6 +3406,91 @@ test('Fix 27: pipeline start creates grouped subtasks with suggested worktrees',
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 27a: planner applies repo change policy to governed domains', () => {
+  const repoDir = join(tmpdir(), `sw-change-policy-plan-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      auth: {
+        required_completed_task_types: ['tests', 'governance', 'docs'],
+        enforcement: 'blocked',
+        rationale: ['auth changes need docs too'],
+      },
+    },
+  });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  const pipeline = startPipeline(pipelineDb, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-policy',
+    priority: 5,
+  });
+  const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
+
+  assert(implementationTask.task_spec.validation_rules.required_completed_task_types.includes('tests'), 'Planner keeps required tests for governed auth work');
+  assert(implementationTask.task_spec.validation_rules.required_completed_task_types.includes('governance'), 'Planner keeps required governance for governed auth work');
+  assert(implementationTask.task_spec.validation_rules.required_completed_task_types.includes('docs'), 'Planner adds policy-required docs for governed auth work');
+  assert(implementationTask.task_spec.validation_rules.rationale.includes('auth changes need docs too'), 'Planner carries policy rationale into the task spec');
+
+  pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 27b: policy-aware followups add missing governed work for sensitive pipelines', () => {
+  const repoDir = join(tmpdir(), `sw-change-policy-followups-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      auth: {
+        required_completed_task_types: ['tests', 'governance', 'docs'],
+        enforcement: 'blocked',
+        rationale: ['auth changes need policy followups'],
+      },
+    },
+  });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const pipeline = startPipeline(db, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-policy-followups',
+    priority: 5,
+  });
+  const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
+  assignTask(db, implementationTask.id, 'main');
+  completeLeaseTask(db, getActiveLeaseForTask(db, implementationTask.id).id);
+
+  db.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'review',
+    'pipe-policy-followups',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const titles = result.created.map((task) => task.title);
+
+  assert(titles.some((title) => title.startsWith('Add policy-required tests for')), 'Policy-aware followups add missing tests');
+  assert(titles.some((title) => title.startsWith('Add policy-required docs for')), 'Policy-aware followups add missing docs');
+  assert(titles.some((title) => title.startsWith('Add policy review for')), 'Policy-aware followups add missing governance review');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 28: pipeline PR summary combines task status with gate results', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-pr-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -3227,6 +3525,59 @@ test('Fix 28: pipeline PR summary combines task status with gate results', () =>
   assert(result.pr_artifact.body.includes('## Reviewer Checklist'), 'Pipeline PR summary generates a structured PR body');
   assert(Array.isArray(result.pr_artifact.provenance), 'Pipeline PR summary includes provenance entries for reviewers');
   assert(result.pr_artifact.provenance[0].lease_id === lease.id, 'Pipeline PR summary includes completed lease provenance');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28p: pipeline PR summary includes active policy requirements', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-pr-policy-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      auth: {
+        required_completed_task_types: ['tests', 'governance', 'docs'],
+        enforcement: 'blocked',
+        rationale: ['auth changes need policy evidence'],
+      },
+    },
+  });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-pr-policy',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-pr-policy-01');
+  completeTask(pipelineDb, 'pipe-pr-policy-02');
+  completeTask(pipelineDb, 'pipe-pr-policy-04');
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'pr',
+    'pipe-pr-policy',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.pr_artifact.policy_state.domains.includes('auth'), 'Pipeline PR summary carries the governed domain');
+  assert(result.pr_artifact.policy_state.missing_task_types.includes('docs'), 'Pipeline PR summary carries the missing policy-required task types');
+  assert(result.pr_artifact.policy_state.evidence_by_task_type.tests.some((entry) => entry.task_id === 'pipe-pr-policy-02'), 'Pipeline PR summary carries concrete evidence for satisfied test requirements');
+  assert(result.pr_artifact.policy_state.evidence_by_task_type.governance.some((entry) => entry.artifact_path?.includes('docs/reviews/pipe-pr-policy/pipe-pr-policy-04.md')), 'Pipeline PR summary carries governance artifact evidence');
+  assert(result.markdown.includes('## Policy Requirements'), 'Pipeline PR markdown includes a policy requirements section');
+  assert(result.markdown.includes('Evidence for governance'), 'Pipeline PR markdown lists the evidence backing satisfied policy requirements');
+  assert(result.pr_artifact.body.includes('Policy domains: auth'), 'Pipeline PR body includes the active policy domains');
+  assert(result.pr_artifact.body.includes('Policy evidence:'), 'Pipeline PR body includes a compact policy evidence summary');
+
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -3269,6 +3620,65 @@ test('Fix 28a: pipeline status exposes readable failure context and next action'
   assert(cliOutput.includes('why:'), 'Pipeline status CLI prints a readable failure summary');
   assert(cliOutput.includes('next:'), 'Pipeline status CLI prints a concrete next step for failed tasks');
   pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28a1: pipeline status surfaces policy state in JSON and text output', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-status-policy-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      auth: {
+        required_completed_task_types: ['tests', 'governance', 'docs'],
+        enforcement: 'blocked',
+        rationale: ['auth changes need visible policy state'],
+      },
+    },
+  });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-status-policy',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-status-policy-02');
+  completeTask(pipelineDb, 'pipe-status-policy-04');
+  pipelineDb.close();
+
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'status',
+    'pipe-status-policy',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'status',
+    'pipe-status-policy',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(jsonOutput.policy_state.domains.includes('auth'), 'Pipeline status JSON includes the active governed domain');
+  assert(jsonOutput.policy_state.missing_task_types.includes('docs'), 'Pipeline status JSON includes missing policy-required work');
+  assert(jsonOutput.policy_state.evidence_by_task_type.tests.some((entry) => entry.task_id === 'pipe-status-policy-02'), 'Pipeline status JSON includes concrete evidence for satisfied requirements');
+  assert(textOutput.includes('Policy'), 'Pipeline status text includes the policy panel');
+  assert(textOutput.includes('auth'), 'Pipeline status text includes the governed domain name');
+  assert(textOutput.includes('tests: pipe-status-policy-02'), 'Pipeline status text includes satisfied policy evidence entries');
+
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -3649,9 +4059,36 @@ test('Fix 28ab: doctor and repo gate surface stale dependency invalidations', ()
     cwd: repoDir,
     encoding: 'utf8',
   }));
+  const doctorText = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const statusText = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
   assert(doctorJson.attention.some((item) => item.kind === 'dependency_invalidation'), 'Doctor includes stale dependency invalidations in the attention list');
   assert(doctorJson.merge_readiness.dependency_invalidations.some((item) => item.affected_task_id === oldTaskId), 'Doctor surfaces stale dependency invalidations in merge readiness');
+  assert(doctorJson.merge_readiness.stale_clusters.some((item) => item.affected_pipeline_id === 'pipe-old-doc'), 'Doctor groups stale invalidations into pipeline clusters');
   assert(doctorJson.attention.some((item) => item.command === 'switchman task retry-stale --pipeline pipe-old-doc'), 'Doctor points stale work at the exact retry command');
+  assert(doctorText.includes('Stale clusters'), 'Doctor text includes a dedicated stale clusters panel');
+  assert(doctorText.includes('pipe-old-doc'), 'Doctor text names the affected stale pipeline');
+  assert(statusJson.merge_readiness.stale_clusters.some((item) => item.affected_pipeline_id === 'pipe-old-doc'), 'Status JSON includes grouped stale clusters');
+  assert(statusText.includes('Stale clusters'), 'Status text includes a dedicated stale clusters panel');
 
   let ciStdout = '';
   try {
@@ -3829,6 +4266,72 @@ test('Fix 28d: pipeline bundle exports reviewer-ready files to disk', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28d0: pipeline bundle carries stale cluster state into PR and landing artifacts', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-bundle-stale-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const staleTask = createTask(db, { id: 'pipe-bundle-stale-01', title: 'Old auth docs' });
+  upsertTaskSpec(db, staleTask, {
+    pipeline_id: 'pipe-bundle-stale',
+    task_type: 'docs',
+    allowed_paths: ['docs/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['docs'],
+    required_deliverables: ['docs'],
+  });
+  assignTask(db, staleTask, 'main');
+  completeLeaseTask(db, getActiveLeaseForTask(db, staleTask).id);
+
+  const sourceTask = createTask(db, { title: 'Fresh auth change' });
+  upsertTaskSpec(db, sourceTask, {
+    pipeline_id: 'pipe-bundle-fresh',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, sourceTask, 'main');
+  const lease = getActiveLeaseForTask(db, sourceTask);
+  execSync('mkdir -p src/auth && printf "new\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
+  evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
+  db.close();
+
+  const outputDir = join(repoDir, 'artifacts', 'pipe-bundle-stale');
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'bundle',
+    'pipe-bundle-stale',
+    outputDir,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const summaryJson = JSON.parse(readFileSync(result.files.summary_json, 'utf8'));
+  const summaryMarkdown = readFileSync(result.files.summary_markdown, 'utf8');
+  const landingJson = JSON.parse(readFileSync(result.files.landing_summary_json, 'utf8'));
+  const landingMarkdown = readFileSync(result.files.landing_summary_markdown, 'utf8');
+
+  assert(summaryJson.stale_clusters.some((cluster) => cluster.affected_pipeline_id === 'pipe-bundle-stale'), 'PR summary JSON includes grouped stale cluster state');
+  assert(summaryJson.pr_artifact.stale_clusters.some((cluster) => cluster.affected_pipeline_id === 'pipe-bundle-stale'), 'PR artifact carries stale cluster state for reviewers');
+  assert(summaryMarkdown.includes('## Stale Clusters'), 'PR summary markdown includes a stale clusters section');
+  assert(landingJson.stale_clusters.some((cluster) => cluster.affected_pipeline_id === 'pipe-bundle-stale'), 'Landing summary JSON includes grouped stale clusters');
+  assert(landingMarkdown.includes('## Stale Clusters'), 'Landing summary markdown includes a stale clusters section');
+  assert(landingJson.next_action === 'switchman task retry-stale --pipeline pipe-bundle-stale', 'Landing summary points stale pipelines at the exact bulk retry command');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 28d1: pipeline bundle writes GitHub Actions landing summary and outputs', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-bundle-github-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -3871,6 +4374,7 @@ test('Fix 28d1: pipeline bundle writes GitHub Actions landing summary and output
   assert(stepSummary.includes('- Name: Switchman Pipeline Landing'), 'Pipeline bundle step summary includes a stable check name');
   assert(stepSummary.includes('- Title: '), 'Pipeline bundle step summary includes a check-friendly title');
   assert(stepSummary.includes('- Summary: '), 'Pipeline bundle step summary includes a one-line check summary');
+  assert(stepSummary.includes('## Stale Clusters'), 'Pipeline bundle step summary includes stale cluster context for PR checks');
   assert(stepSummary.includes('## Queue State'), 'Pipeline bundle step summary includes queue state for PR-facing checks');
   assert(output.includes('switchman_pipeline_id=pipe-bundle-github'), 'Pipeline bundle writes the pipeline ID to GitHub outputs');
   assert(output.includes('switchman_landing_branch='), 'Pipeline bundle writes the landing branch to GitHub outputs');
@@ -3880,6 +4384,7 @@ test('Fix 28d1: pipeline bundle writes GitHub Actions landing summary and output
   assert(output.includes('switchman_check_summary='), 'Pipeline bundle writes a reusable check summary to GitHub outputs');
   assert(output.includes('switchman_queue_status='), 'Pipeline bundle writes queue status to GitHub outputs');
   assert(output.includes('switchman_queue_target_branch='), 'Pipeline bundle writes queue target branch to GitHub outputs');
+  assert(output.includes('switchman_stale_cluster_count='), 'Pipeline bundle writes stale cluster count to GitHub outputs');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -4143,6 +4648,7 @@ printf 'commented\n'
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+
 test('Fix 28e2: pipeline comment can update an existing GitHub PR comment', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-comment-update-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -4259,6 +4765,72 @@ echo "$@" >> "${ghLogPath}"
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28e4: pipeline sync-pr bundles artifacts, writes GitHub outputs, and updates the PR comment', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-sync-pr-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git checkout -b feature/docs-refresh', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const ghLogPath = join(repoDir, 'gh-log.txt');
+  const ghScriptPath = join(repoDir, 'gh-stub.sh');
+  writeFileSync(ghScriptPath, `#!/bin/sh
+echo "$@" >> "${ghLogPath}"
+`, 'utf8');
+  execSync(`chmod +x "${ghScriptPath}"`);
+
+  const stepSummaryPath = join(repoDir, 'pipeline-step-summary.md');
+  const outputPath = join(repoDir, 'pipeline-output.txt');
+  const eventPath = join(repoDir, 'github-event.json');
+  writeFileSync(eventPath, `${JSON.stringify({ pull_request: { number: 88 } }, null, 2)}\n`);
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-sync-pr',
+    priority: 5,
+  });
+  completeTask(pipelineDb, 'pipe-sync-pr-01');
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'sync-pr',
+    'pipe-sync-pr',
+    '--pr-from-env',
+    '--gh-command',
+    ghScriptPath,
+    '--github-step-summary',
+    stepSummaryPath,
+    '--github-output',
+    outputPath,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_EVENT_PATH: eventPath,
+    },
+  }));
+
+  const ghLog = readFileSync(ghLogPath, 'utf8');
+  const stepSummary = readFileSync(stepSummaryPath, 'utf8');
+  const output = readFileSync(outputPath, 'utf8');
+  assert(result.comment.pr_number === '88', 'pipeline sync-pr resolves the PR number from GitHub Actions env');
+  assert(ghLog.includes('pr comment 88'), 'pipeline sync-pr updates the PR comment');
+  assert(stepSummary.includes('## Check Summary'), 'pipeline sync-pr writes the GitHub step summary');
+  assert(output.includes('switchman_check_status='), 'pipeline sync-pr writes GitHub check outputs');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+
 test('Fix 28f: pipeline publish prefers the implementation worktree branch in multi-worktree pipelines', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-publish-multi-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -4273,12 +4845,33 @@ test('Fix 28f: pipeline publish prefers the implementation worktree branch in mu
   registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
   registerWorktree(pipelineDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'switchman/agent1' });
   registerWorktree(pipelineDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'switchman/agent2' });
-  startPipeline(pipelineDb, {
-    title: 'Harden auth API permissions',
-    description: 'Update login permissions for the public API and add migration checks',
-    pipelineId: 'pipe-publish-multi',
-    priority: 9,
+  const implTask = createTask(pipelineDb, {
+    id: 'pipe-publish-multi-01',
+    title: 'Implement UI permissions',
   });
+  upsertTaskSpec(pipelineDb, implTask, {
+    pipeline_id: 'pipe-publish-multi',
+    task_type: 'implementation',
+    subsystem_tags: ['ui'],
+    validation_rules: {
+      required_completed_task_types: [],
+      enforcement: 'none',
+      rationale: [],
+    },
+  });
+  assignTask(pipelineDb, implTask, 'agent1');
+  completeTask(pipelineDb, implTask);
+
+  const docsTask = createTask(pipelineDb, {
+    id: 'pipe-publish-multi-02',
+    title: 'Document UI permissions',
+  });
+  upsertTaskSpec(pipelineDb, docsTask, {
+    pipeline_id: 'pipe-publish-multi',
+    task_type: 'docs',
+    subsystem_tags: ['ui'],
+  });
+  assignTask(pipelineDb, docsTask, 'agent2');
 
   const ghCapturePath = join(repoDir, 'gh-invocation-multi.json');
   const fakeGhPath = join(repoDir, 'fake-gh-multi');
@@ -4315,6 +4908,74 @@ printf 'https://github.com/example/repo/pull/456\n'
   assert(result.head_branch === 'switchman/agent1', 'Pipeline publish infers the implementation worktree branch when multiple worktree branches exist');
   assert(invocation.args.includes('switchman/agent1'), 'Pipeline publish passes the inferred implementation branch to gh');
   pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 29c: pipeline publish blocks when policy-backed landing evidence is still missing', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-publish-policy-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git checkout -b feature/policy-publish', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const ghLogPath = join(repoDir, 'gh-log.txt');
+  const ghScriptPath = join(repoDir, 'gh-stub.sh');
+  writeFileSync(ghScriptPath, `#!/bin/sh
+echo "$@" >> "${ghLogPath}"
+`, 'utf8');
+  execSync(`chmod +x "${ghScriptPath}"`);
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'feature/policy-publish' });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      schema: {
+        required_completed_task_types: ['tests', 'docs', 'governance'],
+        enforcement: 'blocked',
+        rationale: ['schema changes require explicit evidence before publish'],
+      },
+    },
+  });
+  const taskId = createTask(pipelineDb, { id: 'pipe-policy-publish-01', title: 'Implement schema hardening' });
+  upsertTaskSpec(pipelineDb, taskId, {
+    pipeline_id: 'pipe-policy-publish',
+    task_type: 'implementation',
+    subsystem_tags: ['schema'],
+    validation_rules: {
+      required_completed_task_types: ['tests', 'docs', 'governance'],
+      enforcement: 'blocked',
+      rationale: ['schema changes require explicit evidence before publish'],
+    },
+  });
+  completeTask(pipelineDb, taskId);
+  pipelineDb.close();
+
+  let commandError = null;
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline',
+      'publish',
+      'pipe-policy-publish',
+      '--gh-command',
+      ghScriptPath,
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+  } catch (err) {
+    commandError = err;
+  }
+
+  const output = `${commandError?.stdout || ''}${commandError?.stderr || ''}`;
+
+  assert(Boolean(commandError), 'pipeline publish exits non-zero when policy blocks landing');
+  assert(output.includes('Policy blocked landing'), 'pipeline publish reports a policy-backed landing block');
+  assert(output.includes('switchman pipeline review pipe-policy-publish'), 'pipeline publish points at pipeline review as the exact remediation command');
+  assert(!existsSync(ghLogPath), 'pipeline publish does not call gh when policy blocks landing');
   rmSync(repoDir, { recursive: true, force: true });
 });
 

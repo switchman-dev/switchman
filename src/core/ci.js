@@ -69,6 +69,14 @@ function getPipelineLandingCheckInfo(result) {
     };
   }
 
+  if ((result.stale_clusters?.length || 0) > 0) {
+    return {
+      status: 'action_required',
+      title: 'Pipeline has stale work to revalidate',
+      summary: result.stale_clusters[0]?.next_action || result.queue_state?.next_action || result.next_action,
+    };
+  }
+
   if (result.landing_error || result.landing?.last_failure) {
     return {
       status: 'action_required',
@@ -169,6 +177,11 @@ export function formatPipelineLandingMarkdown(result) {
       ]
       : ['- No active recovery worktree']),
     '',
+    '## Stale Clusters',
+    ...(result.stale_clusters?.length
+      ? result.stale_clusters.map((cluster) => `- ${cluster.title}: ${cluster.detail} -> ${cluster.next_action}`)
+      : ['- None']),
+    '',
     '## Queue State',
     `- Status: ${result.queue_state?.status || 'not_queued'}`,
     ...(result.queue_state?.item_id ? [`- Item: ${result.queue_state.item_id}`] : []),
@@ -200,6 +213,8 @@ export function writeGitHubPipelineLandingStatus({ result, stepSummaryPath = nul
       `switchman_queue_item_id=${result.queue_state?.item_id || ''}`,
       `switchman_queue_target_branch=${result.queue_state?.target_branch || 'main'}`,
       `switchman_queue_merged_commit=${result.queue_state?.merged_commit || ''}`,
+      `switchman_stale_cluster_count=${result.stale_clusters?.length || 0}`,
+      `switchman_stale_cluster_summary=${JSON.stringify((result.stale_clusters || []).map((cluster) => `${cluster.affected_pipeline_id || cluster.affected_task_ids[0]}:${cluster.invalidation_count}`).join(' | '))}`,
       `switchman_landing_next_action=${JSON.stringify(result.next_action)}`,
       `switchman_check_name=${JSON.stringify('Switchman Pipeline Landing')}`,
       `switchman_check_status=${checkInfo.status}`,

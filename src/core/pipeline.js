@@ -3,10 +3,11 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { basename, join } from 'path';
 
-import { completeLeaseTask, createTask, failLeaseTask, getTaskSpec, listAuditEvents, listLeases, listMergeQueue, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease, upsertTaskSpec } from './db.js';
+import { completeLeaseTask, createTask, failLeaseTask, getTaskSpec, listAuditEvents, listBoundaryValidationStates, listDependencyInvalidations, listLeases, listMergeQueue, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease, upsertTaskSpec } from './db.js';
 import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
+import { loadChangePolicy } from './policy.js';
 import { buildTaskSpec, planPipelineTasks } from './planner.js';
 import { getWorktreeBranch, gitBranchExists, gitMaterializeIntegrationBranch, gitPrepareIntegrationRecoveryWorktree, gitRemoveWorktree, gitRevParse, listGitWorktrees } from './git.js';
 
@@ -66,6 +67,172 @@ function nextPipelineTaskId(tasks, pipelineId) {
     .filter((value) => Number.isFinite(value))
     .reduce((max, value) => Math.max(max, value), 0) + 1;
   return `${pipelineId}-${String(nextNumber).padStart(2, '0')}`;
+}
+
+function rankEnforcement(level = 'none') {
+  return level === 'blocked' ? 2 : level === 'warn' ? 1 : 0;
+}
+
+function normalizeDependencyInvalidation(item) {
+  const details = item.details || {};
+  return {
+    ...item,
+    details,
+    stale_area: item.reason_type === 'subsystem_overlap'
+      ? `subsystem:${item.subsystem_tag}`
+      : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
+    summary: `${details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
+  };
+}
+
+function buildStaleClusters(invalidations = [], { pipelineId = null } = {}) {
+  const clusters = new Map();
+  for (const invalidation of invalidations.map(normalizeDependencyInvalidation)) {
+    if (pipelineId && invalidation.affected_pipeline_id !== pipelineId) continue;
+    const clusterKey = invalidation.affected_pipeline_id
+      ? `pipeline:${invalidation.affected_pipeline_id}`
+      : `task:${invalidation.affected_task_id}`;
+    if (!clusters.has(clusterKey)) {
+      clusters.set(clusterKey, {
+        key: clusterKey,
+        affected_pipeline_id: invalidation.affected_pipeline_id || null,
+        affected_task_ids: new Set(),
+        source_task_titles: new Set(),
+        source_worktrees: new Set(),
+        stale_areas: new Set(),
+        invalidations: [],
+        severity: 'warn',
+      });
+    }
+    const cluster = clusters.get(clusterKey);
+    cluster.invalidations.push(invalidation);
+    cluster.affected_task_ids.add(invalidation.affected_task_id);
+    if (invalidation.details?.source_task_title) cluster.source_task_titles.add(invalidation.details.source_task_title);
+    if (invalidation.source_worktree) cluster.source_worktrees.add(invalidation.source_worktree);
+    cluster.stale_areas.add(invalidation.stale_area);
+    if (invalidation.severity === 'blocked') cluster.severity = 'block';
+  }
+
+  return [...clusters.values()].map((cluster) => ({
+    key: cluster.key,
+    affected_pipeline_id: cluster.affected_pipeline_id,
+    affected_task_ids: [...cluster.affected_task_ids],
+    invalidation_count: cluster.invalidations.length,
+    source_task_titles: [...cluster.source_task_titles],
+    source_worktrees: [...cluster.source_worktrees],
+    stale_areas: [...cluster.stale_areas],
+    severity: cluster.severity,
+    invalidations: cluster.invalidations,
+    title: cluster.affected_pipeline_id
+      ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale dependency invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
+      : `${[...cluster.affected_task_ids][0]} has ${cluster.invalidations.length} stale dependency invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
+    detail: `${[...cluster.source_task_titles][0] || cluster.invalidations[0]?.source_task_id || 'unknown source'} (${[...cluster.stale_areas].join(', ')})`,
+    next_action: cluster.affected_pipeline_id
+      ? `switchman task retry-stale --pipeline ${cluster.affected_pipeline_id}`
+      : `switchman task retry ${[...cluster.affected_task_ids][0]}`,
+  })).sort((a, b) => b.invalidation_count - a.invalidation_count);
+}
+
+export function summarizePipelinePolicyState(status, changePolicy, boundaryValidations = []) {
+  const tasks = status.tasks || [];
+  const implementationTasks = tasks.filter((task) => task.task_spec?.task_type === 'implementation');
+  const completedTasks = tasks.filter((task) => task.status === 'done' && task.task_spec?.task_type);
+  const completedTaskTypes = new Set(completedTasks.map((task) => task.task_spec?.task_type).filter(Boolean));
+  const governedDomains = uniq(
+    implementationTasks
+      .flatMap((task) => task.task_spec?.subsystem_tags || [])
+      .filter((domain) => changePolicy.domain_rules?.[domain]),
+  );
+  const activeRules = governedDomains.map((domain) => ({
+    domain,
+    ...(changePolicy.domain_rules?.[domain] || { required_completed_task_types: [], enforcement: 'none', rationale: [] }),
+  }));
+  const requiredTaskTypes = uniq([
+    ...implementationTasks.flatMap((task) => task.task_spec?.validation_rules?.required_completed_task_types || []),
+    ...activeRules.flatMap((rule) => rule.required_completed_task_types || []),
+  ]);
+  const missingTaskTypes = uniq([
+    ...boundaryValidations.flatMap((validation) => validation.missing_task_types || []),
+    ...requiredTaskTypes.filter((taskType) => !completedTaskTypes.has(taskType)),
+  ]);
+  const satisfiedTaskTypes = requiredTaskTypes.filter((taskType) => completedTaskTypes.has(taskType));
+  const evidenceByTaskType = Object.fromEntries(
+    requiredTaskTypes.map((taskType) => [
+      taskType,
+      completedTasks
+        .filter((task) => task.task_spec?.task_type === taskType)
+        .map((task) => ({
+          task_id: task.id,
+          title: task.title,
+          task_type: task.task_spec?.task_type || null,
+          worktree: task.worktree || task.suggested_worktree || null,
+          artifact_path: task.task_spec?.primary_output_path || null,
+          subsystem_tags: task.task_spec?.subsystem_tags || [],
+        })),
+    ]),
+  );
+  const requirementStatus = requiredTaskTypes.map((taskType) => ({
+    task_type: taskType,
+    satisfied: satisfiedTaskTypes.includes(taskType),
+    evidence: evidenceByTaskType[taskType] || [],
+  }));
+  const rationale = uniq([
+    ...implementationTasks.flatMap((task) => task.task_spec?.validation_rules?.rationale || []),
+    ...activeRules.flatMap((rule) => rule.rationale || []),
+    ...boundaryValidations.flatMap((validation) => validation.rationale || validation.details?.rationale || []),
+  ]);
+  const enforcement = [...implementationTasks.map((task) => task.task_spec?.validation_rules?.enforcement || 'none'), ...activeRules.map((rule) => rule.enforcement || 'none')]
+    .reduce((highest, current) => rankEnforcement(current) > rankEnforcement(highest) ? current : highest, 'none');
+
+  return {
+    active: governedDomains.length > 0 || boundaryValidations.length > 0,
+    domains: governedDomains,
+    active_rules: activeRules,
+    required_task_types: requiredTaskTypes,
+    satisfied_task_types: satisfiedTaskTypes,
+    missing_task_types: missingTaskTypes,
+    requirement_status: requirementStatus,
+    evidence_by_task_type: evidenceByTaskType,
+    enforcement,
+    rationale,
+    blocked_validations: boundaryValidations.filter((validation) => validation.severity === 'blocked').length,
+    warned_validations: boundaryValidations.filter((validation) => validation.severity !== 'blocked').length,
+    summary: governedDomains.length === 0
+      ? 'No explicit governed-domain policy requirements are active for this pipeline.'
+      : missingTaskTypes.length > 0
+        ? `Governed domains ${governedDomains.join(', ')} still require ${missingTaskTypes.join(', ')} before landing.`
+        : `Governed domains ${governedDomains.join(', ')} have satisfied their current policy requirements.`,
+  };
+}
+
+function buildPipelinePolicyRemediationCommand(status, policyState) {
+  if (policyState.missing_task_types.length === 0) {
+    return `switchman pipeline status ${status.pipeline_id}`;
+  }
+
+  return `switchman pipeline review ${status.pipeline_id}`;
+}
+
+export async function evaluatePipelinePolicyGate(db, repoRoot, pipelineId) {
+  const status = getPipelineStatus(db, pipelineId);
+  const aiGate = await runAiMergeGate(db, repoRoot);
+  const changePolicy = loadChangePolicy(repoRoot);
+  const policyState = summarizePipelinePolicyState(status, changePolicy, aiGate.boundary_validations || []);
+  const blocked = policyState.active
+    && policyState.enforcement === 'blocked'
+    && policyState.missing_task_types.length > 0;
+  const nextAction = blocked ? buildPipelinePolicyRemediationCommand(status, policyState) : null;
+
+  return {
+    ok: !blocked,
+    pipeline_id: pipelineId,
+    reason_code: blocked ? 'policy_requirements_incomplete' : null,
+    summary: blocked
+      ? `Policy blocked landing for governed domains ${policyState.domains.join(', ')} because ${policyState.missing_task_types.join(', ')} is still required.`
+      : policyState.summary,
+    next_action: nextAction,
+    policy_state: policyState,
+  };
 }
 
 export function startPipeline(db, { title, description = null, priority = 5, pipelineId = null, maxTasks = 5 }) {
@@ -594,6 +761,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
   const report = await scanAllWorktrees(db, repoRoot);
   const aiGate = await runAiMergeGate(db, repoRoot);
+  const changePolicy = loadChangePolicy(repoRoot);
   const allLeases = listLeases(db);
   const ciGateOk = report.conflicts.length === 0
     && report.fileConflicts.length === 0
@@ -630,6 +798,8 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   }));
   const changedFiles = uniq(worktreeChanges.flatMap((entry) => entry.files));
   const subsystemTags = uniq(completedTasks.flatMap((task) => task.task_spec?.subsystem_tags || []));
+  const policyState = summarizePipelinePolicyState(status, changePolicy, aiGate.boundary_validations || []);
+  const staleClusters = buildStaleClusters(aiGate.dependency_invalidations || [], { pipelineId });
   const riskNotes = [];
   if (!ciGateOk) riskNotes.push('Repo gate is blocked by conflicts, unmanaged changes, or stale worktrees.');
   if (aiGate.status !== 'pass') riskNotes.push(aiGate.summary);
@@ -648,10 +818,15 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   const reviewerChecklist = [
     ciGateOk ? 'Repo gate passed' : 'Resolve repo gate failures before merge',
     aiGate.status === 'pass' ? 'AI merge gate passed' : `Review AI merge gate findings: ${aiGate.summary}`,
+    policyState.active
+      ? (policyState.missing_task_types.length > 0
+        ? `Complete policy requirements: ${policyState.missing_task_types.join(', ')}`
+        : `Confirm governed domains remain satisfied: ${policyState.domains.join(', ')}`)
+      : null,
     completedTasks.some((task) => task.task_spec?.risk_level === 'high')
       ? 'Confirm high-risk tasks have the expected tests and docs'
       : 'Review changed files and task outcomes',
-  ];
+  ].filter(Boolean);
   const prTitle = status.title.startsWith('Implement:')
     ? status.title.replace(/^Implement:\s*/i, '')
     : status.title;
@@ -664,6 +839,20 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     '## Validation',
     `- Repo gate: ${ciGateOk ? 'pass' : 'blocked'}`,
     `- AI merge gate: ${aiGate.status}`,
+    ...(policyState.active
+      ? [
+        `- Policy domains: ${policyState.domains.join(', ')}`,
+        `- Policy enforcement: ${policyState.enforcement}`,
+        `- Policy requirements: ${policyState.required_task_types.join(', ') || 'none'}`,
+        `- Policy evidence: ${policyState.satisfied_task_types.map((taskType) => `${taskType}:${(policyState.evidence_by_task_type?.[taskType] || []).map((entry) => entry.task_id).join(',')}`).join(' | ') || 'none'}`,
+        `- Policy missing: ${policyState.missing_task_types.join(', ') || 'none'}`,
+      ]
+      : []),
+    ...(staleClusters.length > 0
+      ? [
+        `- Stale clusters: ${staleClusters.map((cluster) => `${cluster.affected_pipeline_id || cluster.affected_task_ids[0]}:${cluster.invalidation_count}`).join(' | ')}`,
+      ]
+      : []),
     '',
     '## Reviewer Checklist',
     ...reviewerChecklist.map((item) => `- ${item}`),
@@ -703,6 +892,28 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     '## Reviewer Notes',
     ...reviewerChecklist.map((item) => `- ${item}`),
     '',
+    ...(policyState.active
+      ? [
+        '## Policy Requirements',
+        `- Domains: ${policyState.domains.join(', ')}`,
+        `- Enforcement: ${policyState.enforcement}`,
+        `- Required task types: ${policyState.required_task_types.join(', ') || 'none'}`,
+        `- Satisfied task types: ${policyState.satisfied_task_types.join(', ') || 'none'}`,
+        `- Missing task types: ${policyState.missing_task_types.join(', ') || 'none'}`,
+        ...policyState.requirement_status
+          .filter((requirement) => requirement.evidence.length > 0)
+          .map((requirement) => `- Evidence for ${requirement.task_type}: ${requirement.evidence.map((entry) => entry.artifact_path ? `${entry.task_id} (${entry.artifact_path})` : entry.task_id).join(', ')}`),
+        ...policyState.rationale.slice(0, 5).map((item) => `- ${item}`),
+        '',
+      ]
+      : []),
+    ...(staleClusters.length > 0
+      ? [
+        '## Stale Clusters',
+        ...staleClusters.map((cluster) => `- ${cluster.title}: ${cluster.detail} -> ${cluster.next_action}`),
+        '',
+      ]
+      : []),
     '## Provenance',
     ...provenance.map((entry) => `- ${entry.task_id}: ${entry.title} (${entry.task_type || 'unknown'}, ${entry.worktree || 'unassigned'}, lease ${entry.lease_id || 'none'})`),
     ...(provenance.length === 0 ? ['- No completed task provenance yet'] : []),
@@ -737,6 +948,8 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
       risk_notes: riskNotes,
       changed_files: changedFiles,
       subsystem_tags: subsystemTags,
+      policy_state: policyState,
+      stale_clusters: staleClusters,
     },
     counts: status.counts,
     ci_gate: {
@@ -748,6 +961,8 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
       status: aiGate.status,
       summary: aiGate.summary,
     },
+    policy_state: policyState,
+    stale_clusters: staleClusters,
     worktree_changes: worktreeChanges,
     markdown,
   };
@@ -755,6 +970,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
 
 export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
+  const staleClusters = buildStaleClusters(listDependencyInvalidations(db, { pipelineId }), { pipelineId });
   let landing;
   let landingError = null;
   try {
@@ -778,13 +994,15 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
     && status.counts.done > 0
     && !landingError
     && !landing.stale
+    && staleClusters.length === 0
     && !landing.last_failure;
-  const nextAction = landingError
-    ? `switchman pipeline status ${pipelineId}`
-    : landing.last_failure?.command
-      || (landing.stale
-        ? `switchman pipeline land ${pipelineId} --refresh`
-        : `switchman queue add --pipeline ${pipelineId}`);
+  const nextAction = staleClusters[0]?.next_action
+    || (landingError
+      ? `switchman pipeline status ${pipelineId}`
+      : landing.last_failure?.command
+        || (landing.stale
+          ? `switchman pipeline land ${pipelineId} --refresh`
+          : `switchman queue add --pipeline ${pipelineId}`));
   const queueItems = listMergeQueue(db)
     .filter((item) => item.source_pipeline_id === pipelineId)
     .sort((a, b) => Number.parseInt(b.id.slice(1), 10) - Number.parseInt(a.id.slice(1), 10));
@@ -834,6 +1052,8 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
       ]
       : landing.stale
         ? landing.stale_reasons.map((reason) => `- Stale: ${reason.summary}`)
+        : staleClusters.length > 0
+          ? staleClusters.map((cluster) => `- Stale cluster: ${cluster.title}`)
         : ['- Current and ready for queueing']),
     '',
     '## Recovery State',
@@ -844,6 +1064,14 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
         ...(recoveryState.resume_command ? [`- Resume: ${recoveryState.resume_command}`] : []),
       ]
       : ['- No active recovery worktree']),
+    '',
+    ...(staleClusters.length > 0
+      ? [
+        '## Stale Clusters',
+        ...staleClusters.map((cluster) => `- ${cluster.title}: ${cluster.detail} -> ${cluster.next_action}`),
+        '',
+      ]
+      : []),
     '',
     '## Queue State',
     `- Status: ${queueState.status}`,
@@ -863,6 +1091,7 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
     counts: status.counts,
     landing,
     recovery_state: recoveryState,
+    stale_clusters: staleClusters,
     queue_state: queueState,
     landing_error: landingError,
     next_action: queueState.next_action || nextAction,
@@ -1735,6 +1964,23 @@ export async function publishPipelinePr(
     outputDir = null,
   } = {},
 ) {
+  const policyGate = await evaluatePipelinePolicyGate(db, repoRoot, pipelineId);
+  if (!policyGate.ok) {
+    logAuditEvent(db, {
+      eventType: 'pipeline_pr_published',
+      status: 'denied',
+      reasonCode: policyGate.reason_code,
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        base_branch: baseBranch,
+        head_branch: headBranch,
+        policy_state: policyGate.policy_state,
+        next_action: policyGate.next_action,
+      }),
+    });
+    throw new Error(`${policyGate.summary} Next: ${policyGate.next_action}`);
+  }
+
   const bundle = await exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir);
   const resolvedLandingTarget = preparePipelineLandingTarget(db, repoRoot, pipelineId, {
     baseBranch,
@@ -1863,10 +2109,78 @@ export async function commentPipelinePr(
   };
 }
 
+export async function syncPipelinePr(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    prNumber,
+    ghCommand = 'gh',
+    outputDir = null,
+    updateExisting = true,
+  } = {},
+) {
+  const bundle = await exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir);
+  let comment = null;
+
+  if (prNumber) {
+    const args = [
+      'pr',
+      'comment',
+      String(prNumber),
+      '--body-file',
+      bundle.files.landing_summary_markdown,
+    ];
+
+    if (updateExisting) {
+      args.push('--edit-last', '--create-if-none');
+    }
+
+    const result = spawnSync(ghCommand, args, {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    });
+    const ok = !result.error && result.status === 0;
+    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+
+    logAuditEvent(db, {
+      eventType: 'pipeline_pr_synced',
+      status: ok ? 'allowed' : 'denied',
+      reasonCode: ok ? null : 'pr_sync_failed',
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        pr_number: String(prNumber),
+        gh_command: ghCommand,
+        update_existing: updateExisting,
+        body_file: bundle.files.landing_summary_markdown,
+        exit_code: result.status,
+        output: output.slice(0, 500),
+      }),
+    });
+
+    if (!ok) {
+      throw new Error(result.error?.message || output || `gh pr comment failed with status ${result.status}`);
+    }
+
+    comment = {
+      pr_number: String(prNumber),
+      output,
+      updated_existing: updateExisting,
+    };
+  }
+
+  return {
+    pipeline_id: pipelineId,
+    bundle,
+    comment,
+  };
+}
+
 export async function createPipelineFollowupTasks(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
   const report = await scanAllWorktrees(db, repoRoot);
   const aiGate = await runAiMergeGate(db, repoRoot);
+  const changePolicy = loadChangePolicy(repoRoot);
   const existingTitles = new Set(status.tasks.map((task) => task.title));
   const hasPlannedTestsTask = status.tasks.some((task) =>
     task.task_spec?.task_type === 'tests' && !task.title.startsWith('Add missing tests'),
@@ -1932,6 +2246,46 @@ export async function createPipelineFollowupTasks(db, repoRoot, pipelineId) {
       maybeCreateTask(
         `Add missing tests for ${worktree.worktree}`,
         `Source files without test updates: ${worktree.source_files.join(', ')}`,
+      );
+    }
+  }
+
+  const implementationTasks = status.tasks.filter((task) => task.task_spec?.task_type === 'implementation');
+  for (const task of implementationTasks) {
+    const taskDomains = task.task_spec?.subsystem_tags || [];
+    const requiredTaskTypes = new Set(task.task_spec?.validation_rules?.required_completed_task_types || []);
+    for (const domain of taskDomains) {
+      const rule = changePolicy.domain_rules?.[domain];
+      for (const taskType of rule?.required_completed_task_types || []) {
+        requiredTaskTypes.add(taskType);
+      }
+    }
+
+    const completedTypes = new Set(
+      status.tasks
+        .filter((candidate) => candidate.status === 'done')
+        .map((candidate) => candidate.task_spec?.task_type)
+        .filter(Boolean),
+    );
+
+    if (requiredTaskTypes.has('tests') && !completedTypes.has('tests')) {
+      maybeCreateTask(
+        `Add policy-required tests for ${task.title}`,
+        `Policy-triggered follow-up for ${task.id}. Domains: ${taskDomains.join(', ')}.`,
+      );
+    }
+
+    if (requiredTaskTypes.has('docs') && !completedTypes.has('docs')) {
+      maybeCreateTask(
+        `Add policy-required docs for ${task.title}`,
+        `Policy-triggered follow-up for ${task.id}. Domains: ${taskDomains.join(', ')}.`,
+      );
+    }
+
+    if (requiredTaskTypes.has('governance') && !completedTypes.has('governance')) {
+      maybeCreateTask(
+        `Add policy review for ${task.title}`,
+        `Policy-triggered governance follow-up for ${task.id}. Domains: ${taskDomains.join(', ')}.`,
       );
     }
   }
