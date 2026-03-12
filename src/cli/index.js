@@ -171,6 +171,14 @@ function renderMiniBar(items) {
   return items.map(({ label, value, color = chalk.white }) => `${color('■')} ${label}:${value}`).join(chalk.dim('  '));
 }
 
+function renderChip(label, value, color = chalk.white) {
+  return color(`[${label}:${value}]`);
+}
+
+function renderSignalStrip(signals) {
+  return signals.join(chalk.dim('  '));
+}
+
 function formatRelativePolicy(policy) {
   return `stale ${policy.stale_after_minutes}m • heartbeat ${policy.heartbeat_interval_seconds}s • auto-reap ${policy.reap_on_status_check ? 'on' : 'off'}`;
 }
@@ -815,13 +823,34 @@ function renderUnifiedStatusReport(report) {
   const badge = healthColor(healthLabel(report.health));
   const mergeColor = report.merge_readiness.ci_gate_ok ? chalk.green : chalk.red;
   const queueCounts = report.counts.queue;
+  const blockedCount = report.attention.filter((item) => item.severity === 'block').length;
+  const warningCount = report.attention.filter((item) => item.severity !== 'block').length;
+  const focusItem = blockedCount > 0
+    ? report.attention.find((item) => item.severity === 'block')
+    : warningCount > 0
+      ? report.attention.find((item) => item.severity !== 'block')
+      : report.next_up[0];
+  const focusLine = focusItem
+    ? ('title' in focusItem
+      ? `${focusItem.title}${focusItem.detail ? ` ${chalk.dim(`• ${focusItem.detail}`)}` : ''}`
+      : `${focusItem.title} ${chalk.dim(focusItem.id)}`)
+    : 'Nothing urgent. Safe to keep parallel work moving.';
+  const queueLoad = queueCounts.queued + queueCounts.retrying + queueCounts.merging + queueCounts.blocked;
+  const landingLabel = report.merge_readiness.ci_gate_ok ? 'ready' : 'hold';
 
   console.log('');
-  console.log(healthColor('='.repeat(64)));
-  console.log(`${badge} ${chalk.bold('switchman status')} ${chalk.dim('• user-centred repo overview')}`);
+  console.log(healthColor('='.repeat(72)));
+  console.log(`${badge} ${chalk.bold('switchman status')} ${chalk.dim('• mission control for parallel agents')}`);
   console.log(`${chalk.dim(report.repo_root)}`);
   console.log(`${chalk.dim(report.summary)}`);
-  console.log(healthColor('='.repeat(64)));
+  console.log(healthColor('='.repeat(72)));
+  console.log(renderSignalStrip([
+    renderChip('health', healthLabel(report.health), healthColor),
+    renderChip('blocked', blockedCount, blockedCount > 0 ? chalk.red : chalk.green),
+    renderChip('watch', warningCount, warningCount > 0 ? chalk.yellow : chalk.green),
+    renderChip('landing', landingLabel, mergeColor),
+    renderChip('queue', queueLoad, queueLoad > 0 ? chalk.blue : chalk.green),
+  ]));
   console.log(renderMetricRow([
     { label: 'tasks', value: `${report.counts.pending}/${report.counts.in_progress}/${report.counts.done}/${report.counts.failed}`, color: chalk.white },
     { label: 'leases', value: `${report.counts.active_leases} active`, color: chalk.blue },
@@ -835,13 +864,18 @@ function renderUnifiedStatusReport(report) {
     { label: 'merging', value: queueCounts.merging, color: chalk.blue },
     { label: 'merged', value: queueCounts.merged, color: chalk.green },
   ]));
+  console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
   console.log(chalk.dim(`policy: ${formatRelativePolicy(report.lease_policy)} • requeue on reap ${report.lease_policy.requeue_task_on_reap ? 'on' : 'off'}`));
 
   const runningLines = report.active_work.length > 0
     ? report.active_work.slice(0, 5).map((item) => {
-      const boundary = item.boundary_validation ? ` validation:${item.boundary_validation.status}` : '';
-      const stale = (item.dependency_invalidations?.length || 0) > 0 ? ` stale:${item.dependency_invalidations.length}` : '';
-      return `${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}${item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : ''}${chalk.dim(boundary)}${chalk.dim(stale)}`;
+      const boundary = item.boundary_validation
+        ? ` ${renderChip('validation', item.boundary_validation.status, item.boundary_validation.status === 'accepted' ? chalk.green : chalk.yellow)}`
+        : '';
+      const stale = (item.dependency_invalidations?.length || 0) > 0
+        ? ` ${renderChip('stale', item.dependency_invalidations.length, chalk.yellow)}`
+        : '';
+      return `${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}${item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : ''}${boundary}${stale}`;
     })
     : [chalk.dim('Nothing active right now.')];
 
@@ -850,7 +884,7 @@ function renderUnifiedStatusReport(report) {
 
   const blockedLines = blockedItems.length > 0
     ? blockedItems.slice(0, 4).flatMap((item) => {
-      const lines = [`${chalk.red('BLOCK')} ${item.title}`];
+      const lines = [`${renderChip('BLOCKED', item.kind || 'item', chalk.red)} ${item.title}`];
       if (item.detail) lines.push(`  ${chalk.dim(item.detail)}`);
       lines.push(`  ${chalk.yellow('next:')} ${item.next_step}`);
       if (item.command) lines.push(`  ${chalk.cyan('run:')} ${item.command}`);
@@ -860,8 +894,7 @@ function renderUnifiedStatusReport(report) {
 
   const warningLines = warningItems.length > 0
     ? warningItems.slice(0, 4).flatMap((item) => {
-      const tone = chalk.yellow('WARN ');
-      const lines = [`${tone} ${item.title}`];
+      const lines = [`${renderChip('WATCH', item.kind || 'item', chalk.yellow)} ${item.title}`];
       if (item.detail) lines.push(`  ${chalk.dim(item.detail)}`);
       lines.push(`  ${chalk.yellow('next:')} ${item.next_step}`);
       if (item.command) lines.push(`  ${chalk.cyan('run:')} ${item.command}`);
@@ -878,7 +911,7 @@ function renderUnifiedStatusReport(report) {
         .filter((entry) => ['blocked', 'retrying', 'merging'].includes(entry.status))
         .slice(0, 4)
         .flatMap((item) => {
-          const lines = [`${statusBadge(item.status)} ${item.id} ${item.source_type}:${item.source_ref} ${chalk.dim(`retries:${item.retry_count}/${item.max_retries}`)}`];
+          const lines = [`${renderChip(item.status.toUpperCase(), item.id, item.status === 'blocked' ? chalk.red : item.status === 'retrying' ? chalk.yellow : chalk.blue)} ${item.source_type}:${item.source_ref} ${chalk.dim(`retries:${item.retry_count}/${item.max_retries}`)}`];
           if (item.last_error_summary) lines.push(`  ${chalk.red('why:')} ${item.last_error_summary}`);
           if (item.next_action) lines.push(`  ${chalk.yellow('next:')} ${item.next_action}`);
           return lines;
@@ -888,7 +921,7 @@ function renderUnifiedStatusReport(report) {
 
   const nextActionLines = [
     ...(report.next_up.length > 0
-      ? report.next_up.map((task) => `[p${task.priority}] ${task.title} ${chalk.dim(task.id)}`)
+      ? report.next_up.map((task) => `${renderChip('NEXT', `p${task.priority}`, chalk.green)} ${task.title} ${chalk.dim(task.id)}`)
       : [chalk.dim('No pending tasks waiting right now.')]),
     '',
     ...report.suggested_commands.slice(0, 4).map((command) => `${chalk.cyan('$')} ${command}`),
