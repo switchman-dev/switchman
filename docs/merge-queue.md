@@ -35,7 +35,8 @@ When you queue a pipeline, Switchman resolves one landing branch for that pipeli
 
 - If the pipeline has exactly one implementation branch, that branch is used.
 - Otherwise, if all completed pipeline work points at one non-`main` branch, that branch is used.
-- If the pipeline still has unfinished tasks or spans multiple landing branches, Switchman stops and tells you to queue a branch or worktree explicitly.
+- If the pipeline is complete and spans multiple branches, Switchman creates `switchman/pipeline-landing/<pipelineId>` and queues that synthetic integration branch.
+- If the pipeline still has unfinished tasks, Switchman stops and tells you to finish the remaining work first.
 
 Useful options:
 - `--target <branch>` — target branch to land into (default: `main`)

@@ -4,8 +4,9 @@
  */
 
 import { execFileSync, execSync, spawnSync } from 'child_process';
-import { existsSync, realpathSync } from 'fs';
+import { existsSync, realpathSync, rmSync } from 'fs';
 import { join, relative, resolve, basename } from 'path';
+import { tmpdir } from 'os';
 import { filterIgnoredPaths } from './ignore.js';
 
 function normalizeFsPath(path) {
@@ -335,6 +336,65 @@ export function gitMergeBranchInto(repoRoot, baseBranch, topicBranch) {
   } finally {
     if (previousBranch && previousBranch !== baseBranch) {
       try { gitCheckout(repoRoot, previousBranch); } catch { /* no-op */ }
+    }
+  }
+}
+
+export function gitMaterializeIntegrationBranch(repoRoot, {
+  branch,
+  baseBranch = 'main',
+  mergeBranches = [],
+} = {}) {
+  const uniqueBranches = [...new Set(mergeBranches.filter(Boolean))].filter((candidate) => candidate !== branch);
+  const tempWorktreePath = join(tmpdir(), `switchman-landing-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+
+  try {
+    execFileSync('git', ['worktree', 'add', '--detach', tempWorktreePath, baseBranch], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    execFileSync('git', ['checkout', '-B', branch, baseBranch], {
+      cwd: tempWorktreePath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    for (const mergeBranch of uniqueBranches) {
+      execFileSync('git', ['merge', '--no-ff', '--no-edit', mergeBranch], {
+        cwd: tempWorktreePath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    }
+
+    return {
+      branch,
+      base_branch: baseBranch,
+      merged_branches: uniqueBranches,
+      head_commit: gitRevParse(tempWorktreePath, 'HEAD'),
+    };
+  } catch (err) {
+    try {
+      execFileSync('git', ['merge', '--abort'], {
+        cwd: tempWorktreePath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      // No active merge to abort.
+    }
+    throw err;
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', tempWorktreePath, '--force'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      rmSync(tempWorktreePath, { recursive: true, force: true });
     }
   }
 }

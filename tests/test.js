@@ -363,18 +363,31 @@ test('Merge queue add stores a queued worktree merge item', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Merge queue add validates pipeline landing semantics before enqueueing', () => {
+test('Merge queue add materializes a synthetic landing branch for multi-branch pipelines', () => {
   const repoDir = join(tmpdir(), `sw-queue-add-pipeline-validate-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
-  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agent1Path = join(tmpdir(), `sw-queue-add-pipeline-agent1-${Date.now()}`);
+  const agent2Path = join(tmpdir(), `sw-queue-add-pipeline-agent2-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-a "${agent1Path}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-b "${agent2Path}"`, { cwd: repoDir });
+  writeFileSync(join(agent1Path, 'a.txt'), 'A\n');
+  execSync('git add a.txt', { cwd: agent1Path });
+  execSync('git commit -m "pipeline a"', { cwd: agent1Path });
+  writeFileSync(join(agent2Path, 'b.txt'), 'B\n');
+  execSync('git add b.txt', { cwd: agent2Path });
+  execSync('git commit -m "pipeline b"', { cwd: agent2Path });
 
   const queueDb = initDb(repoDir);
   registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
-  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-add-pipeline-agent1-${Date.now()}`), branch: 'feature/pipeline-a' });
-  registerWorktree(queueDb, { name: 'agent2', path: join(tmpdir(), `sw-queue-add-pipeline-agent2-${Date.now()}`), branch: 'feature/pipeline-b' });
+  registerWorktree(queueDb, { name: 'agent1', path: agent1Path, branch: 'feature/pipeline-a' });
+  registerWorktree(queueDb, { name: 'agent2', path: agent2Path, branch: 'feature/pipeline-b' });
   const docsA = createTask(queueDb, { id: 'pipe-queue-add-01', title: 'Docs task A' });
   upsertTaskSpec(queueDb, docsA, { pipeline_id: 'pipe-queue-add', task_type: 'docs' });
   const docsB = createTask(queueDb, { id: 'pipe-queue-add-02', title: 'Docs task B' });
@@ -385,30 +398,83 @@ test('Merge queue add validates pipeline landing semantics before enqueueing', (
   completeTask(queueDb, docsB);
   queueDb.close();
 
-  let error = null;
-  try {
-    execFileSync(process.execPath, [
-      join(process.cwd(), 'src/cli/index.js'),
-      'queue',
-      'add',
-      '--pipeline',
-      'pipe-queue-add',
-    ], {
-      cwd: repoDir,
-      encoding: 'utf8',
-      stdio: 'pipe',
-    });
-  } catch (err) {
-    error = err;
-  }
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'add',
+    '--pipeline',
+    'pipe-queue-add',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    stdio: 'pipe',
+  });
 
   const verifyDb = openDb(repoDir);
   const queueItems = listMergeQueue(verifyDb);
+  const syntheticBranch = 'switchman/pipeline-landing/pipe-queue-add';
 
-  assert(error?.status === 1, 'queue add exits non-zero when a pipeline has no single landing branch');
-  assert(String(error?.stderr || '').includes('spans multiple branches'), 'queue add explains why the pipeline cannot be inferred');
-  assert(queueItems.length === 0, 'queue add does not enqueue an invalid pipeline landing item');
+  assert(output.includes('Queued'), 'queue add succeeds for a completed multi-branch pipeline');
+  assert(queueItems.length === 1, 'queue add enqueues the synthesized landing branch');
+  assert(queueItems[0].source_ref === syntheticBranch, 'queue add targets the synthetic landing branch');
+  assert(execSync(`git branch --list "${syntheticBranch}"`, { cwd: repoDir, encoding: 'utf8' }).includes(syntheticBranch), 'queue add creates the synthetic landing branch in git');
   verifyDb.close();
+  execSync(`git worktree remove "${agent1Path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${agent2Path}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Explain queue reports the blocker, resolved source, and next action', () => {
+  const repoDir = join(tmpdir(), `sw-explain-queue-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  const item = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/missing-branch',
+    targetBranch: 'main',
+  });
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'queue',
+    item.id,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'queue',
+    item.id,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(textOutput.includes(`Queue item ${item.id}`), 'Explain queue prints the queue item header');
+  assert(textOutput.includes('feature/missing-branch'), 'Explain queue prints the source ref');
+  assert(textOutput.includes('next:'), 'Explain queue prints a concrete next action');
+  assert(jsonOutput.item.id === item.id, 'Explain queue JSON returns the queue item');
+  assert(jsonOutput.next_action.includes('switchman queue retry'), 'Explain queue JSON carries the next action');
+  queueDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -422,10 +488,21 @@ test('Merge queue pipeline resolution requires a completed pipeline and prefers 
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init"', { cwd: repoDir });
 
+  const agent1Path = join(tmpdir(), `sw-queue-pipeline-agent1-${Date.now()}`);
+  const agent2Path = join(tmpdir(), `sw-queue-pipeline-agent2-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-impl "${agent1Path}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-docs "${agent2Path}"`, { cwd: repoDir });
+  writeFileSync(join(agent1Path, 'impl.txt'), 'impl\n');
+  execSync('git add impl.txt', { cwd: agent1Path });
+  execSync('git commit -m "impl branch"', { cwd: agent1Path });
+  writeFileSync(join(agent2Path, 'docs.txt'), 'docs\n');
+  execSync('git add docs.txt', { cwd: agent2Path });
+  execSync('git commit -m "docs branch"', { cwd: agent2Path });
+
   const queueDb = initDb(repoDir);
   registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
-  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-pipeline-agent1-${Date.now()}`), branch: 'feature/pipeline-impl' });
-  registerWorktree(queueDb, { name: 'agent2', path: join(tmpdir(), `sw-queue-pipeline-agent2-${Date.now()}`), branch: 'feature/pipeline-docs' });
+  registerWorktree(queueDb, { name: 'agent1', path: agent1Path, branch: 'feature/pipeline-impl' });
+  registerWorktree(queueDb, { name: 'agent2', path: agent2Path, branch: 'feature/pipeline-docs' });
 
   const incompleteA = createTask(queueDb, { id: 'pipe-unsafe-01', title: 'Pipeline task A' });
   upsertTaskSpec(queueDb, incompleteA, { pipeline_id: 'pipe-unsafe', task_type: 'implementation' });
@@ -455,24 +532,39 @@ test('Merge queue pipeline resolution requires a completed pipeline and prefers 
   });
 
   assert(String(incompleteError?.message || '').includes('not ready to queue'), 'Pipeline queueing rejects incomplete pipelines');
-  assert(resolved.branch === 'feature/pipeline-impl', 'Pipeline queueing prefers the implementation branch when one is available');
-  assert(resolved.worktree === 'agent1', 'Pipeline queueing returns the implementation worktree as the landing source');
+  assert(resolved.branch === 'switchman/pipeline-landing/pipe-unsafe', 'Completed multi-branch pipelines resolve to a synthetic landing branch');
+  assert(execSync(`git branch --list "${resolved.branch}"`, { cwd: repoDir, encoding: 'utf8' }).includes(resolved.branch), 'Pipeline queueing materializes the completed landing branch in git');
   queueDb.close();
+  execSync(`git worktree remove "${agent1Path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${agent2Path}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Merge queue pipeline resolution rejects ambiguous pipelines with no single landing branch', () => {
+test('Merge queue pipeline resolution materializes a synthetic landing branch when needed', () => {
   const repoDir = join(tmpdir(), `sw-queue-pipeline-ambiguous-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
-  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agent1Path = join(tmpdir(), `sw-queue-pipeline-ambiguous-agent1-${Date.now()}`);
+  const agent2Path = join(tmpdir(), `sw-queue-pipeline-ambiguous-agent2-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-docs-a "${agent1Path}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-docs-b "${agent2Path}"`, { cwd: repoDir });
+  writeFileSync(join(agent1Path, 'docs-a.md'), 'A\n');
+  execSync('git add docs-a.md', { cwd: agent1Path });
+  execSync('git commit -m "docs a"', { cwd: agent1Path });
+  writeFileSync(join(agent2Path, 'docs-b.md'), 'B\n');
+  execSync('git add docs-b.md', { cwd: agent2Path });
+  execSync('git commit -m "docs b"', { cwd: agent2Path });
 
   const queueDb = initDb(repoDir);
   registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
-  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-pipeline-ambiguous-agent1-${Date.now()}`), branch: 'feature/pipeline-docs-a' });
-  registerWorktree(queueDb, { name: 'agent2', path: join(tmpdir(), `sw-queue-pipeline-ambiguous-agent2-${Date.now()}`), branch: 'feature/pipeline-docs-b' });
+  registerWorktree(queueDb, { name: 'agent1', path: agent1Path, branch: 'feature/pipeline-docs-a' });
+  registerWorktree(queueDb, { name: 'agent2', path: agent2Path, branch: 'feature/pipeline-docs-b' });
 
   const docsA = createTask(queueDb, { id: 'pipe-ambiguous-01', title: 'Docs task A' });
   upsertTaskSpec(queueDb, docsA, { pipeline_id: 'pipe-ambiguous', task_type: 'docs' });
@@ -483,19 +575,17 @@ test('Merge queue pipeline resolution rejects ambiguous pipelines with no single
   assignTask(queueDb, docsB, 'agent2');
   completeTask(queueDb, docsB);
 
-  let ambiguousError = null;
-  try {
-    resolveQueueSource(queueDb, repoDir, {
-      source_type: 'pipeline',
-      source_ref: 'pipe-ambiguous',
-      source_pipeline_id: 'pipe-ambiguous',
-    });
-  } catch (err) {
-    ambiguousError = err;
-  }
+  const resolved = resolveQueueSource(queueDb, repoDir, {
+    source_type: 'pipeline',
+    source_ref: 'pipe-ambiguous',
+    source_pipeline_id: 'pipe-ambiguous',
+  });
 
-  assert(String(ambiguousError?.message || '').includes('spans multiple branches'), 'Pipeline queueing rejects ambiguous pipelines without a single landing branch');
+  assert(resolved.branch === 'switchman/pipeline-landing/pipe-ambiguous', 'Pipeline queueing resolves to a synthetic landing branch when branches diverge');
+  assert(execSync(`git branch --list "${resolved.branch}"`, { cwd: repoDir, encoding: 'utf8' }).includes(resolved.branch), 'Synthetic landing branch is created in git');
   queueDb.close();
+  execSync(`git worktree remove "${agent1Path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${agent2Path}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -1109,6 +1199,49 @@ test('Fix 3d: claim paths are normalized before conflict checks and storage', ()
   assert(conflicts.length === 1, 'Conflict checks normalize equivalent file paths');
   assert(claims[0].file_path === 'src/shared.js', 'Stored claim paths are canonicalized');
   canonicalDb.close();
+});
+
+test('Explain claim reports the current owner and the next safe move', () => {
+  const repoDir = join(tmpdir(), `sw-explain-claim-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'agent1', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Own auth path' });
+  assignTask(db, taskId, 'agent1');
+  claimFiles(db, taskId, 'agent1', ['src/auth/login.js']);
+  db.close();
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'claim',
+    './src/../src/auth/login.js',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'claim',
+    'src/auth/login.js',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(textOutput.includes('Claim status for src/auth/login.js'), 'Explain claim normalizes the displayed path');
+  assert(textOutput.includes('agent1'), 'Explain claim prints the owning worktree');
+  assert(textOutput.includes('next:'), 'Explain claim prints the next safe action');
+  assert(jsonOutput.claims.length === 1, 'Explain claim JSON returns the explicit owner');
+  assert(jsonOutput.claims[0].task_id === taskId, 'Explain claim JSON identifies the owning task');
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Lease heartbeat refreshes the active session timestamp', () => {
@@ -3691,6 +3824,139 @@ printf 'https://github.com/example/repo/pull/456\n'
   assert(result.head_branch === 'switchman/agent1', 'Pipeline publish infers the implementation worktree branch when multiple worktree branches exist');
   assert(invocation.args.includes('switchman/agent1'), 'Pipeline publish passes the inferred implementation branch to gh');
   pipelineDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fa: pipeline land materializes a synthetic integration branch for multi-branch pipelines', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-land-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-land-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-land-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-land-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-land-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'a.txt'), 'A\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'b.txt'), 'B\n');
+  execSync('git add b.txt', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-land-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-land-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const branchFiles = execSync(`git ls-tree --name-only -r ${result.branch}`, { cwd: repoDir, encoding: 'utf8' });
+  assert(result.synthetic, 'Pipeline land reports that it created a synthetic branch');
+  assert(result.branch === 'switchman/pipeline-landing/pipe-land', 'Pipeline land uses the default synthetic branch name');
+  assert(branchFiles.includes('a.txt'), 'Synthetic landing branch includes the first component branch changes');
+  assert(branchFiles.includes('b.txt'), 'Synthetic landing branch includes the second component branch changes');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28fb: pipeline publish materializes a synthetic landing branch when multiple completed branches exist', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-publish-synth-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-publish-synth-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-publish-synth-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/publish-synth-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/publish-synth-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'a.txt'), 'A\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'b.txt'), 'B\n');
+  execSync('git add b.txt', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/publish-synth-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/publish-synth-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-publish-synth-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-publish-synth', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-publish-synth-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-publish-synth', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  const ghCapturePath = join(repoDir, 'gh-invocation-synth.json');
+  const fakeGhPath = join(repoDir, 'fake-gh-synth');
+  writeFileSync(fakeGhPath, `#!/bin/sh
+printf '%s\n' "$@" > /dev/null
+printf '{"args":[' > ${JSON.stringify(ghCapturePath)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(ghCapturePath)}; fi
+  first=0
+  printf '%s' "$(printf '%s' "$arg" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/$/\"/; s/^/\"/')" >> ${JSON.stringify(ghCapturePath)}
+done
+printf ']}' >> ${JSON.stringify(ghCapturePath)}
+printf 'https://github.com/example/repo/pull/789\n'
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'publish',
+    'pipe-publish-synth',
+    '--base',
+    'main',
+    '--gh-command',
+    fakeGhPath,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const invocation = JSON.parse(readFileSync(ghCapturePath, 'utf8'));
+  assert(result.head_branch === 'switchman/pipeline-landing/pipe-publish-synth', 'Pipeline publish uses the synthetic landing branch when multiple completed branches exist');
+  assert(result.landing_strategy === 'synthetic_integration_branch', 'Pipeline publish reports the synthetic landing strategy');
+  assert(invocation.args.includes('switchman/pipeline-landing/pipe-publish-synth'), 'Pipeline publish passes the synthetic branch to gh');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
 });
 

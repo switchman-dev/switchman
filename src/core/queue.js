@@ -1,7 +1,7 @@
 import { getMergeQueueItem, listMergeQueue, listWorktrees, markMergeQueueState, startMergeQueueItem } from './db.js';
 import { gitBranchExists, gitMergeBranchInto, gitRebaseOnto } from './git.js';
 import { runAiMergeGate } from './merge-gate.js';
-import { getPipelineStatus, resolvePipelineLandingTarget } from './pipeline.js';
+import { preparePipelineLandingTarget } from './pipeline.js';
 import { scanAllWorktrees } from './detector.js';
 
 function describeQueueError(err) {
@@ -110,8 +110,8 @@ export function resolveQueueSource(db, repoRoot, item) {
 
   if (item.source_type === 'pipeline') {
     const pipelineId = item.source_pipeline_id || item.source_ref;
-    const pipelineStatus = getPipelineStatus(db, pipelineId);
-    const landingTarget = resolvePipelineLandingTarget(db, repoRoot, pipelineStatus, {
+    const landingTarget = preparePipelineLandingTarget(db, repoRoot, pipelineId, {
+      baseBranch: item.target_branch || 'main',
       requireCompleted: true,
       allowCurrentBranchFallback: false,
     });

@@ -7,7 +7,7 @@ import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
 import { buildTaskSpec, planPipelineTasks } from './planner.js';
-import { getWorktreeBranch } from './git.js';
+import { getWorktreeBranch, gitMaterializeIntegrationBranch } from './git.js';
 
 function sleepSync(ms) {
   if (ms > 0) {
@@ -794,6 +794,43 @@ function resolvePipelineBranchForTask(worktreesByName, task) {
   return branch && branch !== 'main' && branch !== 'unknown' ? branch : null;
 }
 
+function collectPipelineLandingCandidates(db, pipelineStatus) {
+  const worktreesByName = new Map(listWorktrees(db).map((worktree) => [worktree.name, worktree]));
+  const orderedBranches = [];
+  const branchToWorktree = new Map();
+
+  for (const task of pipelineStatus.tasks) {
+    const branch = resolvePipelineBranchForTask(worktreesByName, task);
+    if (!branch) continue;
+    if (!branchToWorktree.has(branch) && task.worktree) {
+      branchToWorktree.set(branch, task.worktree);
+    }
+    if (!orderedBranches.includes(branch)) {
+      orderedBranches.push(branch);
+    }
+  }
+
+  const implementationBranches = uniq(
+    pipelineStatus.tasks
+      .filter((task) => task.task_spec?.task_type === 'implementation')
+      .map((task) => resolvePipelineBranchForTask(worktreesByName, task))
+      .filter(Boolean),
+  );
+  const candidateBranches = uniq(orderedBranches);
+  const prioritizedBranches = [
+    ...implementationBranches,
+    ...candidateBranches.filter((branch) => !implementationBranches.includes(branch)),
+  ];
+
+  return {
+    implementationBranches,
+    candidateBranches,
+    prioritizedBranches,
+    branchToWorktree,
+    worktreesByName,
+  };
+}
+
 export function resolvePipelineLandingTarget(
   db,
   repoRoot,
@@ -819,33 +856,16 @@ export function resolvePipelineLandingTarget(
     }
   }
 
-  const worktreesByName = new Map(listWorktrees(db).map((worktree) => [worktree.name, worktree]));
-
-  const implementationBranches = uniq(
-    pipelineStatus.tasks
-      .filter((task) => task.task_spec?.task_type === 'implementation')
-      .map((task) => resolvePipelineBranchForTask(worktreesByName, task))
-      .filter(Boolean),
-  );
+  const { implementationBranches, candidateBranches, branchToWorktree } = collectPipelineLandingCandidates(db, pipelineStatus);
   if (implementationBranches.length === 1) {
     const branch = implementationBranches[0];
-    const worktree = pipelineStatus.tasks.find((task) =>
-      resolvePipelineBranchForTask(worktreesByName, task) === branch,
-    )?.worktree || null;
+    const worktree = branchToWorktree.get(branch) || null;
     return { branch, worktree, strategy: 'implementation_branch' };
   }
 
-  const candidateBranches = uniq(
-    pipelineStatus.tasks
-      .map((task) => resolvePipelineBranchForTask(worktreesByName, task))
-      .filter(Boolean),
-  );
-
   if (candidateBranches.length === 1) {
     const branch = candidateBranches[0];
-    const worktree = pipelineStatus.tasks.find((task) =>
-      resolvePipelineBranchForTask(worktreesByName, task) === branch,
-    )?.worktree || null;
+    const worktree = branchToWorktree.get(branch) || null;
     return { branch, worktree, strategy: 'single_branch' };
   }
 
@@ -857,6 +877,123 @@ export function resolvePipelineLandingTarget(
   }
 
   throw new Error(`Pipeline ${pipelineStatus.pipeline_id} spans multiple branches (${candidateBranches.join(', ') || 'none inferred'}). Queue a branch or worktree explicitly.`);
+}
+
+export function materializePipelineLandingBranch(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    baseBranch = 'main',
+    landingBranch = null,
+    requireCompleted = true,
+  } = {},
+) {
+  const pipelineStatus = getPipelineStatus(db, pipelineId);
+  if (requireCompleted) {
+    const unfinishedTasks = pipelineStatus.tasks.filter((task) => task.status !== 'done');
+    if (unfinishedTasks.length > 0) {
+      throw new Error(`Pipeline ${pipelineId} is not ready to land. Complete remaining tasks first: ${unfinishedTasks.map((task) => task.id).join(', ')}.`);
+    }
+  }
+
+  const { candidateBranches, prioritizedBranches, branchToWorktree } = collectPipelineLandingCandidates(db, pipelineStatus);
+  if (candidateBranches.length === 0) {
+    throw new Error(`Pipeline ${pipelineId} has no landed worktree branch to materialize.`);
+  }
+
+  if (candidateBranches.length === 1) {
+    const branch = candidateBranches[0];
+    return {
+      pipeline_id: pipelineId,
+      branch,
+      base_branch: baseBranch,
+      worktree: branchToWorktree.get(branch) || null,
+      synthetic: false,
+      component_branches: [branch],
+      strategy: 'single_branch',
+      head_commit: null,
+    };
+  }
+
+  const resolvedLandingBranch = landingBranch || `switchman/pipeline-landing/${pipelineId}`;
+  const materialized = gitMaterializeIntegrationBranch(repoRoot, {
+    branch: resolvedLandingBranch,
+    baseBranch,
+    mergeBranches: prioritizedBranches,
+  });
+
+  logAuditEvent(db, {
+    eventType: 'pipeline_landing_branch_materialized',
+    status: 'allowed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: resolvedLandingBranch,
+      base_branch: baseBranch,
+      component_branches: prioritizedBranches,
+      head_commit: materialized.head_commit,
+    }),
+  });
+
+  return {
+    pipeline_id: pipelineId,
+    branch: resolvedLandingBranch,
+    base_branch: baseBranch,
+    worktree: null,
+    synthetic: true,
+    component_branches: prioritizedBranches,
+    strategy: 'synthetic_integration_branch',
+    head_commit: materialized.head_commit,
+  };
+}
+
+export function preparePipelineLandingTarget(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    baseBranch = 'main',
+    explicitHeadBranch = null,
+    requireCompleted = false,
+    allowCurrentBranchFallback = true,
+    landingBranch = null,
+  } = {},
+) {
+  const pipelineStatus = getPipelineStatus(db, pipelineId);
+  const completedPipeline = pipelineStatus.tasks.length > 0 && pipelineStatus.tasks.every((task) => task.status === 'done');
+  const { candidateBranches } = collectPipelineLandingCandidates(db, pipelineStatus);
+
+  if (!explicitHeadBranch && completedPipeline && candidateBranches.length > 1) {
+    return materializePipelineLandingBranch(db, repoRoot, pipelineId, {
+      baseBranch,
+      landingBranch,
+      requireCompleted: true,
+    });
+  }
+
+  try {
+    const resolved = resolvePipelineLandingTarget(db, repoRoot, pipelineStatus, {
+      explicitHeadBranch,
+      requireCompleted,
+      allowCurrentBranchFallback,
+    });
+    return {
+      pipeline_id: pipelineId,
+      ...resolved,
+      synthetic: false,
+      component_branches: [resolved.branch],
+      head_commit: null,
+    };
+  } catch (err) {
+    if (!String(err.message || '').includes('spans multiple branches')) {
+      throw err;
+    }
+    return materializePipelineLandingBranch(db, repoRoot, pipelineId, {
+      baseBranch,
+      landingBranch,
+      requireCompleted: true,
+    });
+  }
 }
 
 export async function publishPipelinePr(
@@ -872,8 +1009,8 @@ export async function publishPipelinePr(
   } = {},
 ) {
   const bundle = await exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir);
-  const status = getPipelineStatus(db, pipelineId);
-  const resolvedLandingTarget = resolvePipelineLandingTarget(db, repoRoot, status, {
+  const resolvedLandingTarget = preparePipelineLandingTarget(db, repoRoot, pipelineId, {
+    baseBranch,
     explicitHeadBranch: headBranch,
     requireCompleted: false,
     allowCurrentBranchFallback: true,
@@ -928,6 +1065,7 @@ export async function publishPipelinePr(
     pipeline_id: pipelineId,
     base_branch: baseBranch,
     head_branch: resolvedHeadBranch,
+    landing_strategy: resolvedLandingTarget.strategy,
     draft,
     bundle,
     output,

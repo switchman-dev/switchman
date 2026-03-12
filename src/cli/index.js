@@ -20,10 +20,11 @@ import { program } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { existsSync } from 'fs';
-import { join } from 'path';
+import { join, posix } from 'path';
 import { execSync, spawn } from 'child_process';
 
 import { findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.js';
+import { matchesPathPatterns } from '../core/ignore.js';
 import {
   initDb, openDb,
   DEFAULT_STALE_LEASE_MINUTES,
@@ -39,10 +40,10 @@ import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcp
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
-import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, publishPipelinePr, resolvePipelineLandingTarget, runPipeline, startPipeline } from '../core/pipeline.js';
+import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, materializePipelineLandingBranch, preparePipelineLandingTarget, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus } from '../core/ci.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
-import { buildQueueStatusSummary, runMergeQueue } from '../core/queue.js';
+import { buildQueueStatusSummary, resolveQueueSource, runMergeQueue } from '../core/queue.js';
 import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../core/policy.js';
 import {
   captureTelemetryEvent,
@@ -232,6 +233,95 @@ function printErrorWithNext(message, nextCommand = null) {
   if (nextCommand) {
     console.error(`${chalk.yellow('next:')} ${nextCommand}`);
   }
+}
+
+function normalizeCliRepoPath(targetPath) {
+  const rawPath = String(targetPath || '').replace(/\\/g, '/').trim();
+  const normalized = posix.normalize(rawPath.replace(/^\.\/+/, ''));
+  if (
+    normalized === '' ||
+    normalized === '.' ||
+    normalized === '..' ||
+    normalized.startsWith('../') ||
+    rawPath.startsWith('/') ||
+    /^[A-Za-z]:\//.test(rawPath)
+  ) {
+    throw new Error('Target path must point to a file inside the repository.');
+  }
+  return normalized;
+}
+
+function buildQueueExplainReport(db, repoRoot, itemId) {
+  const item = getMergeQueueItem(db, itemId);
+  if (!item) {
+    throw new Error(`Queue item ${itemId} does not exist.`);
+  }
+
+  let resolved = null;
+  let resolutionError = null;
+  try {
+    resolved = resolveQueueSource(db, repoRoot, item);
+  } catch (err) {
+    resolutionError = err.message;
+  }
+
+  const recentEvents = listMergeQueueEvents(db, item.id, { limit: 5 });
+  return {
+    item,
+    resolved_source: resolved,
+    resolution_error: resolutionError,
+    next_action: item.next_action || inferQueueExplainNextAction(item, resolved, resolutionError),
+    recent_events: recentEvents,
+  };
+}
+
+function inferQueueExplainNextAction(item, resolved, resolutionError) {
+  if (item.status === 'blocked' && item.next_action) return item.next_action;
+  if (resolutionError) return 'Fix the source resolution issue, then re-run `switchman explain queue <itemId>` or queue a branch/worktree explicitly.';
+  if (item.status === 'queued' || item.status === 'retrying') return 'Run `switchman queue run` to continue landing queued work.';
+  if (item.status === 'merged') return 'No action needed.';
+  if (resolved?.pipeline_id) return `Run \`switchman pipeline status ${resolved.pipeline_id}\` to inspect the pipeline state.`;
+  return 'Run `switchman queue status` to inspect the landing queue.';
+}
+
+function buildClaimExplainReport(db, filePath) {
+  const normalizedPath = normalizeCliRepoPath(filePath);
+  const activeClaims = getActiveFileClaims(db);
+  const directClaims = activeClaims.filter((claim) => claim.file_path === normalizedPath);
+  const activeLeases = listLeases(db, 'active');
+  const scopeOwners = activeLeases.flatMap((lease) => {
+    const taskSpec = getTaskSpec(db, lease.task_id);
+    const patterns = taskSpec?.allowed_paths || [];
+    if (!patterns.some((pattern) => matchesPathPatterns(normalizedPath, [pattern]))) {
+      return [];
+    }
+    return [{
+      lease_id: lease.id,
+      task_id: lease.task_id,
+      task_title: lease.task_title,
+      worktree: lease.worktree,
+      agent: lease.agent || null,
+      ownership_type: 'scope',
+      allowed_paths: patterns,
+    }];
+  });
+
+  return {
+    file_path: normalizedPath,
+    claims: directClaims.map((claim) => ({
+      lease_id: claim.lease_id,
+      task_id: claim.task_id,
+      task_title: claim.task_title,
+      task_status: claim.task_status,
+      worktree: claim.worktree,
+      agent: claim.agent || null,
+      ownership_type: 'claim',
+      heartbeat_at: claim.lease_heartbeat_at || null,
+    })),
+    scope_owners: scopeOwners.filter((owner, index, all) =>
+      all.findIndex((candidate) => candidate.lease_id === owner.lease_id) === index,
+    ),
+  };
 }
 
 async function maybeCaptureTelemetry(event, properties = {}, { homeDir = null } = {}) {
@@ -1588,7 +1678,7 @@ Examples:
 Pipeline landing rule:
   switchman queue add --pipeline <id>
   lands the pipeline's inferred landing branch.
-  If Switchman cannot infer exactly one branch, queue the branch or worktree explicitly instead.
+  If completed work spans multiple branches, Switchman creates one synthetic landing branch first.
 `)
   .action((branch, opts) => {
     const repoRoot = getRepo();
@@ -1610,14 +1700,14 @@ Pipeline landing rule:
           submittedBy: opts.submittedBy || null,
         };
       } else if (opts.pipeline) {
-        const pipelineStatus = getPipelineStatus(db, opts.pipeline);
-        const landingTarget = resolvePipelineLandingTarget(db, repoRoot, pipelineStatus, {
+        const landingTarget = preparePipelineLandingTarget(db, repoRoot, opts.pipeline, {
+          baseBranch: opts.target || 'main',
           requireCompleted: true,
           allowCurrentBranchFallback: false,
         });
         payload = {
           sourceType: 'pipeline',
-          sourceRef: opts.pipeline,
+          sourceRef: landingTarget.branch,
           sourcePipelineId: opts.pipeline,
           sourceWorktree: landingTarget.worktree || null,
           targetBranch: opts.target,
@@ -1929,6 +2019,114 @@ queueCmd
     console.log(`${chalk.green('✓')} Removed ${chalk.cyan(item.id)} from the merge queue`);
   });
 
+// ── explain ───────────────────────────────────────────────────────────────────
+
+const explainCmd = program.command('explain').description('Explain why Switchman blocked something and what to do next');
+explainCmd.addHelpText('after', `
+Examples:
+  switchman explain queue mq-123
+  switchman explain claim src/auth/login.js
+`);
+
+explainCmd
+  .command('queue <itemId>')
+  .description('Explain one landing-queue item in plain English')
+  .option('--json', 'Output raw JSON')
+  .action((itemId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const report = buildQueueExplainReport(db, repoRoot, itemId);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold(`Queue item ${report.item.id}`));
+      console.log(`  ${chalk.dim('status:')} ${statusBadge(report.item.status)}`.trim());
+      console.log(`  ${chalk.dim('source:')} ${report.item.source_type} ${report.item.source_ref}`);
+      console.log(`  ${chalk.dim('target:')} ${report.item.target_branch}`);
+      if (report.resolved_source) {
+        console.log(`  ${chalk.dim('resolved branch:')} ${chalk.cyan(report.resolved_source.branch)}`);
+        if (report.resolved_source.worktree) {
+          console.log(`  ${chalk.dim('resolved worktree:')} ${chalk.cyan(report.resolved_source.worktree)}`);
+        }
+      }
+      if (report.resolution_error) {
+        console.log(`  ${chalk.red('why:')} ${report.resolution_error}`);
+      } else if (report.item.last_error_summary) {
+        console.log(`  ${chalk.red('why:')} ${report.item.last_error_summary}`);
+      } else {
+        console.log(`  ${chalk.dim('why:')} waiting to land`);
+      }
+      console.log(`  ${chalk.yellow('next:')} ${report.next_action}`);
+      if (report.recent_events.length > 0) {
+        console.log(chalk.bold('\nRecent events'));
+        for (const event of report.recent_events) {
+          console.log(`  ${chalk.dim(event.created_at)} ${event.event_type}${event.status ? ` ${statusBadge(event.status).trim()}` : ''}`);
+        }
+      }
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, 'switchman queue status');
+      process.exitCode = 1;
+    }
+  });
+
+explainCmd
+  .command('claim <path>')
+  .description('Explain who currently owns a file path')
+  .option('--json', 'Output raw JSON')
+  .action((filePath, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const report = buildClaimExplainReport(db, filePath);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold(`Claim status for ${report.file_path}`));
+      if (report.claims.length === 0 && report.scope_owners.length === 0) {
+        console.log(`  ${chalk.green('status:')} unowned`);
+        console.log(`  ${chalk.yellow('next:')} switchman claim <taskId> <workspace> ${report.file_path}`);
+        return;
+      }
+
+      if (report.claims.length > 0) {
+        console.log(`  ${chalk.red('explicit claim:')}`);
+        for (const claim of report.claims) {
+          console.log(`    ${chalk.cyan(claim.worktree)} task:${claim.task_id} ${chalk.dim(`lease:${claim.lease_id}`)}`);
+          console.log(`    ${chalk.dim('title:')} ${claim.task_title}`);
+        }
+      }
+
+      if (report.scope_owners.length > 0) {
+        console.log(`  ${chalk.yellow('task scope owner:')}`);
+        for (const owner of report.scope_owners) {
+          console.log(`    ${chalk.cyan(owner.worktree)} task:${owner.task_id} ${chalk.dim(`lease:${owner.lease_id}`)}`);
+          console.log(`    ${chalk.dim('title:')} ${owner.task_title}`);
+        }
+      }
+
+      const blockingOwner = report.claims[0] || report.scope_owners[0];
+      if (blockingOwner) {
+        console.log(`  ${chalk.yellow('next:')} inspect ${chalk.cyan(blockingOwner.worktree)} or choose a different file before claiming this path`);
+      }
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, 'switchman status');
+      process.exitCode = 1;
+    }
+  });
+
 // ── pipeline ──────────────────────────────────────────────────────────────────
 
 const pipelineCmd = program.command('pipeline').description('Create and summarize issue-to-PR execution pipelines');
@@ -1937,6 +2135,7 @@ Examples:
   switchman pipeline start "Harden auth API permissions"
   switchman pipeline exec pipe-123 "/path/to/agent-command"
   switchman pipeline status pipe-123
+  switchman pipeline land pipe-123
 `);
 
 pipelineCmd
@@ -2122,6 +2321,42 @@ pipelineCmd
     } catch (err) {
       db.close();
       console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('land <pipelineId>')
+  .description('Create or refresh one landing branch for a completed pipeline')
+  .option('--base <branch>', 'Base branch for the landing branch', 'main')
+  .option('--branch <branch>', 'Custom landing branch name')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = materializePipelineLandingBranch(db, repoRoot, pipelineId, {
+        baseBranch: opts.base,
+        landingBranch: opts.branch || null,
+        requireCompleted: true,
+      });
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Landing branch ready for ${chalk.cyan(result.pipeline_id)}`);
+      console.log(`  ${chalk.dim('branch:')} ${chalk.cyan(result.branch)}`);
+      console.log(`  ${chalk.dim('base:')} ${result.base_branch}`);
+      console.log(`  ${chalk.dim('strategy:')} ${result.strategy}`);
+      console.log(`  ${chalk.dim('components:')} ${result.component_branches.join(', ')}`);
+      console.log(`  ${chalk.yellow('next:')} switchman queue add ${result.branch}`);
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, `switchman pipeline status ${pipelineId}`);
       process.exitCode = 1;
     }
   });
