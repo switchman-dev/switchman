@@ -2846,6 +2846,45 @@ test('Lease help explains the term and shows examples', () => {
   assert(helpOutput.includes('switchman lease next --json'), 'Lease help includes a practical example');
 });
 
+test('Worktree help includes the workspace alias and plain-English explanation', () => {
+  const helpOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'worktree',
+    '--help',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+
+  assert(helpOutput.includes('switchman workspace list'), 'Worktree help includes the plain-English alias example');
+  assert(helpOutput.includes('worktree = the Git feature behind each agent workspace'), 'Worktree help explains the term in plain English');
+});
+
+test('Claim without files suggests the next command clearly', () => {
+  const repoDir = join(tmpdir(), `sw-claim-help-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'claim',
+    'task-123',
+    'agent1',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('next:'), 'Claim without files includes a next-step hint');
+  assert(output.includes('switchman claim <taskId> <workspace> file1 file2'), 'Claim without files suggests the exact next command shape');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Verify-setup reports missing local editor config clearly', () => {
   const repoDir = join(tmpdir(), `sw-verify-setup-${Date.now()}`);
   const fakeHome = join(tmpdir(), `sw-verify-setup-home-${Date.now()}`);

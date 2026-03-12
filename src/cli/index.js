@@ -183,6 +183,13 @@ function boolBadge(ok) {
   return ok ? chalk.green('OK   ') : chalk.yellow('CHECK');
 }
 
+function printErrorWithNext(message, nextCommand = null) {
+  console.error(chalk.red(message));
+  if (nextCommand) {
+    console.error(`${chalk.yellow('next:')} ${nextCommand}`);
+  }
+}
+
 function collectSetupVerification(repoRoot, { homeDir = null } = {}) {
   const dbPath = join(repoRoot, '.switchman', 'switchman.db');
   const rootMcpPath = join(repoRoot, '.mcp.json');
@@ -1369,7 +1376,7 @@ Examples:
 
 // ── queue ─────────────────────────────────────────────────────────────────────
 
-const queueCmd = program.command('queue').description('Land finished work safely back onto main, one item at a time');
+const queueCmd = program.command('queue').alias('land').description('Land finished work safely back onto main, one item at a time');
 queueCmd.addHelpText('after', `
 Examples:
   switchman queue add --worktree agent1
@@ -1386,6 +1393,12 @@ queueCmd
   .option('--max-retries <n>', 'Maximum automatic retries', '1')
   .option('--submitted-by <name>', 'Operator or automation name')
   .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Examples:
+  switchman queue add feature/auth-hardening
+  switchman queue add --worktree agent2
+  switchman queue add --pipeline pipe-123
+`)
   .action((branch, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -1395,7 +1408,7 @@ queueCmd
       if (opts.worktree) {
         const worktree = listWorktrees(db).find((entry) => entry.name === opts.worktree);
         if (!worktree) {
-          throw new Error(`Worktree ${opts.worktree} is not registered.`);
+          throw new Error(`Workspace ${opts.worktree} is not registered.`);
         }
         payload = {
           sourceType: 'worktree',
@@ -1423,7 +1436,7 @@ queueCmd
           submittedBy: opts.submittedBy || null,
         };
       } else {
-        throw new Error('Provide a branch, --worktree, or --pipeline.');
+        throw new Error('Choose one source to land: a branch name, `--worktree`, or `--pipeline`.');
       }
 
       const result = enqueueMergeItem(db, payload);
@@ -1439,7 +1452,7 @@ queueCmd
       if (result.source_worktree) console.log(`  ${chalk.dim('worktree:')} ${result.source_worktree}`);
     } catch (err) {
       db.close();
-      console.error(chalk.red(err.message));
+      printErrorWithNext(err.message, 'switchman queue add --help');
       process.exitCode = 1;
     }
   });
@@ -1606,7 +1619,7 @@ queueCmd
     db.close();
 
     if (!item) {
-      console.error(chalk.red(`Queue item ${itemId} is not retryable.`));
+      printErrorWithNext(`Queue item ${itemId} is not retryable.`, 'switchman queue status');
       process.exitCode = 1;
       return;
     }
@@ -1629,7 +1642,7 @@ queueCmd
     db.close();
 
     if (!item) {
-      console.error(chalk.red(`Queue item ${itemId} does not exist.`));
+      printErrorWithNext(`Queue item ${itemId} does not exist.`, 'switchman queue status');
       process.exitCode = 1;
       return;
     }
@@ -1899,6 +1912,14 @@ pipelineCmd
   .option('--retry-backoff-ms <ms>', 'Base backoff in milliseconds between retry attempts', '0')
   .option('--timeout-ms <ms>', 'Default command timeout in milliseconds when a task spec does not provide one', '0')
   .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Plain English:
+  pipeline = one goal, broken into smaller safe tasks
+
+Examples:
+  switchman pipeline exec pipe-123 "/path/to/agent-command"
+  switchman pipeline exec pipe-123 "npm test"
+`)
   .action(async (pipelineId, agentCommand, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -1932,14 +1953,14 @@ pipelineCmd
       console.log(chalk.dim(result.pr.markdown.split('\n')[0]));
     } catch (err) {
       db.close();
-      console.error(chalk.red(err.message));
+      printErrorWithNext(err.message, `switchman pipeline status ${pipelineId}`);
       process.exitCode = 1;
     }
   });
 
 // ── lease ────────────────────────────────────────────────────────────────────
 
-const leaseCmd = program.command('lease').description('Manage active work sessions and keep long-running tasks alive');
+const leaseCmd = program.command('lease').alias('session').description('Manage active work sessions and keep long-running tasks alive');
 leaseCmd.addHelpText('after', `
 Plain English:
   lease = a task currently checked out by an agent
@@ -1952,9 +1973,14 @@ Examples:
 
 leaseCmd
   .command('acquire <taskId> <worktree>')
-  .description('Acquire a lease for a pending task')
+  .description('Start a tracked work session for a specific pending task')
   .option('--agent <name>', 'Agent identifier for logging')
   .option('--json', 'Output as JSON')
+  .addHelpText('after', `
+Examples:
+  switchman lease acquire task-123 agent2
+  switchman lease acquire task-123 agent2 --agent cursor
+`)
   .action((taskId, worktree, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -1964,7 +1990,7 @@ leaseCmd
 
     if (!lease || !task) {
       if (opts.json) console.log(JSON.stringify({ lease: null, task: null }));
-      else console.log(chalk.red(`Could not acquire lease. The task may not exist or is not pending.`));
+      else printErrorWithNext('Could not start a work session. The task may not exist or may already be in progress.', 'switchman task list --status pending');
       process.exitCode = 1;
       return;
     }
@@ -2001,7 +2027,7 @@ Examples:
 
     if (!task) {
       if (opts.json) console.log(JSON.stringify({ task: null, lease: null }));
-      else if (exhausted) console.log(chalk.dim('No pending tasks.'));
+      else if (exhausted) console.log(chalk.dim('No pending tasks. Add one with `switchman task add "Your task"`.'));
       else console.log(chalk.yellow('Tasks were claimed by other agents during assignment. Run again to get the next one.'));
       return;
     }
@@ -2064,7 +2090,7 @@ leaseCmd
 
     if (!lease) {
       if (opts.json) console.log(JSON.stringify({ lease: null }));
-      else console.log(chalk.red(`No active lease found for ${leaseId}`));
+      else printErrorWithNext(`No active work session found for ${leaseId}.`, 'switchman lease list --status active');
       process.exitCode = 1;
       return;
     }
@@ -2172,15 +2198,20 @@ leasePolicyCmd
 
 // ── worktree ───────────────────────────────────────────────────────────────────
 
-const wtCmd = program.command('worktree').description('Manage registered workspaces (Git worktrees)');
+const wtCmd = program.command('worktree').alias('workspace').description('Manage registered workspaces (Git worktrees)');
 wtCmd.addHelpText('after', `
 Plain English:
   worktree = the Git feature behind each agent workspace
+
+Examples:
+  switchman worktree list
+  switchman workspace list
+  switchman worktree sync
 `);
 
 wtCmd
   .command('add <name> <path> <branch>')
-  .description('Register a worktree with switchman')
+  .description('Register a workspace with Switchman')
   .option('--agent <name>', 'Agent assigned to this worktree')
   .action((name, path, branch, opts) => {
     const repoRoot = getRepo();
@@ -2192,7 +2223,7 @@ wtCmd
 
 wtCmd
   .command('list')
-  .description('List all registered worktrees')
+  .description('List all registered workspaces')
   .action(() => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -2201,7 +2232,7 @@ wtCmd
     db.close();
 
     if (!worktrees.length && !gitWorktrees.length) {
-      console.log(chalk.dim('No worktrees found.'));
+      console.log(chalk.dim('No workspaces found. Run `switchman setup --agents 3` or `switchman worktree sync`.'));
       return;
     }
 
@@ -2221,7 +2252,7 @@ wtCmd
 
 wtCmd
   .command('sync')
-  .description('Sync git worktrees into the switchman database')
+  .description('Sync Git workspaces into the Switchman database')
   .action(() => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
@@ -2238,12 +2269,20 @@ wtCmd
 
 program
   .command('claim <taskId> <worktree> [files...]')
-  .description('Claim files for a task (warns if conflicts exist)')
+  .description('Lock files for a task before editing')
   .option('--agent <name>', 'Agent name')
   .option('--force', 'Claim even if conflicts exist')
+  .addHelpText('after', `
+Examples:
+  switchman claim task-123 agent2 src/auth.js src/server.js
+  switchman claim task-123 agent2 src/auth.js --agent cursor
+
+Use this before editing files in a shared repo.
+`)
   .action((taskId, worktree, files, opts) => {
     if (!files.length) {
-      console.log(chalk.yellow('No files specified. Use: switchman claim <taskId> <worktree> file1 file2 ...'));
+      console.log(chalk.yellow('No files specified.'));
+      console.log(`${chalk.yellow('next:')} switchman claim <taskId> <workspace> file1 file2`);
       return;
     }
     const repoRoot = getRepo();
@@ -2257,7 +2296,8 @@ program
         for (const c of conflicts) {
           console.log(`  ${chalk.yellow(c.file)} → already claimed by worktree ${chalk.cyan(c.claimedBy.worktree)} (task: ${c.claimedBy.task_title})`);
         }
-        console.log(chalk.dim('\nUse --force to claim anyway, or resolve conflicts first.'));
+        console.log(chalk.dim('\nUse --force to claim anyway, or pick different files first.'));
+        console.log(`${chalk.yellow('next:')} switchman status`);
         process.exitCode = 1;
         return;
       }
@@ -2266,7 +2306,7 @@ program
       console.log(`${chalk.green('✓')} Claimed ${files.length} file(s) for task ${chalk.cyan(taskId)} (${chalk.dim(lease.id)})`);
       files.forEach(f => console.log(`  ${chalk.dim(f)}`));
     } catch (err) {
-      console.error(chalk.red(err.message));
+      printErrorWithNext(err.message, 'switchman task list --status in_progress');
       process.exitCode = 1;
     } finally {
       db.close();
