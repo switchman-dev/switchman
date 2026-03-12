@@ -32,12 +32,16 @@ import {
   completeLeaseTask,
   failTask,
   failLeaseTask,
+  getBoundaryValidationState,
   getTaskSpec,
   upsertTaskSpec,
+  retryTask,
   listTasks,
   getTask,
   getNextPendingTask,
   listLeases,
+  listBoundaryValidationStates,
+  listDependencyInvalidations,
   listScopeReservations,
   getLease,
   getLeaseExecutionContext,
@@ -1599,6 +1603,66 @@ test('Fix 25a: scan and gates report hierarchical ownership overlaps explicitly'
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 25aa: scan and gates report semantic exported-object overlaps explicitly', () => {
+  const repoDir = join(tmpdir(), `sw-semantic-overlap-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const featureA = join(tmpdir(), `sw-semantic-a-${Date.now()}`);
+  const featureB = join(tmpdir(), `sw-semantic-b-${Date.now()}`);
+  execSync(`git worktree add -b feature-semantic-a "${featureA}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature-semantic-b "${featureB}"`, { cwd: repoDir });
+
+  execSync('mkdir -p src/auth && printf "export function ensureAuth() { return true; }\\n" > src/auth/guard.js', { cwd: featureA, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "export function ensureAuth() { return false; }\\n" > src/auth/policy.js', { cwd: featureB, shell: '/bin/zsh' });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: featureA.split('/').pop(), path: featureA, branch: 'feature-semantic-a' });
+  registerWorktree(db, { name: featureB.split('/').pop(), path: featureB, branch: 'feature-semantic-b' });
+  db.close();
+
+  const scan = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'scan', '--json'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  let aiStdout = '';
+  try {
+    aiStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ai', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    aiStdout = String(err.stdout || '');
+  }
+  const aiGate = JSON.parse(aiStdout);
+  let ciStdout = '';
+  try {
+    ciStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ci', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    ciStdout = String(err.stdout || '');
+  }
+  const ciGate = JSON.parse(ciStdout);
+
+  assert(scan.semanticConflicts.some((conflict) => conflict.object_name === 'ensureAuth'), 'Scan reports overlapping exported objects explicitly');
+  assert(aiGate.semantic_conflicts.some((conflict) => conflict.object_name === 'ensureAuth'), 'AI merge gate includes semantic conflicts in JSON output');
+  assert(aiGate.pairs.some((pair) => pair.reasons.some((reason) => reason.includes('ensureAuth'))), 'AI merge gate reasons mention the overlapping exported object');
+  assert(!ciGate.ok, 'Repo CI gate rejects semantic exported-object overlaps');
+  assert(ciGate.semantic_conflicts.some((conflict) => conflict.object_name === 'ensureAuth'), 'Repo CI gate returns semantic conflicts in JSON output');
+
+  execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 25b: AI merge gate blocks missing boundary validation work for high-risk implementation', () => {
   const repoDir = join(tmpdir(), `sw-boundary-validation-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -1618,7 +1682,9 @@ test('Fix 25b: AI merge gate blocks missing boundary validation work for high-ri
     priority: 5,
   });
   const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
-  completeTask(gateDb, implementationTask.id);
+  assignTask(gateDb, implementationTask.id, 'main');
+  const lease = getActiveLeaseForTask(gateDb, implementationTask.id);
+  completeLeaseTask(gateDb, lease.id);
   gateDb.close();
 
   let aiStdout = '';
@@ -1649,6 +1715,102 @@ test('Fix 25b: AI merge gate blocks missing boundary validation work for high-ri
   assert(!ciGate.ok, 'Repo CI gate fails when blocking boundary validations are still missing');
   assert(ciGate.boundary_validations.some((item) => item.pipeline_id === 'pipe-boundary'), 'Repo CI gate returns the blocking boundary validations in JSON output');
 
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 25c: accepted high-risk boundary work creates incremental validation state and follow-up completion satisfies it', () => {
+  const repoDir = join(tmpdir(), `sw-boundary-state-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const pipeline = startPipeline(db, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-boundary-state',
+    priority: 5,
+  });
+  const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
+  const testsTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'tests');
+  const docsTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'docs');
+  const governanceTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'governance');
+  assignTask(db, implementationTask.id, 'main');
+  const lease = getActiveLeaseForTask(db, implementationTask.id);
+  execSync('mkdir -p src/auth && printf "ok\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const outcome = evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
+  const pendingState = getBoundaryValidationState(db, lease.id);
+
+  completeLeaseTask(db, lease.id);
+  completeTask(db, testsTask.id);
+  completeTask(db, docsTask.id);
+  completeTask(db, governanceTask.id);
+  const allStates = listBoundaryValidationStates(db, { pipelineId: 'pipe-boundary-state' });
+  const satisfiedState = allStates.find((state) => state.lease_id === lease.id);
+
+  assert(outcome.status === 'accepted', 'Outcome evaluator accepts the implementation work before follow-up validation is complete');
+  assert(pendingState?.status === 'blocked', 'Accepted high-risk implementation work records a blocking boundary validation state immediately');
+  assert(pendingState?.missing_task_types.includes('tests'), 'Boundary validation state tracks missing tests immediately after the implementation write');
+  assert(satisfiedState?.status === 'satisfied', 'Completing the follow-up validation tasks satisfies the incremental boundary validation state');
+  assert(satisfiedState?.missing_task_types.length === 0, 'Satisfied boundary validation state clears the missing follow-up task types');
+
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 25d: shared-boundary changes mark dependent work stale until it is retried', () => {
+  const repoDir = join(tmpdir(), `sw-dependency-stale-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  writeFileSync(join(repoDir, 'auth-old.js'), 'old\n');
+  execSync('git add README.md auth-old.js', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const previousTaskId = createTask(db, { title: 'Previous auth hardening' });
+  upsertTaskSpec(db, previousTaskId, {
+    pipeline_id: 'pipe-old',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, previousTaskId, 'main');
+  const previousLease = getActiveLeaseForTask(db, previousTaskId);
+  completeLeaseTask(db, previousLease.id);
+
+  const pipeline = startPipeline(db, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-fresh-auth',
+    priority: 5,
+  });
+  const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
+  assignTask(db, implementationTask.id, 'main');
+  const currentLease = getActiveLeaseForTask(db, implementationTask.id);
+  execSync('mkdir -p src/auth && printf "new\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/zsh' });
+  const outcome = evaluateTaskOutcome(db, repoDir, { leaseId: currentLease.id });
+  const staleInvalidations = listDependencyInvalidations(db, { affectedTaskId: previousTaskId });
+
+  assert(outcome.status === 'accepted', 'Outcome evaluator still accepts the new implementation work');
+  assert(staleInvalidations.some((item) => item.reason_type === 'subsystem_overlap' && item.status === 'stale'), 'Shared subsystem work marks the older completed task stale');
+
+  retryTask(db, previousTaskId, 'revalidate after auth change');
+  const clearedInvalidations = listDependencyInvalidations(db, { affectedTaskId: previousTaskId });
+  assert(clearedInvalidations.length === 0, 'Retrying the stale task clears the active dependency invalidation');
+
+  db.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -1855,6 +2017,72 @@ test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () 
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28ab: doctor and repo gate surface stale dependency invalidations', () => {
+  const repoDir = join(tmpdir(), `sw-doctor-stale-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const oldTaskId = createTask(db, { title: 'Old auth flow' });
+  upsertTaskSpec(db, oldTaskId, {
+    pipeline_id: 'pipe-old-doc',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, oldTaskId, 'main');
+  const oldLease = getActiveLeaseForTask(db, oldTaskId);
+  completeLeaseTask(db, oldLease.id);
+
+  const pipeline = startPipeline(db, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-doctor-stale',
+    priority: 5,
+  });
+  const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
+  assignTask(db, implementationTask.id, 'main');
+  const lease = getActiveLeaseForTask(db, implementationTask.id);
+  execSync('mkdir -p src/auth && printf "stale\\n" > src/auth/guard.js', { cwd: repoDir, shell: '/bin/zsh' });
+  evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
+  db.close();
+
+  const doctorJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  assert(doctorJson.attention.some((item) => item.kind === 'dependency_invalidation'), 'Doctor includes stale dependency invalidations in the attention list');
+  assert(doctorJson.merge_readiness.dependency_invalidations.some((item) => item.affected_task_id === oldTaskId), 'Doctor surfaces stale dependency invalidations in merge readiness');
+
+  let ciStdout = '';
+  try {
+    ciStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ci', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    ciStdout = String(err.stdout || '');
+  }
+  const ciGate = JSON.parse(ciStdout);
+  assert(!ciGate.ok, 'Repo gate fails while stale dependency invalidations are unresolved');
+  assert(ciGate.dependency_invalidations.some((item) => item.affected_task_id === oldTaskId), 'Repo gate returns stale dependency invalidations in JSON output');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 28b: planner emits subsystem-aware specs for high-risk work', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-planner-risk-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -2006,6 +2234,91 @@ test('Fix 28d: pipeline bundle exports reviewer-ready files to disk', () => {
   assert(existsSync(result.files.pr_body_markdown), 'Pipeline bundle writes the PR body markdown file');
   assert(readFileSync(result.files.pr_body_markdown, 'utf8').includes('## Reviewer Checklist'), 'Pipeline bundle writes reviewer checklist content into the PR body file');
   assert(readFileSync(result.files.summary_markdown, 'utf8').includes('lease '), 'Pipeline bundle summary markdown includes lease provenance for completed work');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28da: semantic materialize writes a deterministic semantic index artifact', () => {
+  const repoDir = join(tmpdir(), `sw-semantic-materialize-${Date.now()}`);
+  mkdirSync(join(repoDir, 'src/auth'), { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  writeFileSync(join(repoDir, 'src/auth/guard.js'), 'export function ensureAuth() { return true; }\nexport const AUTH_FLAG = true;\n');
+  execSync('git add README.md src/auth/guard.js', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  db.close();
+
+  execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'semantic', 'materialize'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const semanticIndexPath = join(repoDir, '.switchman', 'semantic-index.json');
+  const artifact = JSON.parse(readFileSync(semanticIndexPath, 'utf8'));
+  assert(existsSync(semanticIndexPath), 'Semantic materialize writes the semantic index artifact');
+  assert(artifact.worktrees.some((entry) => entry.worktree === 'main'), 'Semantic index includes the main worktree');
+  assert(artifact.worktrees.flatMap((entry) => entry.index.objects).some((object) => object.name === 'ensureAuth'), 'Semantic index materializes exported code objects deterministically');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28db: canonical object store can import, update, and materialize exported code objects', () => {
+  const repoDir = join(tmpdir(), `sw-object-store-${Date.now()}`);
+  mkdirSync(join(repoDir, 'src/auth'), { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  writeFileSync(join(repoDir, 'src/auth/guard.js'), 'export function ensureAuth() { return true; }\nexport const AUTH_FLAG = true;\n');
+  execSync('git add README.md src/auth/guard.js', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  db.close();
+
+  const imported = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'object',
+    'import',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const targetObject = imported.objects.find((object) => object.name === 'ensureAuth');
+  assert(imported.object_count >= 2, 'Object import stores exported code objects canonically');
+  assert(Boolean(targetObject), 'Object import captures the exported ensureAuth function');
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'object',
+    'update',
+    targetObject.object_id,
+    '--text',
+    'export function ensureAuth() { return "from-store"; }',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'object',
+    'materialize',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const materialized = readFileSync(join(repoDir, 'src/auth/guard.js'), 'utf8');
+  assert(materialized.includes('from-store'), 'Object materialize rewrites files from the canonical object store');
+  assert(materialized.includes('AUTH_FLAG'), 'Object materialize keeps other canonical exported objects in the same file');
+
   rmSync(repoDir, { recursive: true, force: true });
 });
 

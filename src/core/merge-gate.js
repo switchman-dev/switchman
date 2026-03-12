@@ -1,4 +1,4 @@
-import { getTaskSpec, listTasks, logAuditEvent } from './db.js';
+import { getTask, listBoundaryValidationStates, listDependencyInvalidations, logAuditEvent } from './db.js';
 import { scanAllWorktrees } from './detector.js';
 
 const RISK_PATTERNS = [
@@ -87,6 +87,10 @@ function buildPairAnalysis(left, right, report) {
     (conflict.worktreeA === left.worktree && conflict.worktreeB === right.worktree)
     || (conflict.worktreeA === right.worktree && conflict.worktreeB === left.worktree),
   );
+  const semanticConflicts = (report.semanticConflicts || []).filter((conflict) =>
+    (conflict.worktreeA === left.worktree && conflict.worktreeB === right.worktree)
+    || (conflict.worktreeA === right.worktree && conflict.worktreeB === left.worktree),
+  );
   const sharedAreas = intersection(left.areas, right.areas);
   const sharedRiskTags = intersection(left.risk_tags, right.risk_tags);
 
@@ -111,6 +115,18 @@ function buildPairAnalysis(left, right, report) {
       } else if (conflict.type === 'scope_overlap') {
         reasons.push(`both worktrees reserve overlapping scopes (${conflict.scopeA} vs ${conflict.scopeB})`);
         score = Math.max(score, 90);
+      }
+    }
+  }
+
+  if (semanticConflicts.length > 0) {
+    for (const conflict of semanticConflicts) {
+      if (conflict.type === 'semantic_object_overlap') {
+        reasons.push(`both worktrees changed exported ${conflict.object_kind} ${conflict.object_name}`);
+        score = Math.max(score, 92);
+      } else if (conflict.type === 'semantic_name_overlap') {
+        reasons.push(`both worktrees changed semantically similar object ${conflict.object_name}`);
+        score = Math.max(score, 65);
       }
     }
   }
@@ -153,27 +169,30 @@ function buildPairAnalysis(left, right, report) {
     shared_areas: sharedAreas,
     shared_risk_tags: sharedRiskTags,
     ownership_conflicts: ownershipConflicts,
+    semantic_conflicts: semanticConflicts,
     conflicting_files: branchConflict?.conflictingFiles || directFileConflict.map((item) => item.file),
   };
 }
 
-function summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations) {
+function summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations, dependencyInvalidations) {
   const blockedPairs = pairAnalyses.filter((item) => item.status === 'blocked');
   const warnedPairs = pairAnalyses.filter((item) => item.status === 'warn');
   const riskyWorktrees = worktreeAnalyses.filter((item) => item.score >= 40);
   const blockedValidations = boundaryValidations.filter((item) => item.severity === 'blocked');
   const warnedValidations = boundaryValidations.filter((item) => item.severity === 'warn');
+  const blockedInvalidations = dependencyInvalidations.filter((item) => item.severity === 'blocked');
+  const warnedInvalidations = dependencyInvalidations.filter((item) => item.severity === 'warn');
 
-  if (blockedPairs.length > 0 || blockedValidations.length > 0) {
+  if (blockedPairs.length > 0 || blockedValidations.length > 0 || blockedInvalidations.length > 0) {
     return {
       status: 'blocked',
-      summary: `AI merge gate blocked: ${blockedPairs.length} risky pair(s) and ${blockedValidations.length} boundary validation issue(s) need resolution.`,
+      summary: `AI merge gate blocked: ${blockedPairs.length} risky pair(s), ${blockedValidations.length} boundary validation issue(s), and ${blockedInvalidations.length} stale dependency issue(s) need resolution.`,
     };
   }
-  if (warnedPairs.length > 0 || riskyWorktrees.length > 0 || warnedValidations.length > 0) {
+  if (warnedPairs.length > 0 || riskyWorktrees.length > 0 || warnedValidations.length > 0 || warnedInvalidations.length > 0) {
     return {
       status: 'warn',
-      summary: `AI merge gate warns: ${warnedPairs.length} pair(s), ${riskyWorktrees.length} worktree(s), or ${warnedValidations.length} boundary validation issue(s) need review.`,
+      summary: `AI merge gate warns: ${warnedPairs.length} pair(s), ${riskyWorktrees.length} worktree(s), ${warnedValidations.length} boundary validation issue(s), or ${warnedInvalidations.length} stale dependency issue(s) need review.`,
     };
   }
   return {
@@ -183,49 +202,52 @@ function summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations) {
 }
 
 function evaluateBoundaryValidations(db) {
-  const tasks = listTasks(db);
-  const specsByTaskId = new Map(tasks.map((task) => [task.id, getTaskSpec(db, task.id)]));
-  const tasksByPipeline = new Map();
+  return listBoundaryValidationStates(db)
+    .filter((state) => state.status === 'blocked' || state.status === 'pending_validation')
+    .map((state) => {
+      const task = getTask(db, state.task_id);
+      return {
+        pipeline_id: state.pipeline_id,
+        task_id: state.task_id,
+        worktree: task?.worktree || null,
+        severity: state.status === 'blocked' ? 'blocked' : 'warn',
+        missing_task_types: state.missing_task_types || [],
+        rationale: state.details?.rationale || [],
+        subsystem_tags: state.details?.subsystem_tags || [],
+        summary: `${task?.title || state.task_id} is missing completed ${(state.missing_task_types || []).join(', ')} validation work`,
+        touched_at: state.touched_at,
+        validation_status: state.status,
+      };
+    });
+}
 
-  for (const task of tasks) {
-    const spec = specsByTaskId.get(task.id);
-    const pipelineId = spec?.pipeline_id;
-    if (!pipelineId) continue;
-    if (!tasksByPipeline.has(pipelineId)) tasksByPipeline.set(pipelineId, []);
-    tasksByPipeline.get(pipelineId).push({ task, task_spec: spec });
-  }
-
-  const findings = [];
-  for (const [pipelineId, pipelineTasks] of tasksByPipeline.entries()) {
-    const completedTaskTypes = new Set(
-      pipelineTasks
-        .filter(({ task }) => task.status === 'done')
-        .map(({ task_spec }) => task_spec?.task_type)
-        .filter(Boolean),
-    );
-
-    for (const { task, task_spec: spec } of pipelineTasks) {
-      if (!spec?.validation_rules || spec.task_type !== 'implementation') continue;
-      if (!['in_progress', 'done'].includes(task.status)) continue;
-
-      const requiredTypes = spec.validation_rules.required_completed_task_types || [];
-      const missingTaskTypes = requiredTypes.filter((taskType) => !completedTaskTypes.has(taskType));
-      if (missingTaskTypes.length === 0) continue;
-
-      findings.push({
-        pipeline_id: pipelineId,
-        task_id: task.id,
-        worktree: task.worktree || null,
-        subsystem_tags: spec.subsystem_tags || [],
-        severity: spec.validation_rules.enforcement === 'blocked' ? 'blocked' : 'warn',
-        missing_task_types: missingTaskTypes,
-        rationale: spec.validation_rules.rationale || [],
-        summary: `${task.title} is missing completed ${missingTaskTypes.join(', ')} validation work`,
-      });
-    }
-  }
-
-  return findings;
+function evaluateDependencyInvalidations(db) {
+  return listDependencyInvalidations(db, { status: 'stale' })
+    .map((state) => {
+      const affectedTask = getTask(db, state.affected_task_id);
+      const severity = affectedTask?.status === 'done' ? 'blocked' : 'warn';
+      const staleArea = state.reason_type === 'subsystem_overlap'
+        ? `subsystem:${state.subsystem_tag}`
+        : `${state.source_scope_pattern} ↔ ${state.affected_scope_pattern}`;
+      return {
+        source_lease_id: state.source_lease_id,
+        source_task_id: state.source_task_id,
+        source_pipeline_id: state.source_pipeline_id,
+        source_worktree: state.source_worktree,
+        affected_task_id: state.affected_task_id,
+        affected_pipeline_id: state.affected_pipeline_id,
+        affected_worktree: state.affected_worktree,
+        affected_task_status: affectedTask?.status || null,
+        severity,
+        reason_type: state.reason_type,
+        subsystem_tag: state.subsystem_tag,
+        source_scope_pattern: state.source_scope_pattern,
+        affected_scope_pattern: state.affected_scope_pattern,
+        summary: `${affectedTask?.title || state.affected_task_id} is stale because ${state.details?.source_task_title || state.source_task_id} changed shared ${staleArea}`,
+        stale_area: staleArea,
+        created_at: state.created_at,
+      };
+    });
 }
 
 export async function runAiMergeGate(db, repoRoot) {
@@ -246,7 +268,8 @@ export async function runAiMergeGate(db, repoRoot) {
   }
 
   const boundaryValidations = evaluateBoundaryValidations(db);
-  const overall = summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations);
+  const dependencyInvalidations = evaluateDependencyInvalidations(db);
+  const overall = summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations, dependencyInvalidations);
   const result = {
     ok: overall.status === 'pass',
     status: overall.status,
@@ -254,11 +277,13 @@ export async function runAiMergeGate(db, repoRoot) {
     worktrees: worktreeAnalyses,
     pairs: pairAnalyses,
     boundary_validations: boundaryValidations,
+    dependency_invalidations: dependencyInvalidations,
     compliance: report.complianceSummary,
     unclaimed_changes: report.unclaimedChanges,
     branch_conflicts: report.conflicts,
     file_conflicts: report.fileConflicts,
     ownership_conflicts: report.ownershipConflicts || [],
+    semantic_conflicts: report.semanticConflicts || [],
   };
 
   logAuditEvent(db, {
@@ -271,6 +296,8 @@ export async function runAiMergeGate(db, repoRoot) {
       warned_pairs: pairAnalyses.filter((item) => item.status === 'warn').length,
       blocked_boundary_validations: boundaryValidations.filter((item) => item.severity === 'blocked').length,
       warned_boundary_validations: boundaryValidations.filter((item) => item.severity === 'warn').length,
+      blocked_dependency_invalidations: dependencyInvalidations.filter((item) => item.severity === 'blocked').length,
+      warned_dependency_invalidations: dependencyInvalidations.filter((item) => item.severity === 'warn').length,
     }),
   });
 

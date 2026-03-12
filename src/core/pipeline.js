@@ -2,7 +2,7 @@ import { spawn, spawnSync } from 'child_process';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
-import { completeTask, createTask, failTask, getTaskSpec, listAuditEvents, listLeases, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease, upsertTaskSpec } from './db.js';
+import { completeLeaseTask, createTask, failLeaseTask, getTaskSpec, listAuditEvents, listLeases, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease, upsertTaskSpec } from './db.js';
 import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
@@ -507,7 +507,7 @@ function runPipelineIteration(
       const timedOut = result.error?.code === 'ETIMEDOUT';
       const commandOk = !result.error && result.status === 0;
       let evaluation = commandOk
-        ? evaluateTaskOutcome(db, repoRoot, { taskId: assignment.task_id })
+        ? evaluateTaskOutcome(db, repoRoot, { leaseId: assignment.lease_id })
         : null;
       if (commandOk && evaluation?.reason_code === 'no_changes_detected' && beforeHead && afterHead && beforeHead !== afterHead) {
         evaluation = {
@@ -526,14 +526,14 @@ function runPipelineIteration(
         retry_delay_ms: 0,
       };
       if (ok) {
-        completeTask(db, assignment.task_id);
+        completeLeaseTask(db, assignment.lease_id);
       } else {
         const failureReason = !commandOk
           ? (timedOut
             ? `agent command timed out after ${executionPolicy.timeout_ms}ms`
             : (result.error?.message || `agent command exited with status ${result.status}`))
           : `${evaluation.reason_code}: ${evaluation.findings.join('; ')}`;
-        failTask(db, assignment.task_id, failureReason);
+        failLeaseTask(db, assignment.lease_id, failureReason);
         retry = scheduleTaskRetry(db, {
           pipelineId,
           taskId: assignment.task_id,
@@ -593,11 +593,14 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
   const report = await scanAllWorktrees(db, repoRoot);
   const aiGate = await runAiMergeGate(db, repoRoot);
+  const allLeases = listLeases(db);
   const ciGateOk = report.conflicts.length === 0
     && report.fileConflicts.length === 0
+    && (report.semanticConflicts?.length || 0) === 0
     && report.unclaimedChanges.length === 0
     && report.complianceSummary.non_compliant === 0
-    && report.complianceSummary.stale === 0;
+    && report.complianceSummary.stale === 0
+    && (aiGate.dependency_invalidations || []).filter((item) => item.severity === 'blocked').length === 0;
 
   const involvedWorktrees = [...new Set(status.tasks.map((task) => task.worktree).filter(Boolean))];
   const worktreeChanges = involvedWorktrees.map((worktree) => ({
@@ -606,12 +609,21 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   }));
   const completedTasks = status.tasks.filter((task) => task.status === 'done');
   const remainingTasks = status.tasks.filter((task) => task.status !== 'done');
+  const completedLeaseByTask = new Map();
+  for (const lease of allLeases) {
+    if (lease.status !== 'completed') continue;
+    if (!completedLeaseByTask.has(lease.task_id)) {
+      completedLeaseByTask.set(lease.task_id, lease);
+    }
+  }
   const provenance = completedTasks.map((task) => ({
     task_id: task.id,
+    lease_id: completedLeaseByTask.get(task.id)?.id || null,
     title: task.title,
     task_type: task.task_spec?.task_type || null,
     risk_level: task.task_spec?.risk_level || null,
     worktree: task.worktree || task.suggested_worktree || null,
+    agent: completedLeaseByTask.get(task.id)?.agent || null,
     subsystem_tags: task.task_spec?.subsystem_tags || [],
     required_deliverables: task.task_spec?.required_deliverables || [],
   }));
@@ -620,6 +632,12 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   const riskNotes = [];
   if (!ciGateOk) riskNotes.push('Repo gate is blocked by conflicts, unmanaged changes, or stale worktrees.');
   if (aiGate.status !== 'pass') riskNotes.push(aiGate.summary);
+  if ((aiGate.dependency_invalidations || []).length > 0) {
+    riskNotes.push('Some completed work is stale and needs revalidation after a shared boundary changed.');
+  }
+  if ((report.semanticConflicts?.length || 0) > 0) {
+    riskNotes.push('Semantic overlap was detected between changed exported objects across worktrees.');
+  }
   if (completedTasks.some((task) => task.task_spec?.risk_level === 'high')) {
     riskNotes.push('High-risk work is included in this PR and should receive explicit reviewer attention.');
   }
@@ -651,7 +669,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     '',
     '## Provenance',
     ...(provenance.length > 0
-      ? provenance.map((entry) => `- ${entry.task_id} (${entry.task_type || 'unknown'}) via ${entry.worktree || 'unassigned'}`)
+      ? provenance.map((entry) => `- ${entry.task_id} (${entry.task_type || 'unknown'}) via ${entry.worktree || 'unassigned'} lease ${entry.lease_id || 'none'}`)
       : ['- No completed task provenance yet']),
   ].join('\n');
   const ready = status.counts.failed === 0
@@ -685,7 +703,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     ...reviewerChecklist.map((item) => `- ${item}`),
     '',
     '## Provenance',
-    ...provenance.map((entry) => `- ${entry.task_id}: ${entry.title} (${entry.task_type || 'unknown'}, ${entry.worktree || 'unassigned'})`),
+    ...provenance.map((entry) => `- ${entry.task_id}: ${entry.title} (${entry.task_type || 'unknown'}, ${entry.worktree || 'unassigned'}, lease ${entry.lease_id || 'none'})`),
     ...(provenance.length === 0 ? ['- No completed task provenance yet'] : []),
     '',
     '## Gate Notes',

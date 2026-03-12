@@ -3,7 +3,7 @@
  * Scans all registered worktrees for file-level and branch-level conflicts
  */
 
-import { listWorktrees } from './db.js';
+import { listScopeReservations, listWorktrees } from './db.js';
 import {
   listGitWorktrees,
   getWorktreeChangedFiles,
@@ -11,6 +11,7 @@ import {
 } from './git.js';
 import { filterIgnoredPaths } from './ignore.js';
 import { evaluateRepoCompliance } from './enforcement.js';
+import { buildSemanticIndexForPath, detectSemanticConflicts } from './semantic.js';
 
 /**
  * Scan all worktrees for conflicts.
@@ -30,6 +31,8 @@ export async function scanAllWorktrees(db, repoRoot) {
       fileMap: {},
       conflicts: [],
       fileConflicts: [],
+      ownershipConflicts: detectOwnershipOverlaps(db),
+      semanticConflicts: [],
       unclaimedChanges: enforcement.unclaimedChanges,
       worktreeCompliance: enforcement.worktreeCompliance,
       complianceSummary: enforcement.complianceSummary,
@@ -50,6 +53,13 @@ export async function scanAllWorktrees(db, repoRoot) {
 
   // Step 2: Detect file-level overlaps (fast, always available)
   const fileConflicts = detectFileOverlaps(fileMap, worktrees);
+  const ownershipConflicts = detectOwnershipOverlaps(db);
+  const semanticIndexes = worktrees.map((wt) => ({
+    worktree: wt.name,
+    branch: wt.branch || 'unknown',
+    objects: buildSemanticIndexForPath(wt.path, fileMap[wt.name] || []).objects,
+  }));
+  const semanticConflicts = detectSemanticConflicts(semanticIndexes);
 
   // Step 3: Detect branch-level merge conflicts (slower, uses git merge-tree)
   const branchConflicts = [];
@@ -78,12 +88,14 @@ export async function scanAllWorktrees(db, repoRoot) {
     fileMap,
     conflicts: allConflicts,
     fileConflicts,
+    ownershipConflicts,
+    semanticConflicts,
     unclaimedChanges: enforcement.unclaimedChanges,
     worktreeCompliance: enforcement.worktreeCompliance,
     complianceSummary: enforcement.complianceSummary,
     deniedWrites: enforcement.deniedWrites,
     commitGateFailures: enforcement.commitGateFailures,
-    summary: buildSummary(worktrees, allConflicts, fileConflicts, enforcement.unclaimedChanges),
+    summary: buildSummary(worktrees, allConflicts, fileConflicts, ownershipConflicts, semanticConflicts, enforcement.unclaimedChanges),
     scannedAt: new Date().toISOString(),
   };
 }
@@ -105,6 +117,70 @@ function detectFileOverlaps(fileMap, worktrees) {
   for (const [file, wts] of Object.entries(fileToWorktrees)) {
     if (wts.length > 1) {
       conflicts.push({ file, worktrees: wts });
+    }
+  }
+
+  return conflicts;
+}
+
+function normalizeScopeRoot(pattern) {
+  return String(pattern || '')
+    .replace(/\\/g, '/')
+    .replace(/\/\*\*$/, '')
+    .replace(/\/\*$/, '')
+    .replace(/\/+$/, '');
+}
+
+function scopeRootsOverlap(leftPattern, rightPattern) {
+  const left = normalizeScopeRoot(leftPattern);
+  const right = normalizeScopeRoot(rightPattern);
+  if (!left || !right) return false;
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function detectOwnershipOverlaps(db) {
+  const reservations = listScopeReservations(db);
+  const conflicts = [];
+
+  for (let i = 0; i < reservations.length; i++) {
+    for (let j = i + 1; j < reservations.length; j++) {
+      const left = reservations[i];
+      const right = reservations[j];
+      if (left.lease_id === right.lease_id) continue;
+      if (left.worktree === right.worktree) continue;
+
+      if (
+        left.ownership_level === 'subsystem' &&
+        right.ownership_level === 'subsystem' &&
+        left.subsystem_tag &&
+        left.subsystem_tag === right.subsystem_tag
+      ) {
+        conflicts.push({
+          type: 'subsystem_overlap',
+          worktreeA: left.worktree,
+          worktreeB: right.worktree,
+          leaseA: left.lease_id,
+          leaseB: right.lease_id,
+          subsystemTag: left.subsystem_tag,
+        });
+        continue;
+      }
+
+      if (
+        left.ownership_level === 'path_scope' &&
+        right.ownership_level === 'path_scope' &&
+        scopeRootsOverlap(left.scope_pattern, right.scope_pattern)
+      ) {
+        conflicts.push({
+          type: 'scope_overlap',
+          worktreeA: left.worktree,
+          worktreeB: right.worktree,
+          leaseA: left.lease_id,
+          leaseB: right.lease_id,
+          scopeA: left.scope_pattern,
+          scopeB: right.scope_pattern,
+        });
+      }
     }
   }
 
@@ -150,6 +226,8 @@ function mergeWorktreeInfo(dbWorktrees, gitWorktrees) {
     const dbMatch = dbWorktrees.find(d => d.path === gw.path || d.name === gw.name);
     return {
       ...gw,
+      name: dbMatch?.name || gw.name,
+      branch: dbMatch?.branch || gw.branch,
       agent: dbMatch?.agent || null,
       registeredInDb: !!dbMatch,
     };
@@ -168,11 +246,11 @@ function getPairs(arr) {
   return pairs;
 }
 
-function buildSummary(worktrees, conflicts, fileConflicts, unclaimedChanges) {
+function buildSummary(worktrees, conflicts, fileConflicts, ownershipConflicts, semanticConflicts, unclaimedChanges) {
   const lines = [];
   lines.push(`Scanned ${worktrees.length} worktree(s)`);
 
-  if (conflicts.length === 0 && fileConflicts.length === 0) {
+  if (conflicts.length === 0 && fileConflicts.length === 0 && ownershipConflicts.length === 0 && semanticConflicts.length === 0) {
     lines.push('✓ No conflicts detected');
   } else {
     if (conflicts.length > 0) {
@@ -180,6 +258,12 @@ function buildSummary(worktrees, conflicts, fileConflicts, unclaimedChanges) {
     }
     if (fileConflicts.length > 0) {
       lines.push(`⚠ ${fileConflicts.length} file(s) being edited in multiple worktrees`);
+    }
+    if (ownershipConflicts.length > 0) {
+      lines.push(`⚠ ${ownershipConflicts.length} ownership boundary overlap(s) detected`);
+    }
+    if (semanticConflicts.length > 0) {
+      lines.push(`⚠ ${semanticConflicts.length} semantic overlap(s) detected`);
     }
     if (unclaimedChanges.length > 0) {
       lines.push(`⚠ ${unclaimedChanges.length} worktree(s) have unclaimed changed files`);

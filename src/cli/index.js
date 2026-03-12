@@ -26,8 +26,8 @@ import { findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.j
 import {
   initDb, openDb,
   DEFAULT_STALE_LEASE_MINUTES,
-  createTask, startTaskLease, completeTask, failTask, getTaskSpec, listTasks, getTask, getNextPendingTask,
-  listLeases, listScopeReservations, heartbeatLease, getStaleLeases, reapStaleLeases,
+  createTask, startTaskLease, completeTask, failTask, getBoundaryValidationState, getTaskSpec, listTasks, getTask, getNextPendingTask,
+  listDependencyInvalidations, listLeases, listScopeReservations, heartbeatLease, getStaleLeases, reapStaleLeases,
   registerWorktree, listWorktrees,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts,
   verifyAuditTrail,
@@ -39,6 +39,7 @@ import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
 import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus } from '../core/ci.js';
+import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 
 function installMcpConfig(targetDirs) {
   return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
@@ -286,6 +287,10 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     scope_b: conflict.scopeB || null,
     next_step: 'split the task scopes or serialize work across the shared ownership boundary',
   }));
+  const semanticConflicts = (scanReport.semanticConflicts || []).map((conflict) => ({
+    ...conflict,
+    next_step: 'review the overlapping exported object or split the work across different boundaries',
+  }));
 
   const branchConflicts = scanReport.conflicts.map((conflict) => ({
     worktree_a: conflict.worktreeA,
@@ -339,6 +344,16 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       command: 'switchman scan',
       severity: 'block',
     })),
+    ...semanticConflicts.map((conflict) => ({
+      kind: 'semantic_conflict',
+      title: conflict.type === 'semantic_object_overlap'
+        ? `${conflict.worktreeA} and ${conflict.worktreeB} changed the same exported object`
+        : `${conflict.worktreeA} and ${conflict.worktreeB} changed semantically similar objects`,
+      detail: `${conflict.object_name} (${conflict.fileA} ↔ ${conflict.fileB})`,
+      next_step: conflict.next_step,
+      command: 'switchman gate ai',
+      severity: conflict.severity === 'blocked' ? 'block' : 'warn',
+    })),
     ...branchConflicts.map((conflict) => ({
       kind: 'branch_conflict',
       title: `${conflict.worktree_a} and ${conflict.worktree_b} have merge risk`,
@@ -371,6 +386,17 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     });
   }
 
+  for (const invalidation of aiGate.dependency_invalidations || []) {
+    attention.push({
+      kind: 'dependency_invalidation',
+      title: invalidation.summary,
+      detail: `${invalidation.source_worktree || 'unknown'} -> ${invalidation.affected_worktree || 'unknown'} (${invalidation.stale_area})`,
+      next_step: 'rerun or re-review the stale task before merge',
+      command: invalidation.affected_pipeline_id ? `switchman pipeline status ${invalidation.affected_pipeline_id}` : 'switchman gate ai',
+      severity: invalidation.severity === 'blocked' ? 'block' : 'warn',
+    });
+  }
+
   const health = attention.some((item) => item.severity === 'block')
     ? 'block'
     : attention.some((item) => item.severity === 'warn')
@@ -399,18 +425,25 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       task_title: lease.task_title,
       heartbeat_at: lease.heartbeat_at,
       scope_summary: summarizeLeaseScope(db, lease),
+      boundary_validation: getBoundaryValidationState(db, lease.id),
+      dependency_invalidations: listDependencyInvalidations(db, { affectedTaskId: lease.task_id }),
     })),
     attention,
     merge_readiness: {
       ci_gate_ok: scanReport.conflicts.length === 0
         && scanReport.fileConflicts.length === 0
         && (scanReport.ownershipConflicts?.length || 0) === 0
+        && (scanReport.semanticConflicts?.length || 0) === 0
         && scanReport.unclaimedChanges.length === 0
         && scanReport.complianceSummary.non_compliant === 0
-        && scanReport.complianceSummary.stale === 0,
+        && scanReport.complianceSummary.stale === 0
+        && aiGate.status !== 'blocked'
+        && (aiGate.dependency_invalidations || []).filter((item) => item.severity === 'blocked').length === 0,
       ai_gate_status: aiGate.status,
       boundary_validations: aiGate.boundary_validations || [],
+      dependency_invalidations: aiGate.dependency_invalidations || [],
       compliance: scanReport.complianceSummary,
+      semantic_conflicts: scanReport.semanticConflicts || [],
     },
     next_steps: attention.length > 0
       ? [...new Set(attention.map((item) => item.next_step))].slice(0, 5)
@@ -445,6 +478,27 @@ function acquireNextTaskLease(db, worktreeName, agent, attempts = 20) {
   }
 
   return { task: null, lease: null, exhausted: false };
+}
+
+function acquireNextTaskLeaseWithRetries(repoRoot, worktreeName, agent, attempts = 20) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let db = null;
+    try {
+      db = openDb(repoRoot);
+      const result = acquireNextTaskLease(db, worktreeName, agent, attempts);
+      db.close();
+      return result;
+    } catch (err) {
+      lastError = err;
+      try { db?.close(); } catch { /* no-op */ }
+      if (!isBusyError(err) || attempt === attempts) {
+        throw err;
+      }
+      sleepSync(100 * attempt);
+    }
+  }
+  throw lastError;
 }
 
 // ─── Program ──────────────────────────────────────────────────────────────────
@@ -690,10 +744,8 @@ taskCmd
   .option('--agent <name>', 'Agent identifier for logging (e.g. claude-code)')
   .action((opts) => {
     const repoRoot = getRepo();
-    const db = getDb(repoRoot);
     const worktreeName = getCurrentWorktreeName(opts.worktree);
-    const { task, lease, exhausted } = acquireNextTaskLease(db, worktreeName, opts.agent || null);
-    db.close();
+    const { task, lease, exhausted } = acquireNextTaskLeaseWithRetries(repoRoot, worktreeName, opts.agent || null);
 
     if (!task) {
       if (opts.json) console.log(JSON.stringify({ task: null }));
@@ -1054,10 +1106,8 @@ leaseCmd
   .option('--agent <name>', 'Agent identifier for logging')
   .action((opts) => {
     const repoRoot = getRepo();
-    const db = getDb(repoRoot);
     const worktreeName = getCurrentWorktreeName(opts.worktree);
-    const { task, lease, exhausted } = acquireNextTaskLease(db, worktreeName, opts.agent || null);
-    db.close();
+    const { task, lease, exhausted } = acquireNextTaskLeaseWithRetries(repoRoot, worktreeName, opts.agent || null);
 
     if (!task) {
       if (opts.json) console.log(JSON.stringify({ task: null, lease: null }));
@@ -1485,6 +1535,16 @@ program
         console.log('');
       }
 
+      if ((report.semanticConflicts?.length || 0) > 0) {
+        console.log(chalk.yellow(`⚠ Semantic overlaps detected:`));
+        for (const conflict of report.semanticConflicts) {
+          console.log(`  ${chalk.yellow(conflict.object_name)}`);
+          console.log(`    ${chalk.dim('changed by:')} ${conflict.worktreeA}, ${conflict.worktreeB}`);
+          console.log(`    ${chalk.dim('files:')} ${conflict.fileA} ↔ ${conflict.fileB}`);
+        }
+        console.log('');
+      }
+
       // Branch-level conflicts
       if (report.conflicts.length > 0) {
         console.log(chalk.red(`✗ Branch conflicts detected:`));
@@ -1514,7 +1574,7 @@ program
       }
 
       // All clear
-      if (report.conflicts.length === 0 && report.fileConflicts.length === 0 && (report.ownershipConflicts?.length || 0) === 0 && report.unclaimedChanges.length === 0) {
+      if (report.conflicts.length === 0 && report.fileConflicts.length === 0 && (report.ownershipConflicts?.length || 0) === 0 && (report.semanticConflicts?.length || 0) === 0 && report.unclaimedChanges.length === 0) {
         console.log(chalk.green(`✓ No conflicts detected across ${report.worktrees.length} worktree(s)`));
       }
 
@@ -1560,7 +1620,11 @@ program
       for (const lease of activeLeases) {
         const agent = lease.agent ? ` ${chalk.dim(`agent:${lease.agent}`)}` : '';
         const scope = summarizeLeaseScope(db, lease);
-        console.log(`  ${chalk.cyan(lease.worktree)} → ${lease.task_title} ${chalk.dim(lease.id)} ${chalk.dim(`task:${lease.task_id}`)}${agent}${scope ? ` ${chalk.dim(scope)}` : ''}`);
+        const boundaryValidation = getBoundaryValidationState(db, lease.id);
+        const dependencyInvalidations = listDependencyInvalidations(db, { affectedTaskId: lease.task_id });
+        const boundary = boundaryValidation ? ` ${chalk.dim(`validation:${boundaryValidation.status}`)}` : '';
+        const staleMarker = dependencyInvalidations.length > 0 ? ` ${chalk.dim(`stale:${dependencyInvalidations.length}`)}` : '';
+        console.log(`  ${chalk.cyan(lease.worktree)} → ${lease.task_title} ${chalk.dim(lease.id)} ${chalk.dim(`task:${lease.task_id}`)}${agent}${scope ? ` ${chalk.dim(scope)}` : ''}${boundary}${staleMarker}`);
       }
     } else if (inProgress.length > 0) {
       console.log('');
@@ -1632,7 +1696,7 @@ program
       const report = await scanAllWorktrees(db, repoRoot);
       spinner.stop();
 
-      const totalConflicts = report.conflicts.length + report.fileConflicts.length + (report.ownershipConflicts?.length || 0) + report.unclaimedChanges.length;
+      const totalConflicts = report.conflicts.length + report.fileConflicts.length + (report.ownershipConflicts?.length || 0) + (report.semanticConflicts?.length || 0) + report.unclaimedChanges.length;
       if (totalConflicts === 0) {
         console.log(chalk.green(`✓ No conflicts across ${report.worktrees.length} worktree(s)`));
       } else {
@@ -1666,6 +1730,26 @@ program
           } else {
             console.log(`  ${chalk.cyan(conflict.worktreeA)}: ${chalk.dim(conflict.scopeA)} ${chalk.dim('vs')} ${chalk.cyan(conflict.worktreeB)} ${chalk.dim(conflict.scopeB)}`);
           }
+        }
+      }
+
+      if ((report.semanticConflicts?.length || 0) > 0) {
+        console.log('');
+        console.log(chalk.bold('Semantic Overlaps:'));
+        for (const conflict of report.semanticConflicts.slice(0, 5)) {
+          console.log(`  ${chalk.cyan(conflict.worktreeA)}: ${chalk.dim(conflict.object_name)} ${chalk.dim('vs')} ${chalk.cyan(conflict.worktreeB)} ${chalk.dim(`${conflict.fileA} ↔ ${conflict.fileB}`)}`);
+        }
+      }
+
+      const staleInvalidations = listDependencyInvalidations(db, { status: 'stale' });
+      if (staleInvalidations.length > 0) {
+        console.log('');
+        console.log(chalk.bold('Stale For Revalidation:'));
+        for (const invalidation of staleInvalidations.slice(0, 5)) {
+          const staleArea = invalidation.reason_type === 'subsystem_overlap'
+            ? `subsystem:${invalidation.subsystem_tag}`
+            : `${invalidation.source_scope_pattern} ↔ ${invalidation.affected_scope_pattern}`;
+          console.log(`  ${chalk.cyan(invalidation.affected_worktree || 'unknown')}: ${chalk.dim(staleArea)} ${chalk.dim('because')} ${chalk.cyan(invalidation.source_worktree || 'unknown')} changed it`);
         }
       }
 
@@ -1742,7 +1826,13 @@ program
       console.log(chalk.bold('Running now:'));
       for (const item of report.active_work.slice(0, 5)) {
         const leaseId = activeLeases.find((lease) => lease.task_id === item.task_id && lease.worktree === item.worktree)?.id || null;
-        console.log(`  ${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}${leaseId ? ` ${chalk.dim(`lease:${leaseId}`)}` : ''}${item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : ''}`);
+        const boundary = item.boundary_validation
+          ? ` ${chalk.dim(`validation:${item.boundary_validation.status}`)}`
+          : '';
+        const stale = (item.dependency_invalidations?.length || 0) > 0
+          ? ` ${chalk.dim(`stale:${item.dependency_invalidations.length}`)}`
+          : '';
+        console.log(`  ${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}${leaseId ? ` ${chalk.dim(`lease:${leaseId}`)}` : ''}${item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : ''}${boundary}${stale}`);
       }
     }
 
@@ -1887,23 +1977,27 @@ gateCmd
     const ok = report.conflicts.length === 0
       && report.fileConflicts.length === 0
       && (report.ownershipConflicts?.length || 0) === 0
+      && (report.semanticConflicts?.length || 0) === 0
       && report.unclaimedChanges.length === 0
       && report.complianceSummary.non_compliant === 0
       && report.complianceSummary.stale === 0
-      && aiGate.status !== 'blocked';
+      && aiGate.status !== 'blocked'
+      && (aiGate.dependency_invalidations?.filter((item) => item.severity === 'blocked').length || 0) === 0;
 
     const result = {
       ok,
       summary: ok
         ? `Repo gate passed for ${report.worktrees.length} worktree(s).`
-        : 'Repo gate rejected unmanaged changes, stale leases, worktree conflicts, or boundary validation failures.',
+        : 'Repo gate rejected unmanaged changes, stale leases, ownership conflicts, stale dependency invalidations, or boundary validation failures.',
       compliance: report.complianceSummary,
       unclaimed_changes: report.unclaimedChanges,
       file_conflicts: report.fileConflicts,
       ownership_conflicts: report.ownershipConflicts || [],
+      semantic_conflicts: report.semanticConflicts || [],
       branch_conflicts: report.conflicts,
       ai_gate_status: aiGate.status,
       boundary_validations: aiGate.boundary_validations || [],
+      dependency_invalidations: aiGate.dependency_invalidations || [],
     };
 
     const githubTargets = resolveGitHubOutputTargets(opts);
@@ -1943,6 +2037,12 @@ gateCmd
           }
         }
       }
+      if (result.semantic_conflicts.length > 0) {
+        console.log(chalk.bold('  Semantic conflicts:'));
+        for (const conflict of result.semantic_conflicts) {
+          console.log(`    ${chalk.yellow(conflict.object_name)} ${chalk.dim(`${conflict.worktreeA} vs ${conflict.worktreeB}`)}`);
+        }
+      }
       if (result.branch_conflicts.length > 0) {
         console.log(chalk.bold('  Branch conflicts:'));
         for (const conflict of result.branch_conflicts) {
@@ -1953,6 +2053,12 @@ gateCmd
         console.log(chalk.bold('  Boundary validations:'));
         for (const validation of result.boundary_validations) {
           console.log(`    ${chalk.yellow(validation.task_id)} ${chalk.dim(validation.missing_task_types.join(', '))}`);
+        }
+      }
+      if (result.dependency_invalidations.length > 0) {
+        console.log(chalk.bold('  Stale dependency invalidations:'));
+        for (const invalidation of result.dependency_invalidations) {
+          console.log(`    ${chalk.yellow(invalidation.affected_task_id)} ${chalk.dim(invalidation.stale_area)}`);
         }
       }
     }
@@ -2011,6 +2117,20 @@ gateCmd
         }
       }
 
+      if ((result.dependency_invalidations?.length || 0) > 0) {
+        console.log(chalk.bold('  Stale dependency invalidations:'));
+        for (const invalidation of result.dependency_invalidations.slice(0, 5)) {
+          console.log(`    ${chalk.cyan(invalidation.affected_task_id)} ${chalk.dim(invalidation.severity)} ${chalk.dim(invalidation.stale_area)}`);
+        }
+      }
+
+      if ((result.semantic_conflicts?.length || 0) > 0) {
+        console.log(chalk.bold('  Semantic conflicts:'));
+        for (const conflict of result.semantic_conflicts.slice(0, 5)) {
+          console.log(`    ${chalk.cyan(conflict.object_name)} ${chalk.dim(conflict.type)} ${chalk.dim(`${conflict.worktreeA} vs ${conflict.worktreeB}`)}`);
+        }
+      }
+
       const riskyWorktrees = result.worktrees.filter((worktree) => worktree.findings.length > 0);
       if (riskyWorktrees.length > 0) {
         console.log(chalk.bold('  Worktree signals:'));
@@ -2024,6 +2144,103 @@ gateCmd
     }
 
     if (result.status === 'blocked') process.exitCode = 1;
+  });
+
+const semanticCmd = program
+  .command('semantic')
+  .description('Inspect or materialize the derived semantic code-object view');
+
+semanticCmd
+  .command('materialize')
+  .description('Write a deterministic semantic index artifact to .switchman/semantic-index.json')
+  .action(() => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const worktrees = listWorktrees(db);
+    const result = materializeSemanticIndex(repoRoot, { worktrees });
+    db.close();
+    console.log(`${chalk.green('✓')} Wrote semantic index to ${chalk.cyan(result.output_path)}`);
+  });
+
+const objectCmd = program
+  .command('object')
+  .description('Experimental object-source mode backed by canonical exported code objects');
+
+objectCmd
+  .command('import')
+  .description('Import exported code objects from tracked source files into the canonical object store')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const objects = importCodeObjectsToStore(db, repoRoot);
+    db.close();
+    if (opts.json) {
+      console.log(JSON.stringify({ object_count: objects.length, objects }, null, 2));
+      return;
+    }
+    console.log(`${chalk.green('✓')} Imported ${objects.length} code object(s) into the canonical store`);
+  });
+
+objectCmd
+  .command('list')
+  .description('List canonical code objects currently stored in Switchman')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const objects = listCodeObjects(db);
+    db.close();
+    if (opts.json) {
+      console.log(JSON.stringify({ object_count: objects.length, objects }, null, 2));
+      return;
+    }
+    if (objects.length === 0) {
+      console.log(chalk.dim('No canonical code objects stored yet. Run `switchman object import` first.'));
+      return;
+    }
+    for (const object of objects) {
+      console.log(`${chalk.cyan(object.object_id)} ${chalk.dim(`${object.file_path} ${object.kind}`)}`);
+    }
+  });
+
+objectCmd
+  .command('update <objectId>')
+  .description('Update the canonical source text for a stored code object')
+  .requiredOption('--text <source>', 'Replacement exported source text')
+  .option('--json', 'Output raw JSON')
+  .action((objectId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const object = updateCodeObjectSource(db, objectId, opts.text);
+    db.close();
+    if (!object) {
+      console.error(chalk.red(`Unknown code object: ${objectId}`));
+      process.exitCode = 1;
+      return;
+    }
+    if (opts.json) {
+      console.log(JSON.stringify({ object }, null, 2));
+      return;
+    }
+    console.log(`${chalk.green('✓')} Updated ${chalk.cyan(object.object_id)} in the canonical object store`);
+  });
+
+objectCmd
+  .command('materialize')
+  .description('Materialize source files from the canonical object store')
+  .option('--output-root <path>', 'Alternate root directory to write materialized files into')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const result = materializeCodeObjects(db, repoRoot, { outputRoot: opts.outputRoot || repoRoot });
+    db.close();
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(`${chalk.green('✓')} Materialized ${result.file_count} file(s) from the canonical object store`);
   });
 
 // ── monitor ──────────────────────────────────────────────────────────────────
