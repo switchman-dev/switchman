@@ -29,7 +29,7 @@ If you prefer a global fallback, add this to `~/.claude/claude_desktop_config.js
 }
 ```
 
-Project-local MCP config is still the preferred path because it travels with the repo and generated worktrees.
+Project-local MCP config is still the preferred path because it travels with the repo and generated workspaces.
 
 ## 3. Copy `CLAUDE.md` into your repo root
 
@@ -49,7 +49,7 @@ switchman task add "Update README" --priority 2
 
 ## 5. Open Claude Code in each workspace
 
-Open a separate Claude Code window in each folder that `switchman setup` created. Each agent should automatically see the local MCP config, pick up a task, lock the files it needs, and release them when it's done.
+Open a separate Claude Code window in each workspace folder that `switchman setup` created. Each agent should automatically see the local MCP config, pick up a task, lock the files it needs, and release them when it's done.
 
 ## 6. Check before merging
 

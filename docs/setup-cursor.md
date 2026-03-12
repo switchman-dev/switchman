@@ -9,7 +9,7 @@ cd my-project
 switchman setup --agents 5
 ```
 
-This writes `.cursor/mcp.json` into the repo root and each generated worktree.
+This writes `.cursor/mcp.json` into the repo root and each generated workspace.
 
 ## 2. Add your tasks
 
@@ -21,7 +21,7 @@ switchman task add "Update README" --priority 2
 
 ## 3. Open Cursor in each workspace
 
-Open a separate Cursor window in each folder that `switchman setup` created. Cursor should discover the local MCP config automatically.
+Open a separate Cursor window in each workspace folder that `switchman setup` created. Cursor should discover the local MCP config automatically.
 
 ## 4. Check the run from the repo root
 
@@ -33,5 +33,5 @@ switchman gate ci
 
 ## Notes
 
-- Switchman also writes `.mcp.json` for Claude Code in the same repo/worktrees.
+- Switchman also writes `.mcp.json` for Claude Code in the same repo and workspaces.
 - Cursor config is project-local, so it travels with the repo and does not require a global install step.

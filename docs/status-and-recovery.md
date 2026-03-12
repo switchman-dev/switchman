@@ -26,9 +26,9 @@ switchman status --watch --watch-interval-ms 2000
 Use this before merge, or whenever you suspect overlapping work.
 
 It surfaces:
-- changed files per worktree
+- changed files per workspace
 - unmanaged changes
-- conflict signals across worktrees
+- conflict signals across workspaces
 
 ## `switchman gate ci`
 

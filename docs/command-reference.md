@@ -5,16 +5,20 @@
 ### `switchman setup`
 - creates agent workspaces
 - initialises the database
-- writes `.mcp.json` and `.cursor/mcp.json` to the repo root and each generated worktree
+- writes `.mcp.json` and `.cursor/mcp.json` to the repo root and each generated workspace
 
 Useful options:
 - `--agents 3`
 - `--prefix switchman`
 
 ### `switchman init`
-- initialise in the current git repo without creating worktrees
+- initialise in the current git repo without creating extra workspaces
 
 ## Tasks and leases
+
+Plain-English note:
+- `lease` means “this task is currently checked out by an agent”
+- `worktree` in command names means the agent workspace folder
 
 ### `switchman task add <title>`
 ### `switchman task list`

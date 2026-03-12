@@ -1,8 +1,8 @@
 # Stale Lease Policy
 
-Switchman can store a repo-level policy for stale lease recovery.
+Switchman can store repo rules for recovering stuck or abandoned agent work.
 
-This is useful when some agents are interactive, some are automated, and you want the repo to enforce one consistent rule for heartbeat cadence and stale-work cleanup.
+This is useful when some agents are interactive, some are automated, and you want the repo to enforce one consistent rule for heartbeat timing and stuck-work cleanup.
 
 ## Inspect the active policy
 
@@ -32,10 +32,10 @@ switchman lease policy set --requeue-task-on-reap false
 ```
 
 What these settings do:
-- `heartbeat_interval_seconds`
-- `stale_after_minutes`
-- `reap_on_status_check`
-- `requeue_task_on_reap`
+- `heartbeat_interval_seconds` — how often long-running work should check in
+- `stale_after_minutes` — when Switchman considers work abandoned
+- `reap_on_status_check` — whether `switchman status` should clean up stale work automatically
+- `requeue_task_on_reap` — whether cleaned-up work goes back to pending instead of failing
 
 ## Typical policy choices
 

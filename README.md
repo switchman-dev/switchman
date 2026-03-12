@@ -6,6 +6,10 @@ Switchman acts like a project manager for your AI coding assistants. It hands ou
 
 When you run multiple agents on the same repo, they need shared coordination or they collide, duplicate work, and create risky merges. Switchman gives them leases, scoped ownership, merge gates, and landing workflows so they can move in parallel without stepping on each other.
 
+Plain-English note:
+- `workspace` means the folder each agent works in
+- some commands still use the Git term `worktree`, because that is the underlying Git feature
+
 Questions, feedback, or testing Switchman with your team? Join the [Discord](https://discord.gg/pnT8BEC4D)
 
 ## Install
@@ -35,7 +39,7 @@ switchman gate ci
 
 What `switchman setup` gives you:
 - one shared Switchman database in `.switchman/`
-- linked worktrees for each agent
+- linked workspaces for each agent
 - local MCP config for Claude Code and Cursor
 
 If you want a guided demo, see [examples/README.md](/Users/ned/Documents/GitHub/switchman/examples/README.md).
@@ -58,7 +62,7 @@ Pick the guide that matches how you work:
 - keeps long-running work alive with leases and heartbeats
 - flags stale or risky work before merge
 - lands finished work back onto `main` through a governed merge queue
-- checks the repo with merge gates, boundary validation, and CI output
+- checks the repo with safety gates, review checks, and CI output
 
 ## Start here when something feels stuck
 

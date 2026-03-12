@@ -1,8 +1,8 @@
 # Merge Queue
 
-Switchman can serialize finished work back onto `main`.
+Switchman can land finished work back onto `main` one change at a time.
 
-This is useful when several agent worktrees finish around the same time and you want safe, governed landing instead of manual merge juggling.
+This is useful when several agent workspaces finish around the same time and you want safe, governed landing instead of manual merge juggling.
 
 ## Happy-path flow
 
@@ -23,7 +23,7 @@ Before landing work it:
 - retries retryable merge failures up to the configured retry budget
 - blocks with an exact next action when human attention is needed
 
-## Queue a branch, worktree, or pipeline
+## Queue a branch, workspace, or pipeline
 
 ```bash
 switchman queue add feature/auth-hardening

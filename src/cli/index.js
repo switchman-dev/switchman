@@ -7,13 +7,13 @@
  *   switchman init               - Initialize in current repo
  *   switchman task add           - Add a task to the queue
  *   switchman task list          - List all tasks
- *   switchman task assign        - Assign task to a worktree
+ *   switchman task assign        - Assign task to a workspace
  *   switchman task done          - Mark task complete
- *   switchman worktree add       - Register a worktree
- *   switchman worktree list      - List registered worktrees
- *   switchman scan               - Scan for conflicts across worktrees
+ *   switchman worktree add       - Register a workspace
+ *   switchman worktree list      - List registered workspaces
+ *   switchman scan               - Scan for conflicts across workspaces
  *   switchman claim              - Claim files for a task
- *   switchman status             - Show full system status
+ *   switchman status             - Show the repo dashboard
  */
 
 import { program } from 'commander';
@@ -899,8 +899,8 @@ program
 
 program
   .command('setup')
-  .description('One-command setup: create agent worktrees and initialise switchman')
-  .option('-a, --agents <n>', 'Number of agent worktrees to create (default: 3)', '3')
+  .description('One-command setup: create agent workspaces and initialise Switchman')
+  .option('-a, --agents <n>', 'Number of agent workspaces to create (default: 3)', '3')
   .option('--prefix <prefix>', 'Branch prefix (default: switchman)', 'switchman')
   .action((opts) => {
     const agentCount = parseInt(opts.agents);
@@ -921,7 +921,7 @@ program
           stdio: ['pipe', 'pipe', 'pipe'],
         });
       } catch {
-        spinner.fail('Your repo needs at least one commit before worktrees can be created.');
+        spinner.fail('Your repo needs at least one commit before agent workspaces can be created.');
         console.log(chalk.dim('  Run: git commit --allow-empty -m "init"  then try again'));
         process.exit(1);
       }
@@ -929,7 +929,7 @@ program
       // Init the switchman database
       const db = initDb(repoRoot);
 
-      // Create one worktree per agent
+      // Create one workspace (git worktree) per agent
       const created = [];
       for (let i = 1; i <= agentCount; i++) {
         const name = `agent${i}`;
@@ -993,7 +993,7 @@ program
 
 // ── mcp ───────────────────────────────────────────────────────────────────────
 
-const mcpCmd = program.command('mcp').description('Manage editor MCP configuration for Switchman');
+const mcpCmd = program.command('mcp').description('Manage editor connections for Switchman');
 
 mcpCmd
   .command('install')
@@ -1029,7 +1029,7 @@ mcpCmd
 
 // ── task ──────────────────────────────────────────────────────────────────────
 
-const taskCmd = program.command('task').description('Manage the task queue');
+const taskCmd = program.command('task').description('Manage the task list');
 
 taskCmd
   .command('add <title>')
@@ -1085,7 +1085,7 @@ taskCmd
 
 taskCmd
   .command('assign <taskId> <worktree>')
-  .description('Assign a task to a worktree (compatibility shim for lease acquire)')
+  .description('Assign a task to a workspace (compatibility shim for lease acquire)')
   .option('--agent <name>', 'Agent name (e.g. claude-code)')
   .action((taskId, worktree, opts) => {
     const repoRoot = getRepo();
@@ -1129,7 +1129,7 @@ taskCmd
   .command('next')
   .description('Get and assign the next pending task (compatibility shim for lease next)')
   .option('--json', 'Output as JSON')
-  .option('--worktree <name>', 'Worktree to assign the task to (defaults to current worktree name)')
+  .option('--worktree <name>', 'Workspace to assign the task to (defaults to the current folder name)')
   .option('--agent <name>', 'Agent identifier for logging (e.g. claude-code)')
   .action((opts) => {
     const repoRoot = getRepo();
@@ -1159,12 +1159,12 @@ taskCmd
 
 // ── queue ─────────────────────────────────────────────────────────────────────
 
-const queueCmd = program.command('queue').description('Serialize governed worktree or branch merges back onto main');
+const queueCmd = program.command('queue').description('Land finished work safely back onto main, one item at a time');
 
 queueCmd
   .command('add [branch]')
-  .description('Add a branch, worktree, or pipeline to the merge queue')
-  .option('--worktree <name>', 'Queue a registered worktree by name')
+  .description('Add a branch, workspace, or pipeline to the landing queue')
+  .option('--worktree <name>', 'Queue a registered workspace by name')
   .option('--pipeline <pipelineId>', 'Queue a pipeline by id')
   .option('--target <branch>', 'Target branch to merge into', 'main')
   .option('--max-retries <n>', 'Maximum automatic retries', '1')
@@ -2178,13 +2178,13 @@ program
 
 program
   .command('scan')
-  .description('Scan all worktrees for conflicts')
+  .description('Scan all workspaces for conflicts')
   .option('--json', 'Output raw JSON')
   .option('--quiet', 'Only show conflicts')
   .action(async (opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
-    const spinner = ora('Scanning worktrees for conflicts...').start();
+    const spinner = ora('Scanning workspaces for conflicts...').start();
 
     try {
       const report = await scanAllWorktrees(db, repoRoot);
@@ -2277,7 +2277,7 @@ program
 
       // All clear
       if (report.conflicts.length === 0 && report.fileConflicts.length === 0 && (report.ownershipConflicts?.length || 0) === 0 && (report.semanticConflicts?.length || 0) === 0 && report.unclaimedChanges.length === 0) {
-        console.log(chalk.green(`✓ No conflicts detected across ${report.worktrees.length} worktree(s)`));
+        console.log(chalk.green(`✓ No conflicts detected across ${report.worktrees.length} workspace(s)`));
       }
 
     } catch (err) {
@@ -2291,7 +2291,7 @@ program
 
 program
   .command('status')
-  .description('Show one operational view of tasks, leases, queue state, and merge readiness')
+  .description('Show one dashboard view of what is running, blocked, and ready next')
   .option('--json', 'Output raw JSON')
   .option('--watch', 'Keep refreshing status in the terminal')
   .option('--watch-interval-ms <n>', 'Polling interval for --watch mode', '2000')
@@ -2415,7 +2415,7 @@ program
 
 // ── gate ─────────────────────────────────────────────────────────────────────
 
-const gateCmd = program.command('gate').description('Enforcement and commit-gate helpers');
+const gateCmd = program.command('gate').description('Safety checks for edits, merges, and CI');
 
 const auditCmd = program.command('audit').description('Inspect and verify the tamper-evident audit trail');
 
@@ -2627,7 +2627,7 @@ gateCmd
 
 gateCmd
   .command('ai')
-  .description('Run the AI-style merge gate to assess semantic integration risk across worktrees')
+  .description('Run the AI-style merge check to assess risky overlap across workspaces')
   .option('--json', 'Output raw JSON')
   .action(async (opts) => {
     const repoRoot = getRepo();
@@ -2794,7 +2794,7 @@ objectCmd
 
 // ── monitor ──────────────────────────────────────────────────────────────────
 
-const monitorCmd = program.command('monitor').description('Observe worktrees for runtime file mutations');
+const monitorCmd = program.command('monitor').description('Observe workspaces for runtime file changes');
 
 monitorCmd
   .command('once')
@@ -2828,7 +2828,7 @@ monitorCmd
 
 monitorCmd
   .command('watch')
-  .description('Poll worktrees continuously and log observed file changes')
+  .description('Poll workspaces continuously and log observed file changes')
   .option('--interval-ms <ms>', 'Polling interval in milliseconds', '2000')
   .option('--quarantine', 'Move or restore denied runtime changes immediately after detection')
   .option('--daemonized', 'Internal flag used by monitor start', false)
@@ -2841,7 +2841,7 @@ monitorCmd
       process.exit(1);
     }
 
-    console.log(chalk.cyan(`Watching worktrees every ${intervalMs}ms. Press Ctrl+C to stop.`));
+    console.log(chalk.cyan(`Watching workspaces every ${intervalMs}ms. Press Ctrl+C to stop.`));
 
     let stopped = false;
     const stop = () => {

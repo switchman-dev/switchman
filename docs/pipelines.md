@@ -1,6 +1,6 @@
 # Pipelines And PRs
 
-Switchman can take a backlog item through planning, governed execution, review, and PR handoff.
+Switchman can take one backlog item through planning, execution, review, and PR handoff.
 
 ## Happy-path flow
 
@@ -19,7 +19,7 @@ switchman pipeline publish pipe-123 --base main --draft
 1. start the pipeline
 2. run it
 3. inspect `pipeline status` if anything blocks
-4. review the PR artifact or publish the PR
+4. review the PR output or publish the PR
 
 ## Export a PR bundle
 

@@ -34,6 +34,10 @@ Before starting any work:
 Never edit a file you haven't claimed. If a claim fails, do not use --force.
 ```
 
+Plain-English note:
+- Switchman commands may say `worktree`
+- in practice, that just means the agent workspace folder
+
 ## 4. Check before merging
 
 ```bash

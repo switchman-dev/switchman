@@ -43,7 +43,7 @@ In Windsurf, check:
 - `Cascade`
 - `MCP Servers`
 
-Then open the repo or generated worktrees and let each agent use Switchman through MCP.
+Then open the repo or generated workspaces and let each agent use Switchman through MCP.
 
 ## 5. Check the run
 
