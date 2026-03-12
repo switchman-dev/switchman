@@ -678,6 +678,33 @@ test('Fix 8b: completed claimed work remains governed for compliance checks', ()
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 8c: active task-scoped changes remain governed for compliance checks', () => {
+  const repoDir = join(tmpdir(), `sw-enforce-scope-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const enforceDb = initDb(repoDir);
+  registerWorktree(enforceDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(enforceDb, { title: 'Implement: scoped governed change' });
+  assignTask(enforceDb, taskId, 'main');
+  upsertTaskSpec(enforceDb, taskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/scoped/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  execSync('mkdir -p src/scoped && printf "ok\\n" > src/scoped/governed.js', { cwd: repoDir, shell: '/bin/zsh' });
+
+  const compliance = evaluateWorktreeCompliance(enforceDb, repoDir, { name: 'main', path: repoDir, branch: 'main' });
+  assert(compliance.compliance_state === 'managed', 'In-scope task-owned changes remain managed without an explicit file claim');
+  assert(compliance.unclaimed_changed_files.length === 0, 'In-scope task-owned changes are not reported as unclaimed');
+  enforceDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 9: commit gate passes for claimed files under an active lease', () => {
   const repoDir = join(tmpdir(), `sw-gate-pass-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -783,6 +810,46 @@ test('Fix 12: managed write gateway allows claimed writes', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 12a: managed write gateway allows task-scoped writes without an explicit file claim', () => {
+  const repoDir = join(tmpdir(), `sw-write-scope-pass-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const writeDb = initDb(repoDir);
+  registerWorktree(writeDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(writeDb, { title: 'Scoped gateway write task' });
+  assignTask(writeDb, taskId, 'main');
+  const lease = getActiveLeaseForTask(writeDb, taskId);
+  upsertTaskSpec(writeDb, taskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/scoped/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+
+  const validation = validateWriteAccess(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/scoped/example.js',
+    worktree: 'main',
+  });
+  const result = gatewayWriteFile(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: 'src/scoped/example.js',
+    content: 'export const scoped = true;\n',
+    worktree: 'main',
+  });
+
+  assert(validation.ok, 'Validation allows an unclaimed path inside the lease task scope');
+  assert(validation.ownership_type === 'scope', 'Scoped validation reports scope ownership');
+  assert(result.ok, 'Write gateway allows an in-scope task-scoped write');
+  assert(readFileSync(join(repoDir, 'src/scoped/example.js'), 'utf8') === 'export const scoped = true;\n', 'Write gateway writes scoped content to disk');
+  writeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 13: managed write gateway rejects unclaimed paths', () => {
   const repoDir = join(tmpdir(), `sw-write-fail-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -815,6 +882,48 @@ test('Fix 13: managed write gateway rejects unclaimed paths', () => {
   assert(result.reason_code === 'path_not_claimed', 'Denied write returns path_not_claimed');
   writeDb.close();
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 13a: managed write gateway rejects paths scoped by another active lease', () => {
+  const mainDir = join(tmpdir(), `sw-scope-foreign-main-${Date.now()}`);
+  const otherDir = join(tmpdir(), `sw-scope-foreign-other-${Date.now()}`);
+  mkdirSync(mainDir, { recursive: true });
+  mkdirSync(otherDir, { recursive: true });
+  const scopeDb = initDb(mainDir);
+  registerWorktree(scopeDb, { name: 'main', path: mainDir, branch: 'main' });
+  registerWorktree(scopeDb, { name: 'agent2', path: otherDir, branch: 'feature/agent2' });
+
+  const foreignTaskId = createTask(scopeDb, { title: 'Foreign scoped ownership' });
+  assignTask(scopeDb, foreignTaskId, 'agent2');
+  const foreignLease = getActiveLeaseForTask(scopeDb, foreignTaskId);
+  upsertTaskSpec(scopeDb, foreignTaskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/shared/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+
+  const ownTaskId = createTask(scopeDb, { title: 'Own scoped ownership' });
+  assignTask(scopeDb, ownTaskId, 'main');
+  const ownLease = getActiveLeaseForTask(scopeDb, ownTaskId);
+  upsertTaskSpec(scopeDb, ownTaskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/shared/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+
+  const validation = validateWriteAccess(scopeDb, mainDir, {
+    leaseId: ownLease.id,
+    path: 'src/shared/example.js',
+    worktree: 'main',
+  });
+
+  assert(!validation.ok, 'Validation rejects a path already scoped by another active lease');
+  assert(validation.reason_code === 'path_scoped_by_other_lease', 'Scoped ownership conflicts use a dedicated reason code');
+  scopeDb.close();
+  rmSync(mainDir, { recursive: true, force: true });
+  rmSync(otherDir, { recursive: true, force: true });
 });
 
 test('Fix 14: managed remove gateway enforces the same claim policy', () => {
@@ -1471,6 +1580,14 @@ test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () 
 
   const doctorDb = initDb(repoDir);
   registerWorktree(doctorDb, { name: 'main', path: repoDir, branch: 'main' });
+  const activeTaskId = createTask(doctorDb, { title: 'Implement scoped auth update' });
+  assignTask(doctorDb, activeTaskId, 'main');
+  upsertTaskSpec(doctorDb, activeTaskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
   const taskId = createTask(doctorDb, { title: 'Update docs' });
   assignTask(doctorDb, taskId, 'main');
   failTask(doctorDb, taskId, 'changes_outside_task_scope: changed files outside task scope: src/rogue.js');
@@ -1489,6 +1606,7 @@ test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () 
   assert(jsonOutput.next_steps.some((step) => step.includes('allowed paths')), 'Doctor suggests a concrete next step for the failure');
   assert(jsonOutput.suggested_commands.some((command) => command.includes('pipeline status')), 'Doctor suggests an exact follow-through command');
   assert(jsonOutput.attention.some((item) => item.command && item.command.includes('pipeline status')), 'Doctor attention items include exact commands when available');
+  assert(jsonOutput.active_work.some((item) => item.scope_summary === 'scope:src/**'), 'Doctor JSON surfaces scope ownership for active leases');
 
   const textOutput = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
@@ -1500,6 +1618,7 @@ test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () 
   assert(textOutput.includes('Attention now:'), 'Doctor CLI prints an attention section');
   assert(textOutput.includes('next:'), 'Doctor CLI prints actionable next guidance');
   assert(textOutput.includes('run:'), 'Doctor CLI prints exact follow-through commands');
+  assert(textOutput.includes('scope:src/**'), 'Doctor CLI prints scope ownership for active leases');
   rmSync(repoDir, { recursive: true, force: true });
 });
 

@@ -4,7 +4,9 @@ import { execFileSync, spawnSync } from 'child_process';
 
 import {
   getActiveFileClaims,
+  getCompletedFileClaims,
   getLease,
+  getTaskSpec,
   getWorktree,
   getWorktreeSnapshotState,
   replaceWorktreeSnapshotState,
@@ -122,6 +124,62 @@ function diffSnapshots(previousSnapshot, currentSnapshot) {
   return changes.sort((a, b) => a.file_path.localeCompare(b.file_path));
 }
 
+function getLeaseScopePatterns(db, lease) {
+  return getTaskSpec(db, lease.task_id)?.allowed_paths || [];
+}
+
+function findScopedLeaseOwner(db, leases, filePath, excludeLeaseId = null) {
+  for (const lease of leases) {
+    if (excludeLeaseId && lease.id === excludeLeaseId) continue;
+    const patterns = getLeaseScopePatterns(db, lease);
+    if (patterns.length > 0 && matchesPathPatterns(filePath, patterns)) {
+      return lease;
+    }
+  }
+  return null;
+}
+
+function normalizeDirectoryScopeRoot(pattern) {
+  return String(pattern || '').replace(/\\/g, '/').replace(/\/\*\*$/, '').replace(/\/\*$/, '').replace(/\/+$/, '');
+}
+
+function scopeAllowsDirectory(patterns, directoryPath) {
+  const normalizedDir = String(directoryPath || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  return patterns.some((pattern) => {
+    const scopeRoot = normalizeDirectoryScopeRoot(pattern);
+    return scopeRoot === normalizedDir || scopeRoot.startsWith(`${normalizedDir}/`) || normalizedDir.startsWith(`${scopeRoot}/`);
+  });
+}
+
+function resolveLeasePathOwnership(db, lease, filePath, activeClaims, activeLeases) {
+  const ownClaim = activeClaims.find((claim) => claim.file_path === filePath && claim.lease_id === lease.id);
+  if (ownClaim) {
+    return { ok: true, reason_code: null, claim: ownClaim, ownership_type: 'claim' };
+  }
+
+  const foreignClaim = activeClaims.find((claim) => claim.file_path === filePath && claim.lease_id && claim.lease_id !== lease.id);
+  if (foreignClaim) {
+    return { ok: false, reason_code: 'path_claimed_by_other_lease', claim: foreignClaim, ownership_type: null };
+  }
+
+  const ownScopePatterns = getLeaseScopePatterns(db, lease);
+  const ownScopeMatch = ownScopePatterns.length > 0 && matchesPathPatterns(filePath, ownScopePatterns);
+  if (ownScopeMatch) {
+    const foreignScopeOwner = findScopedLeaseOwner(db, activeLeases, filePath, lease.id);
+    if (foreignScopeOwner) {
+      return { ok: false, reason_code: 'path_scoped_by_other_lease', claim: null, ownership_type: null };
+    }
+    return { ok: true, reason_code: 'path_within_task_scope', claim: null, ownership_type: 'scope' };
+  }
+
+  const foreignScopeOwner = findScopedLeaseOwner(db, activeLeases, filePath, lease.id);
+  if (foreignScopeOwner) {
+    return { ok: false, reason_code: 'path_scoped_by_other_lease', claim: null, ownership_type: null };
+  }
+
+  return { ok: false, reason_code: 'path_not_claimed', claim: null, ownership_type: null };
+}
+
 function classifyObservedPath(db, repoRoot, worktree, filePath, options = {}) {
   const activeLeases = options.activeLeases || listLeases(db, 'active');
   const activeClaims = options.activeClaims || getActiveFileClaims(db);
@@ -137,20 +195,20 @@ function classifyObservedPath(db, repoRoot, worktree, filePath, options = {}) {
   if (staleLeaseIds.has(activeLease.id)) {
     return { status: 'denied', reason_code: 'lease_expired', lease: activeLease, claim };
   }
-  if (!claim) {
-    if (matchesPathPatterns(filePath, policy.allowed_generated_paths || [])) {
-      return { status: 'allowed', reason_code: 'policy_exception_allowed', lease: activeLease, claim: null };
-    }
-    const foreignClaim = activeClaims.find((item) => item.file_path === filePath && item.lease_id && item.lease_id !== activeLease.id);
-    if (foreignClaim) {
-      return { status: 'denied', reason_code: 'path_claimed_by_other_lease', lease: activeLease, claim: foreignClaim };
-    }
-    return { status: 'denied', reason_code: 'path_not_claimed', lease: activeLease, claim: null };
+  const ownership = resolveLeasePathOwnership(db, activeLease, filePath, activeClaims, activeLeases);
+  if (ownership.ok) {
+    return {
+      status: 'allowed',
+      reason_code: ownership.reason_code,
+      lease: activeLease,
+      claim: ownership.claim ?? claim,
+      ownership_type: ownership.ownership_type,
+    };
   }
-  if (claim.lease_id && claim.lease_id !== activeLease.id) {
-    return { status: 'denied', reason_code: 'path_claimed_by_other_lease', lease: activeLease, claim };
+  if (matchesPathPatterns(filePath, policy.allowed_generated_paths || [])) {
+    return { status: 'allowed', reason_code: 'policy_exception_allowed', lease: activeLease, claim: null, ownership_type: 'policy' };
   }
-  return { status: 'allowed', reason_code: null, lease: activeLease, claim };
+  return { status: 'denied', reason_code: ownership.reason_code, lease: activeLease, claim: ownership.claim ?? claim, ownership_type: null };
 }
 
 function normalizeRepoPath(repoRoot, targetPath) {
@@ -227,36 +285,27 @@ export function validateWriteAccess(db, repoRoot, { leaseId, path: targetPath, w
   }
 
   normalized.absolutePath = join(leaseWorktree.path, normalized.relativePath);
+  const activeLeases = listLeases(db, 'active');
   const activeClaims = getActiveFileClaims(db).filter((claim) => claim.file_path === normalized.relativePath);
-  const ownClaim = activeClaims.find((claim) => claim.lease_id === lease.id);
-  if (ownClaim) {
+  const ownership = resolveLeasePathOwnership(db, lease, normalized.relativePath, activeClaims, activeLeases);
+  if (ownership.ok) {
     return {
       ok: true,
-      reason_code: null,
+      reason_code: ownership.reason_code,
       file_path: normalized.relativePath,
       absolute_path: normalized.absolutePath,
       lease,
-      claim: ownClaim,
-    };
-  }
-
-  const foreignClaim = activeClaims.find((claim) => claim.lease_id && claim.lease_id !== lease.id);
-  if (foreignClaim) {
-    return {
-      ok: false,
-      reason_code: 'path_claimed_by_other_lease',
-      file_path: normalized.relativePath,
-      lease,
-      claim: foreignClaim,
+      claim: ownership.claim,
+      ownership_type: ownership.ownership_type,
     };
   }
 
   return {
     ok: false,
-    reason_code: 'path_not_claimed',
+    reason_code: ownership.reason_code,
     file_path: normalized.relativePath,
     lease,
-    claim: null,
+    claim: ownership.claim,
   };
 }
 
@@ -317,7 +366,10 @@ function logWriteEvent(db, status, reasonCode, validation, eventType, details = 
     taskId: validation.lease?.task_id ?? null,
     leaseId: validation.lease?.id ?? null,
     filePath: validation.file_path ?? null,
-    details: details ? JSON.stringify(details) : null,
+    details: JSON.stringify({
+      ownership_type: validation.ownership_type ?? null,
+      ...(details || {}),
+    }),
   });
 }
 
@@ -514,8 +566,9 @@ export function gatewayMakeDirectory(db, repoRoot, { leaseId, path: targetPath, 
       claim.file_path.startsWith(`${normalizedPath}/`)
     ),
   );
+  const scopedDescendant = scopeAllowsDirectory(getLeaseScopePatterns(db, lease), normalizedPath);
 
-  if (!claimedDescendant) {
+  if (!claimedDescendant && !scopedDescendant) {
     const validation = {
       lease,
       file_path: normalizedPath,
@@ -531,7 +584,11 @@ export function gatewayMakeDirectory(db, repoRoot, { leaseId, path: targetPath, 
 
   const absolutePath = join(leaseWorktree.path, normalizedPath);
   mkdirSync(absolutePath, { recursive: true });
-  logWriteEvent(db, 'allowed', null, { lease, file_path: normalizedPath }, 'write_allowed', { operation: 'mkdir' });
+  logWriteEvent(db, 'allowed', scopedDescendant && !claimedDescendant ? 'path_within_task_scope' : null, {
+    lease,
+    file_path: normalizedPath,
+    ownership_type: scopedDescendant && !claimedDescendant ? 'scope' : 'claim',
+  }, 'write_allowed', { operation: 'mkdir' });
 
   return {
     ok: true,
@@ -645,23 +702,22 @@ export function evaluateWorktreeCompliance(db, repoRoot, worktree, options = {})
   const staleLeaseIds = options.staleLeaseIds || new Set(getStaleLeases(db).map((lease) => lease.id));
   const activeLeases = options.activeLeases || listLeases(db, 'active');
   const activeClaims = options.activeClaims || getActiveFileClaims(db);
+  const completedClaims = options.completedClaims || getCompletedFileClaims(db, worktree.name);
 
   const changedFiles = getWorktreeChangedFiles(worktree.path, repoRoot);
   const activeLease = activeLeases.find((lease) => lease.worktree === worktree.name) || null;
   const claimsForWorktree = activeClaims.filter((claim) => claim.worktree === worktree.name);
-  const claimsByPath = new Map(claimsForWorktree.map((claim) => [claim.file_path, claim]));
-  const currentLeaseClaims = new Set(
-    claimsForWorktree
-      .filter((claim) => !activeLease || claim.lease_id === activeLease.id)
-      .map((claim) => claim.file_path),
-  );
+  const completedClaimsByPath = new Map(completedClaims.map((claim) => [claim.file_path, claim]));
 
   const violations = [];
   const unclaimedChangedFiles = [];
 
   for (const file of changedFiles) {
-    const claim = claimsByPath.get(file);
+    const completedClaim = completedClaimsByPath.get(file);
     if (!activeLease) {
+      if (completedClaim) {
+        continue;
+      }
       violations.push({ file, reason_code: 'no_active_lease' });
       unclaimedChangedFiles.push(file);
       continue;
@@ -671,12 +727,9 @@ export function evaluateWorktreeCompliance(db, repoRoot, worktree, options = {})
       unclaimedChangedFiles.push(file);
       continue;
     }
-    if (!claim || !currentLeaseClaims.has(file)) {
-      if (claim && claim.lease_id && claim.lease_id !== activeLease.id) {
-        violations.push({ file, reason_code: 'path_claimed_by_other_lease' });
-      } else {
-        violations.push({ file, reason_code: 'path_not_claimed' });
-      }
+    const ownership = resolveLeasePathOwnership(db, activeLease, file, activeClaims, activeLeases);
+    if (!ownership.ok) {
+      violations.push({ file, reason_code: ownership.reason_code });
       unclaimedChangedFiles.push(file);
     }
   }
@@ -705,12 +758,19 @@ export function evaluateWorktreeCompliance(db, repoRoot, worktree, options = {})
 export function evaluateRepoCompliance(db, repoRoot, worktrees) {
   const activeLeases = listLeases(db, 'active');
   const activeClaims = getActiveFileClaims(db);
+  const completedClaims = getCompletedFileClaims(db);
   const staleLeaseIds = new Set(getStaleLeases(db).map((lease) => lease.id));
+  const completedClaimsByWorktree = completedClaims.reduce((acc, claim) => {
+    if (!acc[claim.worktree]) acc[claim.worktree] = [];
+    acc[claim.worktree].push(claim);
+    return acc;
+  }, {});
 
   const worktreeCompliance = worktrees.map((worktree) =>
     evaluateWorktreeCompliance(db, repoRoot, worktree, {
       activeLeases,
       activeClaims,
+      completedClaims: completedClaimsByWorktree[worktree.name] || [],
       staleLeaseIds,
     }),
   );

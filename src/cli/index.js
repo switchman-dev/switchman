@@ -26,10 +26,11 @@ import { findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.j
 import {
   initDb, openDb,
   DEFAULT_STALE_LEASE_MINUTES,
-  createTask, startTaskLease, completeTask, failTask, listTasks, getTask, getNextPendingTask,
+  createTask, startTaskLease, completeTask, failTask, getTaskSpec, listTasks, getTask, getNextPendingTask,
   listLeases, heartbeatLease, getStaleLeases, reapStaleLeases,
   registerWorktree, listWorktrees,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts,
+  verifyAuditTrail,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { upsertProjectMcpConfig } from '../core/mcp.js';
@@ -119,6 +120,18 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function summarizeLeaseScope(db, lease) {
+  const allowedPaths = getTaskSpec(db, lease.task_id)?.allowed_paths || [];
+  if (allowedPaths.length === 0) return null;
+  if (allowedPaths.length === 1) return `scope:${allowedPaths[0]}`;
+  return `scope:${allowedPaths.length} paths`;
+}
+
+function isBusyError(err) {
+  const message = String(err?.message || '').toLowerCase();
+  return message.includes('database is locked') || message.includes('sqlite_busy');
+}
+
 function humanizeReasonCode(reasonCode) {
   const labels = {
     no_active_lease: 'no active lease',
@@ -126,6 +139,8 @@ function humanizeReasonCode(reasonCode) {
     worktree_mismatch: 'wrong worktree',
     path_not_claimed: 'path not claimed',
     path_claimed_by_other_lease: 'claimed by another lease',
+    path_scoped_by_other_lease: 'scoped by another lease',
+    path_within_task_scope: 'within task scope',
     policy_exception_required: 'policy exception required',
     policy_exception_allowed: 'policy exception allowed',
     changes_outside_claims: 'changed files outside claims',
@@ -224,7 +239,7 @@ function commandForFailedTask(task, failure) {
   }
 }
 
-function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanReport, aiGate }) {
+function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, scanReport, aiGate }) {
   const failedTasks = tasks
     .filter((task) => task.status === 'failed')
     .map((task) => {
@@ -341,6 +356,7 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
       task_id: lease.task_id,
       task_title: lease.task_title,
       heartbeat_at: lease.heartbeat_at,
+      scope_summary: summarizeLeaseScope(db, lease),
     })),
     attention,
     merge_readiness: {
@@ -363,14 +379,20 @@ function buildDoctorReport({ repoRoot, tasks, activeLeases, staleLeases, scanRep
 
 function acquireNextTaskLease(db, worktreeName, agent, attempts = 5) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const task = getNextPendingTask(db);
-    if (!task) {
-      return { task: null, lease: null, exhausted: true };
-    }
+    try {
+      const task = getNextPendingTask(db);
+      if (!task) {
+        return { task: null, lease: null, exhausted: true };
+      }
 
-    const lease = startTaskLease(db, task.id, worktreeName, agent || null);
-    if (lease) {
-      return { task, lease, exhausted: false };
+      const lease = startTaskLease(db, task.id, worktreeName, agent || null);
+      if (lease) {
+        return { task, lease, exhausted: false };
+      }
+    } catch (err) {
+      if (!isBusyError(err) || attempt === attempts) {
+        throw err;
+      }
     }
 
     if (attempt < attempts) {
@@ -1477,7 +1499,9 @@ program
       console.log('');
       console.log(chalk.bold('Active Leases:'));
       for (const lease of activeLeases) {
-        console.log(`  ${chalk.cyan(lease.worktree)} → ${lease.task_title} ${chalk.dim(lease.id)}`);
+        const agent = lease.agent ? ` ${chalk.dim(`agent:${lease.agent}`)}` : '';
+        const scope = summarizeLeaseScope(db, lease);
+        console.log(`  ${chalk.cyan(lease.worktree)} → ${lease.task_title} ${chalk.dim(lease.id)} ${chalk.dim(`task:${lease.task_id}`)}${agent}${scope ? ` ${chalk.dim(scope)}` : ''}`);
       }
     } else if (inProgress.length > 0) {
       console.log('');
@@ -1613,6 +1637,7 @@ program
     const scanReport = await scanAllWorktrees(db, repoRoot);
     const aiGate = await runAiMergeGate(db, repoRoot);
     const report = buildDoctorReport({
+      db,
       repoRoot,
       tasks,
       activeLeases,
@@ -1645,7 +1670,8 @@ program
       console.log('');
       console.log(chalk.bold('Running now:'));
       for (const item of report.active_work.slice(0, 5)) {
-        console.log(`  ${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}`);
+        const leaseId = activeLeases.find((lease) => lease.task_id === item.task_id && lease.worktree === item.worktree)?.id || null;
+        console.log(`  ${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}${leaseId ? ` ${chalk.dim(`lease:${leaseId}`)}` : ''}${item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : ''}`);
       }
     }
 
@@ -1680,6 +1706,38 @@ program
 // ── gate ─────────────────────────────────────────────────────────────────────
 
 const gateCmd = program.command('gate').description('Enforcement and commit-gate helpers');
+
+const auditCmd = program.command('audit').description('Inspect and verify the tamper-evident audit trail');
+
+auditCmd
+  .command('verify')
+  .description('Verify the audit log hash chain and project signatures')
+  .option('--json', 'Output verification details as JSON')
+  .action((options) => {
+    const repo = getRepo();
+    const db = getDb(repo);
+    const result = verifyAuditTrail(db);
+
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+      process.exit(result.ok ? 0 : 1);
+    }
+
+    if (result.ok) {
+      console.log(chalk.green(`Audit trail verified: ${result.count} signed events in order.`));
+      return;
+    }
+
+    console.log(chalk.red(`Audit trail verification failed: ${result.failures.length} problem(s) across ${result.count} events.`));
+    for (const failure of result.failures.slice(0, 10)) {
+      const prefix = failure.sequence ? `#${failure.sequence}` : `event ${failure.id}`;
+      console.log(`  ${chalk.red(prefix)} ${failure.reason_code}: ${failure.message}`);
+    }
+    if (result.failures.length > 10) {
+      console.log(chalk.dim(`  ...and ${result.failures.length - 10} more`));
+    }
+    process.exit(1);
+  });
 
 gateCmd
   .command('commit')
