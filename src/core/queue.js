@@ -1,11 +1,8 @@
-import { getMergeQueueItem, listMergeQueue, listTasks, listWorktrees, markMergeQueueState, startMergeQueueItem } from './db.js';
+import { getMergeQueueItem, listMergeQueue, listWorktrees, markMergeQueueState, startMergeQueueItem } from './db.js';
 import { gitBranchExists, gitMergeBranchInto, gitRebaseOnto } from './git.js';
 import { runAiMergeGate } from './merge-gate.js';
+import { getPipelineStatus, resolvePipelineLandingTarget } from './pipeline.js';
 import { scanAllWorktrees } from './detector.js';
-
-function uniq(values) {
-  return [...new Set(values)];
-}
 
 function describeQueueError(err) {
   const message = String(err?.stderr || err?.message || err || '').trim();
@@ -113,40 +110,19 @@ export function resolveQueueSource(db, repoRoot, item) {
 
   if (item.source_type === 'pipeline') {
     const pipelineId = item.source_pipeline_id || item.source_ref;
-    const tasks = listTasks(db).filter((task) => task.id.startsWith(`${pipelineId}-`));
-    if (tasks.length === 0) {
-      throw new Error(`Pipeline ${pipelineId} does not exist.`);
-    }
-
-    const unfinishedTasks = tasks.filter((task) => task.status !== 'done');
-    if (unfinishedTasks.length > 0) {
-      throw new Error(`Pipeline ${pipelineId} is not ready to queue. Complete remaining tasks first: ${unfinishedTasks.map((task) => task.id).join(', ')}.`);
-    }
-
-    const worktreesByName = new Map(listWorktrees(db).map((entry) => [entry.name, entry]));
-    const candidateWorktrees = tasks
-      .map((task) => task.worktree ? worktreesByName.get(task.worktree) || null : null)
-      .filter(Boolean);
-    const candidateBranches = uniq(candidateWorktrees
-      .map((worktree) => worktree.branch)
-      .filter((branch) => branch && branch !== 'main' && branch !== 'unknown'));
-
-    if (candidateBranches.length === 0) {
-      throw new Error(`Pipeline ${pipelineId} has no landed worktree branch to queue.`);
-    }
-    if (candidateBranches.length > 1) {
-      throw new Error(`Pipeline ${pipelineId} spans multiple branches (${candidateBranches.join(', ')}). Queue a branch or worktree explicitly instead.`);
-    }
-
-    const worktree = candidateWorktrees.find((entry) => entry.branch === candidateBranches[0]) || null;
-    if (!worktree) {
-      throw new Error(`Queued pipeline branch ${candidateBranches[0]} is not registered.`);
-    }
+    const pipelineStatus = getPipelineStatus(db, pipelineId);
+    const landingTarget = resolvePipelineLandingTarget(db, repoRoot, pipelineStatus, {
+      requireCompleted: true,
+      allowCurrentBranchFallback: false,
+    });
+    const worktree = landingTarget.worktree
+      ? listWorktrees(db).find((entry) => entry.name === landingTarget.worktree) || null
+      : null;
 
     return {
-      branch: candidateBranches[0],
-      worktree: worktree.name,
-      worktree_path: worktree.path,
+      branch: landingTarget.branch,
+      worktree: worktree?.name || null,
+      worktree_path: worktree?.path || null,
       pipeline_id: pipelineId,
     };
   }

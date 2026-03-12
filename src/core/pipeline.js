@@ -788,42 +788,75 @@ export async function exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir
   };
 }
 
-function resolvePipelineHeadBranch(db, repoRoot, pipelineStatus, explicitHeadBranch = null) {
-  if (explicitHeadBranch) return explicitHeadBranch;
+function resolvePipelineBranchForTask(worktreesByName, task) {
+  const worktreeName = task.worktree || task.suggested_worktree || null;
+  const branch = worktreeName ? worktreesByName.get(worktreeName)?.branch || null : null;
+  return branch && branch !== 'main' && branch !== 'unknown' ? branch : null;
+}
+
+export function resolvePipelineLandingTarget(
+  db,
+  repoRoot,
+  pipelineStatus,
+  {
+    explicitHeadBranch = null,
+    requireCompleted = false,
+    allowCurrentBranchFallback = true,
+  } = {},
+) {
+  if (explicitHeadBranch) {
+    return {
+      branch: explicitHeadBranch,
+      worktree: null,
+      strategy: 'explicit',
+    };
+  }
+
+  if (requireCompleted) {
+    const unfinishedTasks = pipelineStatus.tasks.filter((task) => task.status !== 'done');
+    if (unfinishedTasks.length > 0) {
+      throw new Error(`Pipeline ${pipelineStatus.pipeline_id} is not ready to queue. Complete remaining tasks first: ${unfinishedTasks.map((task) => task.id).join(', ')}.`);
+    }
+  }
 
   const worktreesByName = new Map(listWorktrees(db).map((worktree) => [worktree.name, worktree]));
-  const resolveBranchForTask = (task) => {
-    const worktreeName = task.worktree || task.suggested_worktree || null;
-    const branch = worktreeName ? worktreesByName.get(worktreeName)?.branch || null : null;
-    return branch && branch !== 'main' && branch !== 'unknown' ? branch : null;
-  };
 
   const implementationBranches = uniq(
     pipelineStatus.tasks
       .filter((task) => task.task_spec?.task_type === 'implementation')
-      .map(resolveBranchForTask)
+      .map((task) => resolvePipelineBranchForTask(worktreesByName, task))
       .filter(Boolean),
   );
   if (implementationBranches.length === 1) {
-    return implementationBranches[0];
+    const branch = implementationBranches[0];
+    const worktree = pipelineStatus.tasks.find((task) =>
+      resolvePipelineBranchForTask(worktreesByName, task) === branch,
+    )?.worktree || null;
+    return { branch, worktree, strategy: 'implementation_branch' };
   }
 
   const candidateBranches = uniq(
     pipelineStatus.tasks
-      .map(resolveBranchForTask)
+      .map((task) => resolvePipelineBranchForTask(worktreesByName, task))
       .filter(Boolean),
   );
 
   if (candidateBranches.length === 1) {
-    return candidateBranches[0];
+    const branch = candidateBranches[0];
+    const worktree = pipelineStatus.tasks.find((task) =>
+      resolvePipelineBranchForTask(worktreesByName, task) === branch,
+    )?.worktree || null;
+    return { branch, worktree, strategy: 'single_branch' };
   }
 
-  const currentBranch = getWorktreeBranch(repoRoot);
-  if (currentBranch && currentBranch !== 'main') {
-    return currentBranch;
+  if (allowCurrentBranchFallback) {
+    const currentBranch = getWorktreeBranch(repoRoot);
+    if (currentBranch && currentBranch !== 'main') {
+      return { branch: currentBranch, worktree: null, strategy: 'current_branch' };
+    }
   }
 
-  return null;
+  throw new Error(`Pipeline ${pipelineStatus.pipeline_id} spans multiple branches (${candidateBranches.join(', ') || 'none inferred'}). Queue a branch or worktree explicitly.`);
 }
 
 export async function publishPipelinePr(
@@ -840,11 +873,12 @@ export async function publishPipelinePr(
 ) {
   const bundle = await exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir);
   const status = getPipelineStatus(db, pipelineId);
-  const resolvedHeadBranch = resolvePipelineHeadBranch(db, repoRoot, status, headBranch);
-
-  if (!resolvedHeadBranch) {
-    throw new Error(`Could not determine a head branch for pipeline ${pipelineId}. Pass --head <branch>.`);
-  }
+  const resolvedLandingTarget = resolvePipelineLandingTarget(db, repoRoot, status, {
+    explicitHeadBranch: headBranch,
+    requireCompleted: false,
+    allowCurrentBranchFallback: true,
+  });
+  const resolvedHeadBranch = resolvedLandingTarget.branch;
 
   const args = [
     'pr',

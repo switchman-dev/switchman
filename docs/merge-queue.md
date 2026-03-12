@@ -31,6 +31,12 @@ switchman queue add --worktree agent3
 switchman queue add --pipeline pipe-123
 ```
 
+When you queue a pipeline, Switchman resolves one landing branch for that pipeline.
+
+- If the pipeline has exactly one implementation branch, that branch is used.
+- Otherwise, if all completed pipeline work points at one non-`main` branch, that branch is used.
+- If the pipeline still has unfinished tasks or spans multiple landing branches, Switchman stops and tells you to queue a branch or worktree explicitly.
+
 Useful options:
 - `--target <branch>` — target branch to land into (default: `main`)
 - `--max-retries <n>` — automatic retry budget for retryable merge failures

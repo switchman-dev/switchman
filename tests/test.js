@@ -363,7 +363,56 @@ test('Merge queue add stores a queued worktree merge item', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Merge queue pipeline resolution rejects incomplete pipelines and ambiguous multi-branch pipelines', () => {
+test('Merge queue add validates pipeline landing semantics before enqueueing', () => {
+  const repoDir = join(tmpdir(), `sw-queue-add-pipeline-validate-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-add-pipeline-agent1-${Date.now()}`), branch: 'feature/pipeline-a' });
+  registerWorktree(queueDb, { name: 'agent2', path: join(tmpdir(), `sw-queue-add-pipeline-agent2-${Date.now()}`), branch: 'feature/pipeline-b' });
+  const docsA = createTask(queueDb, { id: 'pipe-queue-add-01', title: 'Docs task A' });
+  upsertTaskSpec(queueDb, docsA, { pipeline_id: 'pipe-queue-add', task_type: 'docs' });
+  const docsB = createTask(queueDb, { id: 'pipe-queue-add-02', title: 'Docs task B' });
+  upsertTaskSpec(queueDb, docsB, { pipeline_id: 'pipe-queue-add', task_type: 'docs' });
+  assignTask(queueDb, docsA, 'agent1');
+  completeTask(queueDb, docsA);
+  assignTask(queueDb, docsB, 'agent2');
+  completeTask(queueDb, docsB);
+  queueDb.close();
+
+  let error = null;
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'queue',
+      'add',
+      '--pipeline',
+      'pipe-queue-add',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    });
+  } catch (err) {
+    error = err;
+  }
+
+  const verifyDb = openDb(repoDir);
+  const queueItems = listMergeQueue(verifyDb);
+
+  assert(error?.status === 1, 'queue add exits non-zero when a pipeline has no single landing branch');
+  assert(String(error?.stderr || '').includes('spans multiple branches'), 'queue add explains why the pipeline cannot be inferred');
+  assert(queueItems.length === 0, 'queue add does not enqueue an invalid pipeline landing item');
+  verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue pipeline resolution requires a completed pipeline and prefers the implementation branch', () => {
   const repoDir = join(tmpdir(), `sw-queue-pipeline-safety-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   execSync('git init -b main', { cwd: repoDir });
@@ -375,11 +424,13 @@ test('Merge queue pipeline resolution rejects incomplete pipelines and ambiguous
 
   const queueDb = initDb(repoDir);
   registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
-  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-pipeline-agent1-${Date.now()}`), branch: 'feature/pipeline-a' });
-  registerWorktree(queueDb, { name: 'agent2', path: join(tmpdir(), `sw-queue-pipeline-agent2-${Date.now()}`), branch: 'feature/pipeline-b' });
+  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-pipeline-agent1-${Date.now()}`), branch: 'feature/pipeline-impl' });
+  registerWorktree(queueDb, { name: 'agent2', path: join(tmpdir(), `sw-queue-pipeline-agent2-${Date.now()}`), branch: 'feature/pipeline-docs' });
 
   const incompleteA = createTask(queueDb, { id: 'pipe-unsafe-01', title: 'Pipeline task A' });
+  upsertTaskSpec(queueDb, incompleteA, { pipeline_id: 'pipe-unsafe', task_type: 'implementation' });
   const incompleteB = createTask(queueDb, { id: 'pipe-unsafe-02', title: 'Pipeline task B' });
+  upsertTaskSpec(queueDb, incompleteB, { pipeline_id: 'pipe-unsafe', task_type: 'docs' });
   assignTask(queueDb, incompleteA, 'agent1');
   completeTask(queueDb, incompleteA);
 
@@ -397,19 +448,53 @@ test('Merge queue pipeline resolution rejects incomplete pipelines and ambiguous
   assignTask(queueDb, incompleteB, 'agent2');
   completeTask(queueDb, incompleteB);
 
+  const resolved = resolveQueueSource(queueDb, repoDir, {
+    source_type: 'pipeline',
+    source_ref: 'pipe-unsafe',
+    source_pipeline_id: 'pipe-unsafe',
+  });
+
+  assert(String(incompleteError?.message || '').includes('not ready to queue'), 'Pipeline queueing rejects incomplete pipelines');
+  assert(resolved.branch === 'feature/pipeline-impl', 'Pipeline queueing prefers the implementation branch when one is available');
+  assert(resolved.worktree === 'agent1', 'Pipeline queueing returns the implementation worktree as the landing source');
+  queueDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue pipeline resolution rejects ambiguous pipelines with no single landing branch', () => {
+  const repoDir = join(tmpdir(), `sw-queue-pipeline-ambiguous-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-pipeline-ambiguous-agent1-${Date.now()}`), branch: 'feature/pipeline-docs-a' });
+  registerWorktree(queueDb, { name: 'agent2', path: join(tmpdir(), `sw-queue-pipeline-ambiguous-agent2-${Date.now()}`), branch: 'feature/pipeline-docs-b' });
+
+  const docsA = createTask(queueDb, { id: 'pipe-ambiguous-01', title: 'Docs task A' });
+  upsertTaskSpec(queueDb, docsA, { pipeline_id: 'pipe-ambiguous', task_type: 'docs' });
+  const docsB = createTask(queueDb, { id: 'pipe-ambiguous-02', title: 'Docs task B' });
+  upsertTaskSpec(queueDb, docsB, { pipeline_id: 'pipe-ambiguous', task_type: 'docs' });
+  assignTask(queueDb, docsA, 'agent1');
+  completeTask(queueDb, docsA);
+  assignTask(queueDb, docsB, 'agent2');
+  completeTask(queueDb, docsB);
+
   let ambiguousError = null;
   try {
     resolveQueueSource(queueDb, repoDir, {
       source_type: 'pipeline',
-      source_ref: 'pipe-unsafe',
-      source_pipeline_id: 'pipe-unsafe',
+      source_ref: 'pipe-ambiguous',
+      source_pipeline_id: 'pipe-ambiguous',
     });
   } catch (err) {
     ambiguousError = err;
   }
 
-  assert(String(incompleteError?.message || '').includes('not ready to queue'), 'Pipeline queueing rejects incomplete pipelines');
-  assert(String(ambiguousError?.message || '').includes('spans multiple branches'), 'Pipeline queueing rejects ambiguous multi-branch pipelines');
+  assert(String(ambiguousError?.message || '').includes('spans multiple branches'), 'Pipeline queueing rejects ambiguous pipelines without a single landing branch');
   queueDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });

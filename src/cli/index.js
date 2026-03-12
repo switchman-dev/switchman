@@ -39,7 +39,7 @@ import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcp
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
-import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
+import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, publishPipelinePr, resolvePipelineLandingTarget, runPipeline, startPipeline } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus } from '../core/ci.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, runMergeQueue } from '../core/queue.js';
@@ -1584,6 +1584,11 @@ Examples:
   switchman queue add feature/auth-hardening
   switchman queue add --worktree agent2
   switchman queue add --pipeline pipe-123
+
+Pipeline landing rule:
+  switchman queue add --pipeline <id>
+  lands the pipeline's inferred landing branch.
+  If Switchman cannot infer exactly one branch, queue the branch or worktree explicitly instead.
 `)
   .action((branch, opts) => {
     const repoRoot = getRepo();
@@ -1605,10 +1610,16 @@ Examples:
           submittedBy: opts.submittedBy || null,
         };
       } else if (opts.pipeline) {
+        const pipelineStatus = getPipelineStatus(db, opts.pipeline);
+        const landingTarget = resolvePipelineLandingTarget(db, repoRoot, pipelineStatus, {
+          requireCompleted: true,
+          allowCurrentBranchFallback: false,
+        });
         payload = {
           sourceType: 'pipeline',
           sourceRef: opts.pipeline,
           sourcePipelineId: opts.pipeline,
+          sourceWorktree: landingTarget.worktree || null,
           targetBranch: opts.target,
           maxRetries: opts.maxRetries,
           submittedBy: opts.submittedBy || null,
