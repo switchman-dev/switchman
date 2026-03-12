@@ -3,7 +3,7 @@
  * Worktree discovery and conflict detection via git merge-tree
  */
 
-import { execSync, spawnSync } from 'child_process';
+import { execFileSync, execSync, spawnSync } from 'child_process';
 import { existsSync, realpathSync } from 'fs';
 import { join, relative, resolve, basename } from 'path';
 import { filterIgnoredPaths } from './ignore.js';
@@ -263,6 +263,79 @@ export function getWorktreeBranch(worktreePath) {
     }).trim();
   } catch {
     return null;
+  }
+}
+
+export function gitBranchExists(repoRoot, branch) {
+  const result = spawnSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+  return result.status === 0;
+}
+
+export function gitRevParse(repoRoot, ref) {
+  try {
+    return execFileSync('git', ['rev-parse', ref], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+export function gitGetCurrentBranch(repoRoot) {
+  try {
+    return execFileSync('git', ['branch', '--show-current'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export function gitCheckout(repoRoot, ref) {
+  execFileSync('git', ['checkout', ref], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+export function gitRebaseOnto(repoRoot, baseBranch, topicBranch) {
+  const previousBranch = gitGetCurrentBranch(repoRoot);
+  try {
+    gitCheckout(repoRoot, topicBranch);
+    execFileSync('git', ['rebase', baseBranch], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } finally {
+    if (previousBranch && previousBranch !== topicBranch) {
+      try { gitCheckout(repoRoot, previousBranch); } catch { /* no-op */ }
+    }
+  }
+}
+
+export function gitMergeBranchInto(repoRoot, baseBranch, topicBranch) {
+  const previousBranch = gitGetCurrentBranch(repoRoot);
+  try {
+    gitCheckout(repoRoot, baseBranch);
+    execFileSync('git', ['merge', '--ff-only', topicBranch], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return gitRevParse(repoRoot, 'HEAD');
+  } finally {
+    if (previousBranch && previousBranch !== baseBranch) {
+      try { gitCheckout(repoRoot, previousBranch); } catch { /* no-op */ }
+    }
   }
 }
 

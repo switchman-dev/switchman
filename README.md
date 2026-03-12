@@ -112,6 +112,7 @@ That runs the included demo against the example API in [examples/README.md](/Use
 - prevents overlapping edits with file claims and scoped ownership
 - keeps long-running work alive with leases and heartbeats
 - flags stale or risky work before merge
+- lands finished work back onto `main` through a governed merge queue
 - checks the repo with merge gates, boundary validation, and CI output
 
 ---
@@ -287,6 +288,26 @@ switchman gate ci
 
 If it fails, Switchman has detected unmanaged changes, stale state, or merge-governance problems.
 
+### `switchman queue status`
+
+Use this when you want to see what is queued to land, what is retrying, and what is blocked.
+
+It shows:
+- retry counts and retry budget
+- the next item to land
+- blocked queue items with exact next steps
+- recent queue events
+
+### `switchman lease policy`
+
+Use this when you want to inspect or change how Switchman handles stale leases in this repo.
+
+It controls:
+- the recommended heartbeat interval
+- when a lease is considered stale
+- whether `switchman status` auto-reaps stale leases
+- whether stale work gets re-queued or failed when reaped
+
 ### Common recovery cases
 
 `A file claim is blocked`
@@ -300,6 +321,12 @@ If it fails, Switchman has detected unmanaged changes, stale state, or merge-gov
 
 ```bash
 switchman lease reap
+```
+
+- if you want this to happen automatically on status checks, configure:
+
+```bash
+switchman lease policy set --reap-on-status-check true
 ```
 
 `A pipeline task failed`
@@ -354,6 +381,24 @@ Refresh the heartbeat timestamp for a long-running lease so it does not get trea
 Expire stale leases, release their claims, and return their tasks to `pending`.
 - `--stale-after-minutes <n>` — staleness threshold (default: 15)
 
+### `switchman lease policy`
+Show the active stale-lease policy for the current repo.
+
+```bash
+switchman lease policy
+switchman lease policy --json
+```
+
+### `switchman lease policy set`
+Persist a stale-lease policy for the current repo.
+
+```bash
+switchman lease policy set --stale-after-minutes 20
+switchman lease policy set --heartbeat-interval-seconds 60
+switchman lease policy set --reap-on-status-check true
+switchman lease policy set --requeue-task-on-reap false
+```
+
 ### `switchman task done <taskId>`
 Mark a task complete and automatically release all file claims.
 When the task has an active lease, Switchman finalises the execution through that lease so provenance stays tied to the live session.
@@ -380,6 +425,134 @@ List all git worktrees with their registered agents and status.
 
 ### `switchman worktree sync`
 Re-sync git worktrees into the Switchman database (useful if you add worktrees after init).
+
+---
+
+## Stale lease policy
+
+Switchman can now store a repo-level policy for stale lease recovery.
+
+This is useful when some agents are interactive, some are automated, and you want the repo to enforce one consistent rule for heartbeat cadence and stale-work cleanup.
+
+### Inspect the active policy
+
+```bash
+switchman lease policy
+switchman lease policy --json
+```
+
+Default policy:
+
+```json
+{
+  "heartbeat_interval_seconds": 60,
+  "stale_after_minutes": 15,
+  "reap_on_status_check": false,
+  "requeue_task_on_reap": true
+}
+```
+
+### Update the policy
+
+```bash
+switchman lease policy set --heartbeat-interval-seconds 60
+switchman lease policy set --stale-after-minutes 15
+switchman lease policy set --reap-on-status-check true
+switchman lease policy set --requeue-task-on-reap false
+```
+
+What these settings do:
+- `heartbeat_interval_seconds` — the recommended heartbeat cadence for long-running work
+- `stale_after_minutes` — how long a lease can go without heartbeat before it is stale
+- `reap_on_status_check` — whether `switchman status` should automatically reap stale leases
+- `requeue_task_on_reap` — whether stale work returns to `pending` instead of being marked failed
+
+### Typical policy choices
+
+For interactive agents:
+- heartbeat more often
+- stale after a shorter window
+- auto-reap off if you prefer manual review
+
+For unattended automation:
+- auto-reap on
+- requeue on reap
+- use `switchman status` as a lightweight recovery loop
+
+---
+
+## Merge queue
+
+Switchman can now serialize finished work back onto `main`.
+
+This is useful when several agent worktrees finish around the same time and you want safe, governed landing instead of manual merge juggling.
+
+### Happy-path merge queue flow
+
+```bash
+switchman queue add --worktree agent1
+switchman queue add --worktree agent2
+
+switchman queue status
+switchman queue run --watch
+```
+
+What the merge queue does before landing work:
+- rebases the queued branch onto the latest target branch
+- runs the same repo-level safety checks behind `switchman gate ci`
+- fast-forwards the target branch when the item is safe to land
+- retries retryable merge failures up to the configured retry budget
+- blocks with an exact next action when human attention is needed
+
+### Queue a branch, worktree, or pipeline
+
+```bash
+switchman queue add feature/auth-hardening
+switchman queue add --worktree agent3
+switchman queue add --pipeline pipe-123
+```
+
+Useful options:
+- `--target <branch>` — target branch to land into (default: `main`)
+- `--max-retries <n>` — automatic retry budget for retryable merge failures
+
+### Inspect queue state
+
+```bash
+switchman queue list
+switchman queue status
+switchman queue status --json
+```
+
+`switchman queue status` shows:
+- queued, rebasing, merging, retrying, blocked, and merged counts
+- retry counts like `1/2`
+- recent queue events
+
+### Run the queue once or continuously
+
+```bash
+switchman queue run
+switchman queue run --watch
+switchman queue run --watch --watch-interval-ms 1000
+```
+
+Useful watch-mode options:
+- `--watch` — keep polling for new queue items
+- `--watch-interval-ms <n>` — polling interval
+- `--max-cycles <n>` — stop after a fixed number of polling cycles
+
+### Retry or remove blocked items
+
+```bash
+switchman queue retry <itemId>
+switchman queue remove <itemId>
+```
+
+Typical blocked cases:
+- repo gate failed
+- source branch disappeared
+- retry budget was exhausted after repeated merge conflicts
 
 ---
 
@@ -553,7 +726,6 @@ This is different from normal CI:
 
 ## Roadmap
 
-- [ ] Merge queue — serialize worktree→main merges with auto-retry
 - [ ] Automatic stale-lease policies — configurable heartbeat/reap behaviour
 - [ ] Cursor and Windsurf native MCP integration
 - [ ] Web dashboard

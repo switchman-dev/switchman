@@ -273,6 +273,38 @@ function ensureSchema(db) {
       area           TEXT,
       updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS merge_queue (
+      id                 TEXT PRIMARY KEY,
+      source_type        TEXT NOT NULL,
+      source_ref         TEXT NOT NULL,
+      source_worktree    TEXT,
+      source_pipeline_id TEXT,
+      target_branch      TEXT NOT NULL DEFAULT 'main',
+      status             TEXT NOT NULL DEFAULT 'queued',
+      retry_count        INTEGER NOT NULL DEFAULT 0,
+      max_retries        INTEGER NOT NULL DEFAULT 1,
+      last_error_code    TEXT,
+      last_error_summary TEXT,
+      next_action        TEXT,
+      merged_commit      TEXT,
+      submitted_by       TEXT,
+      created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+      last_attempt_at    TEXT,
+      started_at         TEXT,
+      finished_at        TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS merge_queue_events (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      queue_item_id TEXT NOT NULL,
+      event_type    TEXT NOT NULL,
+      status        TEXT,
+      details       TEXT,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY(queue_item_id) REFERENCES merge_queue(id) ON DELETE CASCADE
+    );
   `);
 
   const fileClaimColumns = getTableColumns(db, 'file_claims');
@@ -300,6 +332,11 @@ function ensureSchema(db) {
   }
   if (auditColumns.length > 0 && !auditColumns.includes('signature')) {
     db.exec(`ALTER TABLE audit_log ADD COLUMN signature TEXT`);
+  }
+
+  const mergeQueueColumns = getTableColumns(db, 'merge_queue');
+  if (mergeQueueColumns.length > 0 && !mergeQueueColumns.includes('last_attempt_at')) {
+    db.exec(`ALTER TABLE merge_queue ADD COLUMN last_attempt_at TEXT`);
   }
 
   db.exec(`
@@ -334,6 +371,10 @@ function ensureSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_dependency_invalidations_status ON dependency_invalidations(status);
     CREATE INDEX IF NOT EXISTS idx_code_objects_file_path ON code_objects(file_path);
     CREATE INDEX IF NOT EXISTS idx_code_objects_name ON code_objects(name);
+    CREATE INDEX IF NOT EXISTS idx_merge_queue_status ON merge_queue(status);
+    CREATE INDEX IF NOT EXISTS idx_merge_queue_created_at ON merge_queue(created_at);
+    CREATE INDEX IF NOT EXISTS idx_merge_queue_pipeline_id ON merge_queue(source_pipeline_id);
+    CREATE INDEX IF NOT EXISTS idx_merge_queue_events_item ON merge_queue_events(queue_item_id);
   `);
 
   migrateLegacyAuditLog(db);
@@ -1372,6 +1413,198 @@ export function getTask(db, taskId) {
   return db.prepare(`SELECT * FROM tasks WHERE id=?`).get(taskId);
 }
 
+export function enqueueMergeItem(db, {
+  id = null,
+  sourceType,
+  sourceRef,
+  sourceWorktree = null,
+  sourcePipelineId = null,
+  targetBranch = 'main',
+  maxRetries = 1,
+  submittedBy = null,
+} = {}) {
+  const itemId = id || makeId('mq');
+  db.prepare(`
+    INSERT INTO merge_queue (
+      id, source_type, source_ref, source_worktree, source_pipeline_id,
+      target_branch, status, retry_count, max_retries, submitted_by
+    )
+    VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
+  `).run(
+    itemId,
+    sourceType,
+    sourceRef,
+    sourceWorktree || null,
+    sourcePipelineId || null,
+    targetBranch || 'main',
+    Math.max(0, Number.parseInt(maxRetries, 10) || 0),
+    submittedBy || null,
+  );
+
+  logMergeQueueEvent(db, itemId, {
+    eventType: 'merge_queue_enqueued',
+    status: 'queued',
+    details: JSON.stringify({
+      source_type: sourceType,
+      source_ref: sourceRef,
+      source_worktree: sourceWorktree || null,
+      source_pipeline_id: sourcePipelineId || null,
+      target_branch: targetBranch || 'main',
+    }),
+  });
+
+  return getMergeQueueItem(db, itemId);
+}
+
+export function listMergeQueue(db, { status = null } = {}) {
+  if (status) {
+    return db.prepare(`
+      SELECT *
+      FROM merge_queue
+      WHERE status=?
+      ORDER BY datetime(created_at) ASC, id ASC
+    `).all(status);
+  }
+
+  return db.prepare(`
+    SELECT *
+    FROM merge_queue
+    ORDER BY datetime(created_at) ASC, id ASC
+  `).all();
+}
+
+export function getMergeQueueItem(db, itemId) {
+  return db.prepare(`
+    SELECT *
+    FROM merge_queue
+    WHERE id=?
+  `).get(itemId);
+}
+
+export function listMergeQueueEvents(db, itemId, { limit = 10 } = {}) {
+  return db.prepare(`
+    SELECT *
+    FROM merge_queue_events
+    WHERE queue_item_id=?
+    ORDER BY id DESC
+    LIMIT ?
+  `).all(itemId, limit);
+}
+
+export function logMergeQueueEvent(db, itemId, {
+  eventType,
+  status = null,
+  details = null,
+} = {}) {
+  db.prepare(`
+    INSERT INTO merge_queue_events (queue_item_id, event_type, status, details)
+    VALUES (?, ?, ?, ?)
+  `).run(itemId, eventType, status || null, details == null ? null : String(details));
+}
+
+export function startMergeQueueItem(db, itemId) {
+  return withImmediateTransaction(db, () => {
+    const item = getMergeQueueItem(db, itemId);
+    if (!item || !['queued', 'retrying'].includes(item.status)) {
+      return null;
+    }
+
+    db.prepare(`
+      UPDATE merge_queue
+      SET status='validating',
+          started_at=COALESCE(started_at, datetime('now')),
+          last_attempt_at=datetime('now'),
+          updated_at=datetime('now')
+      WHERE id=? AND status IN ('queued', 'retrying')
+    `).run(itemId);
+
+    logMergeQueueEvent(db, itemId, {
+      eventType: 'merge_queue_started',
+      status: 'validating',
+    });
+
+    return getMergeQueueItem(db, itemId);
+  });
+}
+
+export function markMergeQueueState(db, itemId, {
+  status,
+  lastErrorCode = null,
+  lastErrorSummary = null,
+  nextAction = null,
+  mergedCommit = null,
+  incrementRetry = false,
+} = {}) {
+  const terminal = ['merged', 'blocked', 'failed', 'canceled'].includes(status);
+  db.prepare(`
+    UPDATE merge_queue
+    SET status=?,
+        last_error_code=?,
+        last_error_summary=?,
+        next_action=?,
+        merged_commit=COALESCE(?, merged_commit),
+        retry_count=retry_count + ?,
+        updated_at=datetime('now'),
+        finished_at=CASE WHEN ? THEN datetime('now') ELSE finished_at END
+    WHERE id=?
+  `).run(
+    status,
+    lastErrorCode || null,
+    lastErrorSummary || null,
+    nextAction || null,
+    mergedCommit || null,
+    incrementRetry ? 1 : 0,
+    terminal ? 1 : 0,
+    itemId,
+  );
+
+  logMergeQueueEvent(db, itemId, {
+    eventType: 'merge_queue_state_changed',
+    status,
+    details: JSON.stringify({
+      last_error_code: lastErrorCode || null,
+      last_error_summary: lastErrorSummary || null,
+      next_action: nextAction || null,
+      merged_commit: mergedCommit || null,
+      increment_retry: incrementRetry,
+    }),
+  });
+
+  return getMergeQueueItem(db, itemId);
+}
+
+export function retryMergeQueueItem(db, itemId) {
+  const item = getMergeQueueItem(db, itemId);
+  if (!item || !['blocked', 'failed'].includes(item.status)) {
+    return null;
+  }
+
+  db.prepare(`
+    UPDATE merge_queue
+    SET status='retrying',
+        last_error_code=NULL,
+        last_error_summary=NULL,
+        next_action=NULL,
+        finished_at=NULL,
+        updated_at=datetime('now')
+    WHERE id=?
+  `).run(itemId);
+
+  logMergeQueueEvent(db, itemId, {
+    eventType: 'merge_queue_retried',
+    status: 'retrying',
+  });
+
+  return getMergeQueueItem(db, itemId);
+}
+
+export function removeMergeQueueItem(db, itemId) {
+  const item = getMergeQueueItem(db, itemId);
+  if (!item) return null;
+  db.prepare(`DELETE FROM merge_queue WHERE id=?`).run(itemId);
+  return item;
+}
+
 export function upsertTaskSpec(db, taskId, spec) {
   db.prepare(`
     INSERT INTO task_specs (task_id, spec_json, updated_at)
@@ -1626,7 +1859,7 @@ export function getStaleLeases(db, staleAfterMinutes = DEFAULT_STALE_LEASE_MINUT
   `).all(`-${staleAfterMinutes} minutes`);
 }
 
-export function reapStaleLeases(db, staleAfterMinutes = DEFAULT_STALE_LEASE_MINUTES) {
+export function reapStaleLeases(db, staleAfterMinutes = DEFAULT_STALE_LEASE_MINUTES, { requeueTask = true } = {}) {
   return withImmediateTransaction(db, () => {
     const staleLeases = getStaleLeases(db, staleAfterMinutes);
     if (!staleLeases.length) {
@@ -1655,11 +1888,28 @@ export function reapStaleLeases(db, staleAfterMinutes = DEFAULT_STALE_LEASE_MINU
         )
     `);
 
+    const failTaskForStaleLease = db.prepare(`
+      UPDATE tasks
+      SET status='failed',
+          description=COALESCE(description,'') || '\nFAILED: lease_expired: stale lease reaped',
+          updated_at=datetime('now')
+      WHERE id=? AND status='in_progress'
+        AND NOT EXISTS (
+          SELECT 1 FROM leases
+          WHERE task_id=?
+            AND status='active'
+        )
+    `);
+
     for (const lease of staleLeases) {
       expireLease.run(lease.id);
       releaseClaimsForLeaseTx(db, lease.id);
       releaseScopeReservationsForLeaseTx(db, lease.id);
-      resetTask.run(lease.task_id, lease.task_id);
+      if (requeueTask) {
+        resetTask.run(lease.task_id, lease.task_id);
+      } else {
+        failTaskForStaleLease.run(lease.task_id, lease.task_id);
+      }
       touchWorktreeLeaseState(db, lease.worktree, lease.agent, 'idle');
       logAuditEventTx(db, {
         eventType: 'lease_expired',

@@ -18,6 +18,7 @@ import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorStat
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 import { buildTaskSpec } from '../src/core/planner.js';
+import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../src/core/policy.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 const TEST_ZDOTDIR = join(tmpdir(), `switchman-zdotdir-${Date.now()}`);
@@ -43,6 +44,8 @@ import {
   listTasks,
   getTask,
   getNextPendingTask,
+  enqueueMergeItem,
+  listMergeQueue,
   listLeases,
   listBoundaryValidationStates,
   listDependencyInvalidations,
@@ -62,6 +65,7 @@ import {
   listAuditEvents,
   logAuditEvent,
   verifyAuditTrail,
+  retryMergeQueueItem,
 } from '../src/core/db.js';
 
 let passed = 0;
@@ -327,6 +331,369 @@ test('Task queue ordering', () => {
   assert(next.title === 'High priority', 'Queue returns highest priority first');
 });
 
+test('Merge queue add stores a queued worktree merge item', () => {
+  const repoDir = join(tmpdir(), `sw-queue-add-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-add-agent-${Date.now()}`), branch: 'feature/queue-add' });
+
+  const item = enqueueMergeItem(queueDb, {
+    sourceType: 'worktree',
+    sourceRef: 'feature/queue-add',
+    sourceWorktree: 'agent1',
+    targetBranch: 'main',
+  });
+  const items = listMergeQueue(queueDb);
+
+  assert(item.status === 'queued', 'Queue item starts queued');
+  assert(items.length === 1, 'Queue item is persisted');
+  assert(items[0].source_worktree === 'agent1', 'Queue item stores the queued worktree name');
+  queueDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run fast-forwards a clean worktree branch into main', () => {
+  const repoDir = join(tmpdir(), `sw-queue-run-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(tmpdir(), `sw-queue-run-agent-${Date.now()}`);
+  execSync(`git worktree add -b feature/queue-run "${agentPath}"`, { cwd: repoDir });
+  writeFileSync(join(agentPath, 'queue.txt'), 'queued\n');
+  execSync('git add queue.txt', { cwd: agentPath });
+  execSync('git commit -m "queue work"', { cwd: agentPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: agentPath, branch: 'feature/queue-run' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'worktree',
+    sourceRef: 'feature/queue-run',
+    sourceWorktree: 'agent1',
+    targetBranch: 'main',
+  });
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const updated = listMergeQueue(queueDb)[0];
+  const mainFile = readFileSync(join(repoDir, 'queue.txt'), 'utf8');
+
+  assert(cliResult.processed[0].status === 'merged', 'Queue runner reports a merged queue item');
+  assert(updated.status === 'merged', 'Queue item is marked merged');
+  assert(Boolean(updated.merged_commit), 'Merged queue item records the resulting commit');
+  assert(mainFile === 'queued\n', 'Merged queue work lands on the main branch');
+  queueDb.close();
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run blocks missing source branches with a clear reason', () => {
+  const repoDir = join(tmpdir(), `sw-queue-missing-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/missing-branch',
+    targetBranch: 'main',
+  });
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const updated = listMergeQueue(queueDb)[0];
+
+  assert(cliResult.processed[0].status === 'blocked', 'Queue runner blocks missing source branches');
+  assert(updated.last_error_code === 'source_missing', 'Blocked queue item records the missing-source error code');
+  assert(updated.next_action.includes('switchman queue retry'), 'Blocked queue item provides an exact retry command');
+  queueDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue retry resets a blocked item back to retrying', () => {
+  const repoDir = join(tmpdir(), `sw-queue-retry-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  const item = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/missing-branch',
+    targetBranch: 'main',
+  });
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const retried = retryMergeQueueItem(queueDb, item.id);
+
+  assert(retried.status === 'retrying', 'Retrying a blocked queue item resets it to retrying');
+  assert(retried.last_error_code === null, 'Retrying clears the last error code');
+  queueDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run blocks when the repo gate fails before merge', () => {
+  const repoDir = join(tmpdir(), `sw-queue-gate-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(tmpdir(), `sw-queue-gate-agent-${Date.now()}`);
+  execSync(`git worktree add -b feature/queue-gate "${agentPath}"`, { cwd: repoDir });
+  writeFileSync(join(agentPath, 'queue.txt'), 'queued\n');
+  execSync('git add queue.txt', { cwd: agentPath });
+  execSync('git commit -m "queue work"', { cwd: agentPath });
+  writeFileSync(join(repoDir, 'rogue.txt'), 'unclaimed\n');
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: agentPath, branch: 'feature/queue-gate' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'worktree',
+    sourceRef: 'feature/queue-gate',
+    sourceWorktree: 'agent1',
+    targetBranch: 'main',
+  });
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const updated = listMergeQueue(queueDb)[0];
+
+  assert(cliResult.processed[0].status === 'blocked', 'Queue runner blocks when the repo gate fails');
+  assert(updated.last_error_code === 'gate_failed', 'Blocked queue item records the gate failure code');
+  assert(updated.next_action.includes('switchman gate ci'), 'Blocked queue item points the operator at the repo gate');
+  queueDb.close();
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue status JSON includes retry counts and recent queue events', () => {
+  const repoDir = join(tmpdir(), `sw-queue-status-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/missing-branch',
+    targetBranch: 'main',
+    maxRetries: 2,
+  });
+  queueDb.close();
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(statusJson.items[0].max_retries === 2, 'Queue status JSON includes the retry budget');
+  assert(Array.isArray(statusJson.recent_events) && statusJson.recent_events.length > 0, 'Queue status JSON includes recent queue events');
+  assert(statusJson.summary.counts.queued === 1, 'Queue status JSON includes queue counts');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run watch mode polls for work and exits after max cycles', () => {
+  const repoDir = join(tmpdir(), `sw-queue-watch-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  queueDb.close();
+
+  const watchJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--watch',
+    '--watch-interval-ms',
+    '10',
+    '--max-cycles',
+    '2',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(watchJson.watch === true, 'Queue watch mode reports that watch mode was enabled');
+  assert(watchJson.cycles === 2, 'Queue watch mode respects the requested max cycle count');
+  assert(Array.isArray(watchJson.processed) && watchJson.processed.length === 0, 'Queue watch mode can poll without processing items');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run schedules an automatic retry for retryable rebase conflicts', () => {
+  const repoDir = join(tmpdir(), `sw-queue-auto-retry-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'base\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(tmpdir(), `sw-queue-auto-retry-agent-${Date.now()}`);
+  execSync(`git worktree add -b feature/queue-auto-retry "${agentPath}"`, { cwd: repoDir });
+  writeFileSync(join(agentPath, 'README.md'), 'feature\n');
+  execSync('git add README.md', { cwd: agentPath });
+  execSync('git commit -m "feature change"', { cwd: agentPath });
+  writeFileSync(join(repoDir, 'README.md'), 'main\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "main change"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: agentPath, branch: 'feature/queue-auto-retry' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'worktree',
+    sourceRef: 'feature/queue-auto-retry',
+    sourceWorktree: 'agent1',
+    targetBranch: 'main',
+    maxRetries: 1,
+  });
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const updated = listMergeQueue(queueDb)[0];
+
+  assert(cliResult.processed[0].status === 'retrying', 'Queue runner schedules a retry for retryable rebase conflicts');
+  assert(updated.status === 'retrying', 'Retryable merge failure leaves the queue item in retrying');
+  assert(updated.retry_count === 1, 'Retryable merge failure increments the retry count');
+  queueDb.close();
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run blocks once retry budget is exhausted for rebase conflicts', () => {
+  const repoDir = join(tmpdir(), `sw-queue-retry-exhausted-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'base\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(tmpdir(), `sw-queue-retry-exhausted-agent-${Date.now()}`);
+  execSync(`git worktree add -b feature/queue-retry-exhausted "${agentPath}"`, { cwd: repoDir });
+  writeFileSync(join(agentPath, 'README.md'), 'feature\n');
+  execSync('git add README.md', { cwd: agentPath });
+  execSync('git commit -m "feature change"', { cwd: agentPath });
+  writeFileSync(join(repoDir, 'README.md'), 'main\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "main change"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: agentPath, branch: 'feature/queue-retry-exhausted' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'worktree',
+    sourceRef: 'feature/queue-retry-exhausted',
+    sourceWorktree: 'agent1',
+    targetBranch: 'main',
+    maxRetries: 1,
+  });
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const secondResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const updated = listMergeQueue(queueDb)[0];
+
+  assert(secondResult.processed[0].status === 'blocked', 'Queue runner blocks once the retry budget is exhausted');
+  assert(updated.status === 'blocked', 'Exhausted retry budget leaves the queue item blocked');
+  assert(updated.retry_count === 1, 'Blocking after retry exhaustion does not increment retries again');
+  queueDb.close();
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 // ─── Fix regression tests ─────────────────────────────────────────────────────
 
 test('Fix 1: busy_timeout is set on new connections', () => {
@@ -578,6 +945,36 @@ test('Lease heartbeat refreshes the active session timestamp', () => {
   leaseDb.close();
 });
 
+test('Lease policy defaults load when no repo policy file exists', () => {
+  const repoDir = join(tmpdir(), `sw-lease-policy-default-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+
+  const policy = loadLeasePolicy(repoDir);
+
+  assert(policy.stale_after_minutes === DEFAULT_LEASE_POLICY.stale_after_minutes, 'Missing lease policy falls back to the default stale timeout');
+  assert(policy.reap_on_status_check === DEFAULT_LEASE_POLICY.reap_on_status_check, 'Missing lease policy falls back to the default auto-reap behavior');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Lease policy writes and reloads persisted settings', () => {
+  const repoDir = join(tmpdir(), `sw-lease-policy-write-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+
+  writeLeasePolicy(repoDir, {
+    heartbeat_interval_seconds: 45,
+    stale_after_minutes: 9,
+    reap_on_status_check: true,
+    requeue_task_on_reap: false,
+  });
+  const policy = loadLeasePolicy(repoDir);
+
+  assert(policy.heartbeat_interval_seconds === 45, 'Lease policy persists the heartbeat interval');
+  assert(policy.stale_after_minutes === 9, 'Lease policy persists the stale timeout');
+  assert(policy.reap_on_status_check === true, 'Lease policy persists auto-reap-on-status');
+  assert(policy.requeue_task_on_reap === false, 'Lease policy persists requeue-on-reap');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Stale lease reaping releases claims and re-queues the task', () => {
   const reapDb = initDb(join(tmpdir(), `sw-lease-reap-${Date.now()}`));
   const taskId = createTask(reapDb, { title: 'reap task' });
@@ -601,6 +998,107 @@ test('Stale lease reaping releases claims and re-queues the task', () => {
   assert(activeClaims.length === 0, 'Reaping a stale lease releases active claims');
   assert(leaseAfter.status === 'expired', 'Stale lease is marked expired');
   reapDb.close();
+});
+
+test('Stale lease reaping can fail tasks instead of re-queueing them when policy disables requeue', () => {
+  const reapDb = initDb(join(tmpdir(), `sw-lease-reap-fail-${Date.now()}`));
+  const taskId = createTask(reapDb, { title: 'reap fail task' });
+  const lease = startTaskLease(reapDb, taskId, 'lease-reap-fail-worktree', 'codex');
+
+  reapDb.prepare(`
+    UPDATE leases
+    SET heartbeat_at=datetime('now', '-30 minutes')
+    WHERE id=?
+  `).run(lease.id);
+
+  const expired = reapStaleLeases(reapDb, 15, { requeueTask: false });
+  const task = getTask(reapDb, taskId);
+
+  assert(expired.length === 1, 'One stale lease was reaped when requeue is disabled');
+  assert(task.status === 'failed', 'Stale lease can mark the task failed instead of pending');
+  assert(task.description.includes('lease_expired'), 'Failing on stale reap records the stale-lease reason');
+  reapDb.close();
+});
+
+test('Lease reap CLI uses the configured stale policy by default', () => {
+  const repoDir = join(tmpdir(), `sw-lease-policy-cli-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const reapDb = initDb(repoDir);
+  registerWorktree(reapDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(reapDb, { title: 'policy cli reap task' });
+  const lease = startTaskLease(reapDb, taskId, 'main', 'codex');
+  reapDb.prepare(`
+    UPDATE leases
+    SET heartbeat_at=datetime('now', '-10 minutes')
+    WHERE id=?
+  `).run(lease.id);
+  reapDb.close();
+
+  writeLeasePolicy(repoDir, {
+    stale_after_minutes: 5,
+    requeue_task_on_reap: true,
+  });
+
+  const output = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'lease',
+    'reap',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(output.stale_after_minutes === 5, 'Lease reap CLI uses the configured stale timeout by default');
+  assert(output.expired.length === 1, 'Lease reap CLI expires leases using the configured stale timeout');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Status auto-reaps stale leases when policy enables it', () => {
+  const repoDir = join(tmpdir(), `sw-lease-policy-status-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const statusDb = initDb(repoDir);
+  registerWorktree(statusDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(statusDb, { title: 'policy status reap task' });
+  const lease = startTaskLease(statusDb, taskId, 'main', 'codex');
+  statusDb.prepare(`
+    UPDATE leases
+    SET heartbeat_at=datetime('now', '-10 minutes')
+    WHERE id=?
+  `).run(lease.id);
+  statusDb.close();
+
+  writeLeasePolicy(repoDir, {
+    stale_after_minutes: 5,
+    reap_on_status_check: true,
+    requeue_task_on_reap: true,
+  });
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const verifyDb = openDb(repoDir);
+  const leaseAfter = getLease(verifyDb, lease.id);
+  const taskAfter = getTask(verifyDb, taskId);
+  assert(leaseAfter.status === 'expired', 'Status auto-reaps stale leases when policy enables it');
+  assert(taskAfter.status === 'pending', 'Status auto-reap requeues the task when policy enables requeue');
+  verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('openDb migrates legacy in-progress tasks into leases and backfills claims', () => {

@@ -29,6 +29,7 @@ import {
   createTask, startTaskLease, completeTask, failTask, getBoundaryValidationState, getTaskSpec, listTasks, getTask, getNextPendingTask,
   listDependencyInvalidations, listLeases, listScopeReservations, heartbeatLease, getStaleLeases, reapStaleLeases,
   registerWorktree, listWorktrees,
+  enqueueMergeItem, getMergeQueueItem, listMergeQueue, listMergeQueueEvents, removeMergeQueueItem, retryMergeQueueItem,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts,
   verifyAuditTrail,
 } from '../core/db.js';
@@ -40,6 +41,8 @@ import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorSt
 import { buildPipelinePrSummary, createPipelineFollowupTasks, executePipeline, exportPipelinePrBundle, getPipelineStatus, publishPipelinePr, runPipeline, startPipeline } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus } from '../core/ci.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
+import { buildQueueStatusSummary, runMergeQueue } from '../core/queue.js';
+import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../core/policy.js';
 
 function installMcpConfig(targetDirs) {
   return targetDirs.map((targetDir) => upsertProjectMcpConfig(targetDir));
@@ -80,6 +83,14 @@ function statusBadge(status) {
     observed: chalk.yellow,
     non_compliant: chalk.red,
     stale: chalk.red,
+    queued: chalk.yellow,
+    validating: chalk.blue,
+    rebasing: chalk.blue,
+    retrying: chalk.yellow,
+    blocked: chalk.red,
+    merging: chalk.blue,
+    merged: chalk.green,
+    canceled: chalk.gray,
   };
   return (colors[status] || chalk.white)(status.toUpperCase().padEnd(11));
 }
@@ -792,6 +803,259 @@ taskCmd
     }
   });
 
+// ── queue ─────────────────────────────────────────────────────────────────────
+
+const queueCmd = program.command('queue').description('Serialize governed worktree or branch merges back onto main');
+
+queueCmd
+  .command('add [branch]')
+  .description('Add a branch, worktree, or pipeline to the merge queue')
+  .option('--worktree <name>', 'Queue a registered worktree by name')
+  .option('--pipeline <pipelineId>', 'Queue a pipeline by id')
+  .option('--target <branch>', 'Target branch to merge into', 'main')
+  .option('--max-retries <n>', 'Maximum automatic retries', '1')
+  .option('--submitted-by <name>', 'Operator or automation name')
+  .option('--json', 'Output raw JSON')
+  .action((branch, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      let payload;
+      if (opts.worktree) {
+        const worktree = listWorktrees(db).find((entry) => entry.name === opts.worktree);
+        if (!worktree) {
+          throw new Error(`Worktree ${opts.worktree} is not registered.`);
+        }
+        payload = {
+          sourceType: 'worktree',
+          sourceRef: worktree.branch,
+          sourceWorktree: worktree.name,
+          targetBranch: opts.target,
+          maxRetries: opts.maxRetries,
+          submittedBy: opts.submittedBy || null,
+        };
+      } else if (opts.pipeline) {
+        payload = {
+          sourceType: 'pipeline',
+          sourceRef: opts.pipeline,
+          sourcePipelineId: opts.pipeline,
+          targetBranch: opts.target,
+          maxRetries: opts.maxRetries,
+          submittedBy: opts.submittedBy || null,
+        };
+      } else if (branch) {
+        payload = {
+          sourceType: 'branch',
+          sourceRef: branch,
+          targetBranch: opts.target,
+          maxRetries: opts.maxRetries,
+          submittedBy: opts.submittedBy || null,
+        };
+      } else {
+        throw new Error('Provide a branch, --worktree, or --pipeline.');
+      }
+
+      const result = enqueueMergeItem(db, payload);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Queued ${chalk.cyan(result.id)} for ${chalk.bold(result.target_branch)}`);
+      console.log(`  ${chalk.dim('source:')} ${result.source_type} ${result.source_ref}`);
+      if (result.source_worktree) console.log(`  ${chalk.dim('worktree:')} ${result.source_worktree}`);
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+queueCmd
+  .command('list')
+  .description('List merge queue items')
+  .option('--status <status>', 'Filter by queue status')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const items = listMergeQueue(db, { status: opts.status || null });
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify(items, null, 2));
+      return;
+    }
+
+    if (items.length === 0) {
+      console.log(chalk.dim('Merge queue is empty.'));
+      return;
+    }
+
+    for (const item of items) {
+      const retryInfo = chalk.dim(`retries:${item.retry_count}/${item.max_retries}`);
+      const attemptInfo = item.last_attempt_at ? ` ${chalk.dim(`last-attempt:${item.last_attempt_at}`)}` : '';
+      console.log(`  ${statusBadge(item.status)} ${item.id} ${item.source_type}:${item.source_ref} ${chalk.dim(`→ ${item.target_branch}`)} ${retryInfo}${attemptInfo}`);
+      if (item.last_error_summary) {
+        console.log(`    ${chalk.red('why:')} ${item.last_error_summary}`);
+      }
+      if (item.next_action) {
+        console.log(`    ${chalk.yellow('next:')} ${item.next_action}`);
+      }
+    }
+  });
+
+queueCmd
+  .command('status')
+  .description('Show an operator-friendly merge queue summary')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const items = listMergeQueue(db);
+    const summary = buildQueueStatusSummary(items);
+    const recentEvents = items.slice(0, 5).flatMap((item) =>
+      listMergeQueueEvents(db, item.id, { limit: 3 }).map((event) => ({ ...event, queue_item_id: item.id })),
+    ).sort((a, b) => b.id - a.id).slice(0, 8);
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify({ items, summary, recent_events: recentEvents }, null, 2));
+      return;
+    }
+
+    console.log(`Queue: ${items.length} item(s)`);
+    console.log(`  ${chalk.dim('queued')} ${summary.counts.queued}  ${chalk.dim('validating')} ${summary.counts.validating}  ${chalk.dim('rebasing')} ${summary.counts.rebasing}  ${chalk.dim('merging')} ${summary.counts.merging}  ${chalk.dim('retrying')} ${summary.counts.retrying}  ${chalk.dim('blocked')} ${summary.counts.blocked}  ${chalk.dim('merged')} ${summary.counts.merged}`);
+    if (summary.next) {
+      console.log(`  ${chalk.dim('next:')} ${summary.next.id} ${summary.next.source_type}:${summary.next.source_ref} ${chalk.dim(`retries:${summary.next.retry_count}/${summary.next.max_retries}`)}`);
+    }
+    for (const item of summary.blocked) {
+      console.log(`  ${statusBadge(item.status)} ${item.id} ${item.source_type}:${item.source_ref} ${chalk.dim(`retries:${item.retry_count}/${item.max_retries}`)}`);
+      if (item.last_error_summary) console.log(`    ${chalk.red('why:')} ${item.last_error_summary}`);
+      if (item.next_action) console.log(`    ${chalk.yellow('next:')} ${item.next_action}`);
+    }
+    if (recentEvents.length > 0) {
+      console.log('');
+      console.log(chalk.bold('Recent Queue Events:'));
+      for (const event of recentEvents) {
+        console.log(`  ${chalk.cyan(event.queue_item_id)} ${chalk.dim(event.event_type)} ${chalk.dim(event.status || '')} ${chalk.dim(event.created_at)}`.trim());
+      }
+    }
+  });
+
+queueCmd
+  .command('run')
+  .description('Process queued merge items serially')
+  .option('--max-items <n>', 'Maximum queue items to process', '1')
+  .option('--target <branch>', 'Default target branch', 'main')
+  .option('--watch', 'Keep polling for new queue items')
+  .option('--watch-interval-ms <n>', 'Polling interval for --watch mode', '1000')
+  .option('--max-cycles <n>', 'Maximum watch cycles before exiting (mainly for tests)')
+  .option('--json', 'Output raw JSON')
+  .action(async (opts) => {
+    const repoRoot = getRepo();
+
+    try {
+      const watch = Boolean(opts.watch);
+      const watchIntervalMs = Math.max(0, Number.parseInt(opts.watchIntervalMs, 10) || 1000);
+      const maxCycles = opts.maxCycles ? Math.max(1, Number.parseInt(opts.maxCycles, 10) || 1) : null;
+      const aggregate = {
+        processed: [],
+        cycles: 0,
+        watch,
+      };
+
+      while (true) {
+        const db = getDb(repoRoot);
+        const result = await runMergeQueue(db, repoRoot, {
+          maxItems: Number.parseInt(opts.maxItems, 10) || 1,
+          targetBranch: opts.target || 'main',
+        });
+        db.close();
+
+        aggregate.processed.push(...result.processed);
+        aggregate.summary = result.summary;
+        aggregate.cycles += 1;
+
+        if (!watch) break;
+        if (maxCycles && aggregate.cycles >= maxCycles) break;
+        if (result.processed.length === 0) {
+          sleepSync(watchIntervalMs);
+        }
+      }
+
+      if (opts.json) {
+        console.log(JSON.stringify(aggregate, null, 2));
+        return;
+      }
+
+      if (aggregate.processed.length === 0) {
+        console.log(chalk.dim('No queued merge items.'));
+        return;
+      }
+
+      for (const entry of aggregate.processed) {
+        const item = entry.item;
+        if (entry.status === 'merged') {
+          console.log(`${chalk.green('✓')} Merged ${chalk.cyan(item.id)} into ${chalk.bold(item.target_branch)}`);
+          console.log(`  ${chalk.dim('commit:')} ${item.merged_commit}`);
+        } else {
+          console.log(`${chalk.red('✗')} Blocked ${chalk.cyan(item.id)}`);
+          console.log(`  ${chalk.red('why:')} ${item.last_error_summary}`);
+          if (item.next_action) console.log(`  ${chalk.yellow('next:')} ${item.next_action}`);
+        }
+      }
+    } catch (err) {
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+queueCmd
+  .command('retry <itemId>')
+  .description('Retry a blocked merge queue item')
+  .option('--json', 'Output raw JSON')
+  .action((itemId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const item = retryMergeQueueItem(db, itemId);
+    db.close();
+
+    if (!item) {
+      console.error(chalk.red(`Queue item ${itemId} is not retryable.`));
+      process.exitCode = 1;
+      return;
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(item, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Queue item ${chalk.cyan(item.id)} reset to retrying`);
+  });
+
+queueCmd
+  .command('remove <itemId>')
+  .description('Remove a merge queue item')
+  .action((itemId) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const item = removeMergeQueueItem(db, itemId);
+    db.close();
+
+    if (!item) {
+      console.error(chalk.red(`Queue item ${itemId} does not exist.`));
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Removed ${chalk.cyan(item.id)} from the merge queue`);
+  });
+
 // ── pipeline ──────────────────────────────────────────────────────────────────
 
 const pipelineCmd = program.command('pipeline').description('Create and summarize issue-to-PR execution pipelines');
@@ -1215,13 +1479,18 @@ leaseCmd
 leaseCmd
   .command('reap')
   .description('Expire stale leases, release their claims, and return their tasks to pending')
-  .option('--stale-after-minutes <minutes>', 'Age threshold for staleness', String(DEFAULT_STALE_LEASE_MINUTES))
+  .option('--stale-after-minutes <minutes>', 'Age threshold for staleness')
   .option('--json', 'Output as JSON')
   .action((opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
-    const staleAfterMinutes = Number.parseInt(opts.staleAfterMinutes, 10);
-    const expired = reapStaleLeases(db, staleAfterMinutes);
+    const leasePolicy = loadLeasePolicy(repoRoot);
+    const staleAfterMinutes = opts.staleAfterMinutes
+      ? Number.parseInt(opts.staleAfterMinutes, 10)
+      : leasePolicy.stale_after_minutes;
+    const expired = reapStaleLeases(db, staleAfterMinutes, {
+      requeueTask: leasePolicy.requeue_task_on_reap,
+    });
     db.close();
 
     if (opts.json) {
@@ -1238,6 +1507,60 @@ leaseCmd
     for (const lease of expired) {
       console.log(`  ${chalk.dim(lease.id)}  ${chalk.cyan(lease.worktree)} → ${lease.task_title}`);
     }
+  });
+
+const leasePolicyCmd = leaseCmd.command('policy').description('Inspect or update the stale-lease policy for this repo');
+
+leasePolicyCmd
+  .command('set')
+  .description('Persist a stale-lease policy for this repo')
+  .option('--heartbeat-interval-seconds <seconds>', 'Recommended heartbeat interval')
+  .option('--stale-after-minutes <minutes>', 'Age threshold for staleness')
+  .option('--reap-on-status-check <boolean>', 'Automatically reap stale leases during `switchman status`')
+  .option('--requeue-task-on-reap <boolean>', 'Return stale tasks to pending instead of failing them')
+  .option('--json', 'Output as JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const current = loadLeasePolicy(repoRoot);
+    const next = {
+      ...current,
+      ...(opts.heartbeatIntervalSeconds ? { heartbeat_interval_seconds: Number.parseInt(opts.heartbeatIntervalSeconds, 10) } : {}),
+      ...(opts.staleAfterMinutes ? { stale_after_minutes: Number.parseInt(opts.staleAfterMinutes, 10) } : {}),
+      ...(opts.reapOnStatusCheck ? { reap_on_status_check: opts.reapOnStatusCheck === 'true' } : {}),
+      ...(opts.requeueTaskOnReap ? { requeue_task_on_reap: opts.requeueTaskOnReap === 'true' } : {}),
+    };
+    const path = writeLeasePolicy(repoRoot, next);
+    const saved = loadLeasePolicy(repoRoot);
+
+    if (opts.json) {
+      console.log(JSON.stringify({ path, policy: saved }, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Lease policy updated`);
+    console.log(`  ${chalk.dim(path)}`);
+    console.log(`  ${chalk.dim('heartbeat_interval_seconds:')} ${saved.heartbeat_interval_seconds}`);
+    console.log(`  ${chalk.dim('stale_after_minutes:')} ${saved.stale_after_minutes}`);
+    console.log(`  ${chalk.dim('reap_on_status_check:')} ${saved.reap_on_status_check}`);
+    console.log(`  ${chalk.dim('requeue_task_on_reap:')} ${saved.requeue_task_on_reap}`);
+  });
+
+leasePolicyCmd
+  .description('Show the active stale-lease policy for this repo')
+  .option('--json', 'Output as JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const policy = loadLeasePolicy(repoRoot);
+    if (opts.json) {
+      console.log(JSON.stringify({ policy }, null, 2));
+      return;
+    }
+
+    console.log(chalk.bold('Lease policy'));
+    console.log(`  ${chalk.dim('heartbeat_interval_seconds:')} ${policy.heartbeat_interval_seconds}`);
+    console.log(`  ${chalk.dim('stale_after_minutes:')} ${policy.stale_after_minutes}`);
+    console.log(`  ${chalk.dim('reap_on_status_check:')} ${policy.reap_on_status_check}`);
+    console.log(`  ${chalk.dim('requeue_task_on_reap:')} ${policy.requeue_task_on_reap}`);
   });
 
 // ── worktree ───────────────────────────────────────────────────────────────────
@@ -1618,6 +1941,13 @@ program
   .action(async () => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
+    const leasePolicy = loadLeasePolicy(repoRoot);
+
+    if (leasePolicy.reap_on_status_check) {
+      reapStaleLeases(db, leasePolicy.stale_after_minutes, {
+        requeueTask: leasePolicy.requeue_task_on_reap,
+      });
+    }
 
     console.log('');
     console.log(chalk.bold.cyan('━━━ switchman status ━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
@@ -1631,13 +1961,14 @@ program
     const done = tasks.filter(t => t.status === 'done');
     const failed = tasks.filter(t => t.status === 'failed');
     const activeLeases = listLeases(db, 'active');
-    const staleLeases = getStaleLeases(db);
+    const staleLeases = getStaleLeases(db, leasePolicy.stale_after_minutes);
 
     console.log(chalk.bold('Tasks:'));
     console.log(`  ${chalk.yellow('Pending')}     ${pending.length}`);
     console.log(`  ${chalk.blue('In Progress')} ${inProgress.length}`);
     console.log(`  ${chalk.green('Done')}        ${done.length}`);
     console.log(`  ${chalk.red('Failed')}      ${failed.length}`);
+    console.log(`  ${chalk.dim('policy:')} stale_after=${leasePolicy.stale_after_minutes}m heartbeat=${leasePolicy.heartbeat_interval_seconds}s auto_reap=${leasePolicy.reap_on_status_check} requeue_on_reap=${leasePolicy.requeue_task_on_reap}`);
 
     if (activeLeases.length > 0) {
       console.log('');
