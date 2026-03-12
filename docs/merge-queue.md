@@ -1,0 +1,64 @@
+# Merge Queue
+
+Switchman can serialize finished work back onto `main`.
+
+This is useful when several agent worktrees finish around the same time and you want safe, governed landing instead of manual merge juggling.
+
+## Happy-path flow
+
+```bash
+switchman queue add --worktree agent1
+switchman queue add --worktree agent2
+
+switchman queue status
+switchman queue run --watch
+```
+
+## What the merge queue does
+
+Before landing work it:
+- rebases the queued branch onto the latest target branch
+- runs the same repo-level safety checks behind `switchman gate ci`
+- fast-forwards the target branch when the item is safe to land
+- retries retryable merge failures up to the configured retry budget
+- blocks with an exact next action when human attention is needed
+
+## Queue a branch, worktree, or pipeline
+
+```bash
+switchman queue add feature/auth-hardening
+switchman queue add --worktree agent3
+switchman queue add --pipeline pipe-123
+```
+
+Useful options:
+- `--target <branch>` — target branch to land into (default: `main`)
+- `--max-retries <n>` — automatic retry budget for retryable merge failures
+
+## Inspect queue state
+
+```bash
+switchman queue list
+switchman queue status
+switchman queue status --json
+```
+
+## Run once or continuously
+
+```bash
+switchman queue run
+switchman queue run --watch
+switchman queue run --watch --watch-interval-ms 1000
+```
+
+Useful watch-mode options:
+- `--watch`
+- `--watch-interval-ms <n>`
+- `--max-cycles <n>`
+
+## Retry or remove blocked items
+
+```bash
+switchman queue retry <itemId>
+switchman queue remove <itemId>
+```
