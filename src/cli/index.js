@@ -32,7 +32,7 @@ import {
   listDependencyInvalidations, listLeases, listScopeReservations, heartbeatLease, getStaleLeases, reapStaleLeases,
   registerWorktree, listWorktrees,
   enqueueMergeItem, getMergeQueueItem, listMergeQueue, listMergeQueueEvents, removeMergeQueueItem, retryMergeQueueItem,
-  claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts,
+  claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts, retryTask,
   verifyAuditTrail,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
@@ -321,6 +321,29 @@ function buildClaimExplainReport(db, filePath) {
     scope_owners: scopeOwners.filter((owner, index, all) =>
       all.findIndex((candidate) => candidate.lease_id === owner.lease_id) === index,
     ),
+  };
+}
+
+function buildStaleTaskExplainReport(db, taskId) {
+  const task = getTask(db, taskId);
+  if (!task) {
+    throw new Error(`Task ${taskId} does not exist.`);
+  }
+
+  const invalidations = listDependencyInvalidations(db, { affectedTaskId: taskId });
+  return {
+    task,
+    invalidations: invalidations.map((item) => ({
+      ...item,
+      details: item.details || {},
+      stale_area: item.reason_type === 'subsystem_overlap'
+        ? `subsystem:${item.subsystem_tag}`
+        : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
+      summary: `${item.details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
+    })),
+    next_action: invalidations.length > 0
+      ? `switchman task retry ${taskId}`
+      : null,
   };
 }
 
@@ -746,8 +769,8 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       kind: 'dependency_invalidation',
       title: invalidation.summary,
       detail: `${invalidation.source_worktree || 'unknown'} -> ${invalidation.affected_worktree || 'unknown'} (${invalidation.stale_area})`,
-      next_step: 'rerun or re-review the stale task before merge',
-      command: invalidation.affected_pipeline_id ? `switchman pipeline status ${invalidation.affected_pipeline_id}` : 'switchman gate ai',
+      next_step: 'requeue the stale task so it can be revalidated before merge',
+      command: `switchman task retry ${invalidation.affected_task_id}`,
       severity: invalidation.severity === 'blocked' ? 'block' : 'warn',
     });
   }
@@ -1588,6 +1611,33 @@ taskCmd
   });
 
 taskCmd
+  .command('retry <taskId>')
+  .description('Return a failed or stale completed task to pending so it can be revalidated')
+  .option('--reason <text>', 'Reason to record for the retry')
+  .option('--json', 'Output raw JSON')
+  .action((taskId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const task = retryTask(db, taskId, opts.reason || 'manual retry');
+    db.close();
+
+    if (!task) {
+      printErrorWithNext(`Task ${taskId} is not retryable.`, 'switchman task list --status failed');
+      process.exitCode = 1;
+      return;
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(task, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Reset ${chalk.cyan(task.id)} to pending`);
+    console.log(`  ${chalk.dim('title:')} ${task.title}`);
+    console.log(`${chalk.yellow('next:')} switchman task assign ${task.id} <workspace>`);
+  });
+
+taskCmd
   .command('done <taskId>')
   .description('Mark a task as complete and release all file claims')
   .action((taskId) => {
@@ -2123,6 +2173,43 @@ explainCmd
     } catch (err) {
       db.close();
       printErrorWithNext(err.message, 'switchman status');
+      process.exitCode = 1;
+    }
+  });
+
+explainCmd
+  .command('stale <taskId>')
+  .description('Explain why a task is stale and how to revalidate it')
+  .option('--json', 'Output raw JSON')
+  .action((taskId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const report = buildStaleTaskExplainReport(db, taskId);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold(`Stale status for ${report.task.id}`));
+      console.log(`  ${chalk.dim('title:')} ${report.task.title}`);
+      console.log(`  ${chalk.dim('status:')} ${statusBadge(report.task.status)}`.trim());
+      if (report.invalidations.length === 0) {
+        console.log(`  ${chalk.green('state:')} no active dependency invalidations`);
+        return;
+      }
+      for (const invalidation of report.invalidations) {
+        console.log(`  ${chalk.red('why:')} ${invalidation.summary}`);
+        console.log(`  ${chalk.dim('source task:')} ${invalidation.source_task_id}`);
+        console.log(`  ${chalk.dim('stale area:')} ${invalidation.stale_area}`);
+      }
+      console.log(`  ${chalk.yellow('next:')} ${report.next_action}`);
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, 'switchman doctor');
       process.exitCode = 1;
     }
   });

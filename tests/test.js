@@ -2949,6 +2949,107 @@ test('Fix 25d: shared-boundary changes mark dependent work stale until it is ret
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 25da: explain stale reports why a task is stale and points at task retry', () => {
+  const repoDir = join(tmpdir(), `sw-explain-stale-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const previousTaskId = createTask(db, { title: 'Previous auth hardening' });
+  upsertTaskSpec(db, previousTaskId, {
+    pipeline_id: 'pipe-old-stale',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, previousTaskId, 'main');
+  const previousLease = getActiveLeaseForTask(db, previousTaskId);
+  completeLeaseTask(db, previousLease.id);
+
+  const pipeline = startPipeline(db, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-fresh-stale',
+    priority: 5,
+  });
+  const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
+  assignTask(db, implementationTask.id, 'main');
+  const currentLease = getActiveLeaseForTask(db, implementationTask.id);
+  execSync('mkdir -p src/auth && printf "new\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
+  evaluateTaskOutcome(db, repoDir, { leaseId: currentLease.id });
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'stale',
+    previousTaskId,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'stale',
+    previousTaskId,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(textOutput.includes(`Stale status for ${previousTaskId}`), 'Explain stale prints the task header');
+  assert(textOutput.includes('switchman task retry'), 'Explain stale points at the retry command');
+  assert(jsonOutput.invalidations.length > 0, 'Explain stale JSON returns the active invalidations');
+  assert(jsonOutput.next_action === `switchman task retry ${previousTaskId}`, 'Explain stale JSON returns the exact retry command');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 25db: task retry CLI resets stale completed work back to pending', () => {
+  const repoDir = join(tmpdir(), `sw-task-retry-cli-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Retry stale task' });
+  assignTask(db, taskId, 'main');
+  const lease = getActiveLeaseForTask(db, taskId);
+  completeLeaseTask(db, lease.id);
+  db.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'task',
+    'retry',
+    taskId,
+    '--reason',
+    'revalidate after drift',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const verifyDb = openDb(repoDir);
+  const task = getTask(verifyDb, taskId);
+  assert(output.includes('Reset'), 'task retry CLI reports that the task was reset');
+  assert(task.status === 'pending', 'task retry CLI resets the task to pending');
+  verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 26: AI merge gate passes isolated worktree changes', () => {
   const repoDir = join(tmpdir(), `sw-ai-gate-pass-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -3451,6 +3552,7 @@ test('Fix 28ab: doctor and repo gate surface stale dependency invalidations', ()
   }));
   assert(doctorJson.attention.some((item) => item.kind === 'dependency_invalidation'), 'Doctor includes stale dependency invalidations in the attention list');
   assert(doctorJson.merge_readiness.dependency_invalidations.some((item) => item.affected_task_id === oldTaskId), 'Doctor surfaces stale dependency invalidations in merge readiness');
+  assert(doctorJson.attention.some((item) => item.command === `switchman task retry ${oldTaskId}`), 'Doctor points stale work at the exact retry command');
 
   let ciStdout = '';
   try {
