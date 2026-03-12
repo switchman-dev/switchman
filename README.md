@@ -21,6 +21,10 @@ Switchman gives them a shared task queue and file locking so they stay on separa
 npm install -g @switchman-dev
 ```
 
+Questions, feedback, or testing Switchman with your team? 
+
+Join the Discord: https://discord.gg/pnT8BEC4D
+
 ---
 
 ## First successful run: 3 agents on one repo
