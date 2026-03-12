@@ -19,6 +19,7 @@
 import { program } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import { execSync, spawn } from 'child_process';
 
@@ -176,6 +177,148 @@ function formatRelativePolicy(policy) {
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function boolBadge(ok) {
+  return ok ? chalk.green('OK   ') : chalk.yellow('CHECK');
+}
+
+function collectSetupVerification(repoRoot, { homeDir = null } = {}) {
+  const dbPath = join(repoRoot, '.switchman', 'switchman.db');
+  const rootMcpPath = join(repoRoot, '.mcp.json');
+  const cursorMcpPath = join(repoRoot, '.cursor', 'mcp.json');
+  const claudeGuidePath = join(repoRoot, 'CLAUDE.md');
+  const checks = [];
+  const nextSteps = [];
+  let workspaces = [];
+  let db = null;
+
+  const dbExists = existsSync(dbPath);
+  checks.push({
+    key: 'database',
+    ok: dbExists,
+    label: 'Project database',
+    detail: dbExists ? '.switchman/switchman.db is ready' : 'Switchman database is missing',
+  });
+  if (!dbExists) {
+    nextSteps.push('Run `switchman init` or `switchman setup --agents 3` in this repo.');
+  }
+
+  if (dbExists) {
+    try {
+      db = getDb(repoRoot);
+      workspaces = listWorktrees(db);
+    } catch {
+      checks.push({
+        key: 'database_open',
+        ok: false,
+        label: 'Database access',
+        detail: 'Switchman could not open the project database',
+      });
+      nextSteps.push('Re-run `switchman init` if the project database looks corrupted.');
+    } finally {
+      try { db?.close(); } catch { /* no-op */ }
+    }
+  }
+
+  const agentWorkspaces = workspaces.filter((entry) => entry.name !== 'main');
+  const workspaceReady = agentWorkspaces.length > 0;
+  checks.push({
+    key: 'workspaces',
+    ok: workspaceReady,
+    label: 'Agent workspaces',
+    detail: workspaceReady
+      ? `${agentWorkspaces.length} agent workspace(s) registered`
+      : 'No agent workspaces are registered yet',
+  });
+  if (!workspaceReady) {
+    nextSteps.push('Run `switchman setup --agents 3` to create agent workspaces.');
+  }
+
+  const rootMcpExists = existsSync(rootMcpPath);
+  checks.push({
+    key: 'claude_mcp',
+    ok: rootMcpExists,
+    label: 'Claude Code MCP',
+    detail: rootMcpExists ? '.mcp.json is present in the repo root' : '.mcp.json is missing from the repo root',
+  });
+  if (!rootMcpExists) {
+    nextSteps.push('Re-run `switchman setup --agents 3` to restore the repo-local MCP config.');
+  }
+
+  const cursorMcpExists = existsSync(cursorMcpPath);
+  checks.push({
+    key: 'cursor_mcp',
+    ok: cursorMcpExists,
+    label: 'Cursor MCP',
+    detail: cursorMcpExists ? '.cursor/mcp.json is present in the repo root' : '.cursor/mcp.json is missing from the repo root',
+  });
+  if (!cursorMcpExists) {
+    nextSteps.push('Re-run `switchman setup --agents 3` if you want Cursor to attach automatically.');
+  }
+
+  const claudeGuideExists = existsSync(claudeGuidePath);
+  checks.push({
+    key: 'claude_md',
+    ok: claudeGuideExists,
+    label: 'Claude guide',
+    detail: claudeGuideExists ? 'CLAUDE.md is present' : 'CLAUDE.md is optional but recommended for Claude Code',
+  });
+  if (!claudeGuideExists) {
+    nextSteps.push('If you use Claude Code, add `CLAUDE.md` from the repo root setup guide.');
+  }
+
+  const windsurfConfigExists = existsSync(getWindsurfMcpConfigPath(homeDir || undefined));
+  checks.push({
+    key: 'windsurf_mcp',
+    ok: windsurfConfigExists,
+    label: 'Windsurf MCP',
+    detail: windsurfConfigExists
+      ? 'Windsurf shared MCP config is installed'
+      : 'Windsurf shared MCP config is optional and not installed',
+  });
+  if (!windsurfConfigExists) {
+    nextSteps.push('If you use Windsurf, run `switchman mcp install --windsurf` once.');
+  }
+
+  const ok = checks.every((item) => item.ok || ['claude_md', 'windsurf_mcp'].includes(item.key));
+  return {
+    ok,
+    repo_root: repoRoot,
+    checks,
+    workspaces: workspaces.map((entry) => ({
+      name: entry.name,
+      path: entry.path,
+      branch: entry.branch,
+    })),
+    suggested_commands: [
+      'switchman status --watch',
+      'switchman task add "Your first task" --priority 8',
+      'switchman gate ci',
+      ...nextSteps.some((step) => step.includes('Windsurf')) ? ['switchman mcp install --windsurf'] : [],
+    ],
+    next_steps: [...new Set(nextSteps)].slice(0, 6),
+  };
+}
+
+function renderSetupVerification(report, { compact = false } = {}) {
+  console.log(chalk.bold(compact ? 'First-run check:' : 'Setup verification:'));
+  for (const check of report.checks) {
+    const badge = boolBadge(check.ok);
+    console.log(`  ${badge} ${check.label} ${chalk.dim(`— ${check.detail}`)}`);
+  }
+  if (report.next_steps.length > 0) {
+    console.log('');
+    console.log(chalk.bold('Fix next:'));
+    for (const step of report.next_steps) {
+      console.log(`  - ${step}`);
+    }
+  }
+  console.log('');
+  console.log(chalk.bold('Try next:'));
+  for (const command of report.suggested_commands.slice(0, 4)) {
+    console.log(`  ${chalk.cyan(command)}`);
+  }
 }
 
 function summarizeLeaseScope(db, lease) {
@@ -1006,10 +1149,39 @@ Examples:
       console.log(`     ${chalk.cyan('switchman status')}`);
       console.log('');
 
+      const verification = collectSetupVerification(repoRoot);
+      renderSetupVerification(verification, { compact: true });
+
     } catch (err) {
       spinner.fail(err.message);
       process.exit(1);
     }
+  });
+
+program
+  .command('verify-setup')
+  .description('Check whether this repo is ready for a smooth first Switchman run')
+  .option('--json', 'Output raw JSON')
+  .option('--home <path>', 'Override the home directory for editor config checks')
+  .addHelpText('after', `
+Examples:
+  switchman verify-setup
+  switchman verify-setup --json
+
+Use this after setup or whenever editor/config wiring feels off.
+`)
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const report = collectSetupVerification(repoRoot, { homeDir: opts.home || null });
+
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+      if (!report.ok) process.exitCode = 1;
+      return;
+    }
+
+    renderSetupVerification(report);
+    if (!report.ok) process.exitCode = 1;
   });
 
 

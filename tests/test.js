@@ -744,6 +744,29 @@ test('Fix 1b: parallel CLI task acquisition avoids transient database lock failu
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Setup prints a first-run verification summary', () => {
+  const repoDir = join(tmpdir(), `sw-setup-verify-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const output = execFileSync(process.execPath, [cliPath, 'setup', '--agents', '2'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('First-run check:'), 'Setup prints a first-run verification section');
+  assert(output.includes('Project database'), 'Setup verification checks the project database');
+  assert(output.includes('Cursor MCP'), 'Setup verification checks local editor config');
+  assert(output.includes('Try next:'), 'Setup verification suggests exact next commands');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 1c: CLI task done succeeds while a transient SQLite write lock is present', () => {
   const repoDir = join(tmpdir(), `sw-task-done-retry-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -2821,6 +2844,41 @@ test('Lease help explains the term and shows examples', () => {
 
   assert(helpOutput.includes('lease = a task currently checked out by an agent'), 'Lease help includes plain-English vocabulary guidance');
   assert(helpOutput.includes('switchman lease next --json'), 'Lease help includes a practical example');
+});
+
+test('Verify-setup reports missing local editor config clearly', () => {
+  const repoDir = join(tmpdir(), `sw-verify-setup-${Date.now()}`);
+  const fakeHome = join(tmpdir(), `sw-verify-setup-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(fakeHome, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  execFileSync(process.execPath, [cliPath, 'setup', '--agents', '1'], { cwd: repoDir, encoding: 'utf8' });
+  rmSync(join(repoDir, '.cursor'), { recursive: true, force: true });
+
+  let failed = false;
+  let jsonOutput = null;
+  try {
+    execFileSync(process.execPath, [cliPath, 'verify-setup', '--json', '--home', fakeHome], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    failed = true;
+    jsonOutput = JSON.parse(err.stdout);
+  }
+
+  assert(failed, 'verify-setup exits non-zero when required setup pieces are missing');
+  assert(jsonOutput.checks.some((item) => item.key === 'cursor_mcp' && item.ok === false), 'verify-setup reports missing Cursor config');
+  assert(jsonOutput.next_steps.some((step) => step.includes('`switchman setup --agents 3`')), 'verify-setup suggests how to restore local editor config');
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(fakeHome, { recursive: true, force: true });
 });
 
 test('Fix 28ab: doctor and repo gate surface stale dependency invalidations', () => {
