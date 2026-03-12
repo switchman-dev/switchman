@@ -284,6 +284,13 @@ function inferExpectedOutputTypes(taskType) {
   return ['source'];
 }
 
+function buildPrimaryOutputPath({ taskType, pipelineId, taskId }) {
+  if (taskType === 'governance') {
+    return `docs/reviews/${pipelineId}/${taskId}.md`;
+  }
+  return null;
+}
+
 function inferTaskType(title) {
   if (/^Add or update tests/.test(title) || /\btests?\b/i.test(title)) return 'tests';
   if (/^Update integration notes/.test(title) || /\bdocs?|readme|integration notes\b/i.test(title)) return 'docs';
@@ -343,12 +350,6 @@ function buildRequiredDeliverables({ taskType, riskLevel, domains }) {
 
   if (taskType === 'implementation') {
     deliverables.push('source');
-    if (riskLevel === 'high') {
-      deliverables.push('tests');
-    }
-    if (domains.some((domain) => ['api', 'schema', 'config'].includes(domain))) {
-      deliverables.push('docs');
-    }
   } else if (taskType === 'tests') {
     deliverables.push('tests');
   } else if (taskType === 'docs') {
@@ -358,6 +359,59 @@ function buildRequiredDeliverables({ taskType, riskLevel, domains }) {
   }
 
   return uniq(deliverables);
+}
+
+function buildFollowupDeliverables({ taskType, riskLevel, domains }) {
+  const deliverables = [];
+
+  if (taskType === 'implementation') {
+    if (riskLevel === 'high') {
+      deliverables.push('tests');
+    }
+    if (domains.some((domain) => ['api', 'schema', 'config'].includes(domain))) {
+      deliverables.push('docs');
+    }
+  }
+
+  return uniq(deliverables);
+}
+
+function buildValidationRules({ taskType, riskLevel, domains }) {
+  if (taskType !== 'implementation') {
+    return {
+      enforcement: 'none',
+      required_completed_task_types: [],
+      rationale: [],
+    };
+  }
+
+  const requiredCompletedTaskTypes = [];
+  const rationale = [];
+
+  if (riskLevel === 'high') {
+    requiredCompletedTaskTypes.push('tests');
+    rationale.push('high-risk implementation must be backed by completed test work');
+  }
+
+  if (domains.some((domain) => ['auth', 'payments', 'schema', 'config'].includes(domain))) {
+    requiredCompletedTaskTypes.push('governance');
+    rationale.push('sensitive ownership boundaries require completed governance review');
+  }
+
+  if (domains.some((domain) => ['api', 'schema', 'config'].includes(domain))) {
+    requiredCompletedTaskTypes.push('docs');
+    rationale.push('public or shared boundaries require updated docs or integration notes');
+  }
+
+  const enforcement = domains.some((domain) => ['auth', 'payments', 'schema'].includes(domain))
+    ? 'blocked'
+    : (requiredCompletedTaskTypes.length > 0 ? 'warn' : 'none');
+
+  return {
+    enforcement,
+    required_completed_task_types: uniq(requiredCompletedTaskTypes),
+    rationale,
+  };
 }
 
 function extractObjectiveKeywords(title, domains = []) {
@@ -382,7 +436,11 @@ export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDesc
   const domains = detectDomains(text);
   const objectiveKeywords = extractObjectiveKeywords(title, domains);
   const riskLevel = inferRiskLevel(text);
-  const allowedPaths = inferAllowedPaths(taskType, domains, repoContext, objectiveKeywords);
+  const primaryOutputPath = buildPrimaryOutputPath({ taskType, pipelineId, taskId });
+  const allowedPaths = uniq([
+    ...inferAllowedPaths(taskType, domains, repoContext, objectiveKeywords),
+    ...(primaryOutputPath ? [primaryOutputPath] : []),
+  ]);
   const expectedOutputTypes = inferExpectedOutputTypes(taskType);
 
   return {
@@ -395,9 +453,12 @@ export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDesc
     dependencies,
     subsystem_tags: domains,
     objective_keywords: objectiveKeywords,
+    primary_output_path: primaryOutputPath,
     allowed_paths: allowedPaths,
     expected_output_types: expectedOutputTypes,
     required_deliverables: buildRequiredDeliverables({ taskType, riskLevel, domains }),
+    followup_deliverables: buildFollowupDeliverables({ taskType, riskLevel, domains }),
+    validation_rules: buildValidationRules({ taskType, riskLevel, domains }),
     success_criteria: buildSuccessCriteria({ taskType, allowedPaths, dependencies }),
     risk_level: riskLevel,
     execution_policy: buildExecutionPolicy({ taskType, riskLevel }),

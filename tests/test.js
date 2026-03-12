@@ -38,6 +38,7 @@ import {
   getTask,
   getNextPendingTask,
   listLeases,
+  listScopeReservations,
   getLease,
   getLeaseExecutionContext,
   getActiveLeaseForTask,
@@ -884,7 +885,7 @@ test('Fix 13: managed write gateway rejects unclaimed paths', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Fix 13a: managed write gateway rejects paths scoped by another active lease', () => {
+test('Fix 13a: attaching a conflicting task scope to an active lease is rejected immediately', () => {
   const mainDir = join(tmpdir(), `sw-scope-foreign-main-${Date.now()}`);
   const otherDir = join(tmpdir(), `sw-scope-foreign-other-${Date.now()}`);
   mkdirSync(mainDir, { recursive: true });
@@ -895,7 +896,6 @@ test('Fix 13a: managed write gateway rejects paths scoped by another active leas
 
   const foreignTaskId = createTask(scopeDb, { title: 'Foreign scoped ownership' });
   assignTask(scopeDb, foreignTaskId, 'agent2');
-  const foreignLease = getActiveLeaseForTask(scopeDb, foreignTaskId);
   upsertTaskSpec(scopeDb, foreignTaskId, {
     task_type: 'implementation',
     allowed_paths: ['src/shared/**'],
@@ -905,25 +905,127 @@ test('Fix 13a: managed write gateway rejects paths scoped by another active leas
 
   const ownTaskId = createTask(scopeDb, { title: 'Own scoped ownership' });
   assignTask(scopeDb, ownTaskId, 'main');
-  const ownLease = getActiveLeaseForTask(scopeDb, ownTaskId);
-  upsertTaskSpec(scopeDb, ownTaskId, {
+  let threw = false;
+  try {
+    upsertTaskSpec(scopeDb, ownTaskId, {
+      task_type: 'implementation',
+      allowed_paths: ['src/shared/**'],
+      expected_output_types: ['source'],
+      required_deliverables: ['source'],
+    });
+  } catch (err) {
+    threw = String(err.message).includes('Scope reservation conflict');
+  }
+
+  const ownReservations = listScopeReservations(scopeDb, { taskId: ownTaskId });
+  assert(threw, 'Conflicting task scope is rejected as soon as it is attached to the active lease');
+  assert(ownReservations.length === 0, 'Conflicting task does not keep any active scope reservations after rejection');
+  scopeDb.close();
+  rmSync(mainDir, { recursive: true, force: true });
+  rmSync(otherDir, { recursive: true, force: true });
+});
+
+test('Fix 13aa: validation still rejects writes into another lease claim inside shared areas', () => {
+  const repoDir = join(tmpdir(), `sw-claim-conflict-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const scopeDb = initDb(repoDir);
+  registerWorktree(scopeDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(scopeDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'feature/agent2' });
+
+  const foreignTaskId = createTask(scopeDb, { title: 'Foreign explicit claim' });
+  assignTask(scopeDb, foreignTaskId, 'agent2');
+  upsertTaskSpec(scopeDb, foreignTaskId, {
     task_type: 'implementation',
     allowed_paths: ['src/shared/**'],
     expected_output_types: ['source'],
     required_deliverables: ['source'],
   });
+  claimFiles(scopeDb, foreignTaskId, 'agent2', ['src/shared/example.js']);
 
-  const validation = validateWriteAccess(scopeDb, mainDir, {
+  const ownTaskId = createTask(scopeDb, { title: 'Own unrelated scope' });
+  assignTask(scopeDb, ownTaskId, 'main');
+  const ownLease = getActiveLeaseForTask(scopeDb, ownTaskId);
+  upsertTaskSpec(scopeDb, ownTaskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/local/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  const validation = validateWriteAccess(scopeDb, repoDir, {
     leaseId: ownLease.id,
     path: 'src/shared/example.js',
     worktree: 'main',
   });
 
-  assert(!validation.ok, 'Validation rejects a path already scoped by another active lease');
-  assert(validation.reason_code === 'path_scoped_by_other_lease', 'Scoped ownership conflicts use a dedicated reason code');
+  assert(!validation.ok, 'Validation rejects a path already claimed by another active lease');
+  assert(validation.reason_code === 'path_claimed_by_other_lease', 'Claim conflicts still use the explicit claim reason code');
   scopeDb.close();
-  rmSync(mainDir, { recursive: true, force: true });
-  rmSync(otherDir, { recursive: true, force: true });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 13b: overlapping scope reservations are blocked when the second lease starts', () => {
+  const repoDir = join(tmpdir(), `sw-scope-reserve-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const scopeDb = initDb(repoDir);
+  registerWorktree(scopeDb, { name: 'agent1', path: repoDir, branch: 'feature/agent1' });
+  registerWorktree(scopeDb, { name: 'agent2', path: join(repoDir, 'agent2'), branch: 'feature/agent2' });
+
+  const taskA = createTask(scopeDb, { title: 'Own auth scope' });
+  upsertTaskSpec(scopeDb, taskA, {
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+  });
+  const leaseA = startTaskLease(scopeDb, taskA, 'agent1', 'codex');
+
+  const taskB = createTask(scopeDb, { title: 'Conflicting auth scope' });
+  upsertTaskSpec(scopeDb, taskB, {
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/session/**'],
+    subsystem_tags: ['auth'],
+  });
+
+  let threw = false;
+  try {
+    startTaskLease(scopeDb, taskB, 'agent2', 'codex');
+  } catch (err) {
+    threw = String(err.message).includes('Scope reservation conflict');
+  }
+
+  const reservations = listScopeReservations(scopeDb, { activeOnly: true });
+  const taskBAfter = getTask(scopeDb, taskB);
+  assert(Boolean(leaseA), 'First lease acquires its reserved scope normally');
+  assert(threw, 'Second overlapping lease is blocked at reservation time');
+  assert(taskBAfter.status === 'pending', 'Task stays pending when scope reservation fails');
+  assert(reservations.length >= 1 && reservations.every((reservation) => reservation.lease_id === leaseA.id), 'Only the first lease keeps active scope reservations after the conflict');
+  scopeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 13c: scope reservations are released when a lease completes', () => {
+  const repoDir = join(tmpdir(), `sw-scope-release-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const scopeDb = initDb(repoDir);
+  registerWorktree(scopeDb, { name: 'main', path: repoDir, branch: 'main' });
+
+  const taskId = createTask(scopeDb, { title: 'Scoped completion task' });
+  upsertTaskSpec(scopeDb, taskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/payments/**'],
+    subsystem_tags: ['payments'],
+  });
+  const lease = startTaskLease(scopeDb, taskId, 'main', 'codex');
+  const activeReservations = listScopeReservations(scopeDb, { leaseId: lease.id });
+
+  completeLeaseTask(scopeDb, lease.id);
+
+  const releasedReservations = listScopeReservations(scopeDb, { activeOnly: false, leaseId: lease.id });
+  const stillActive = listScopeReservations(scopeDb, { leaseId: lease.id });
+  assert(activeReservations.length === 2, 'Lease creates both path-scope and subsystem reservations');
+  assert(stillActive.length === 0, 'Lease completion releases active scope reservations');
+  assert(releasedReservations.every((reservation) => Boolean(reservation.released_at)), 'Released scope reservations keep a release timestamp for auditability');
+  scopeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Fix 14: managed remove gateway enforces the same claim policy', () => {
@@ -1419,6 +1521,137 @@ test('Fix 25: AI merge gate blocks high-risk overlapping subsystem changes', () 
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 25a: scan and gates report hierarchical ownership overlaps explicitly', () => {
+  const repoDir = join(tmpdir(), `sw-ownership-report-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const featureA = join(tmpdir(), `sw-ownership-report-a-${Date.now()}`);
+  const featureB = join(tmpdir(), `sw-ownership-report-b-${Date.now()}`);
+  execSync(`git worktree add -b feature-owned-a "${featureA}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature-owned-b "${featureB}"`, { cwd: repoDir });
+
+  const gateDb = initDb(repoDir);
+  const worktreeA = featureA.split('/').pop();
+  const worktreeB = featureB.split('/').pop();
+  registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(gateDb, { name: worktreeA, path: featureA, branch: 'feature-owned-a' });
+  registerWorktree(gateDb, { name: worktreeB, path: featureB, branch: 'feature-owned-b' });
+
+  const taskA = createTask(gateDb, { title: 'Owned A' });
+  const taskB = createTask(gateDb, { title: 'Owned B' });
+  const leaseA = startTaskLease(gateDb, taskA, worktreeA, 'codex');
+  const leaseB = startTaskLease(gateDb, taskB, worktreeB, 'codex');
+
+  gateDb.prepare(`
+    INSERT INTO scope_reservations (lease_id, task_id, worktree, ownership_level, scope_pattern, subsystem_tag)
+    VALUES (?, ?, ?, 'subsystem', NULL, 'auth'),
+           (?, ?, ?, 'subsystem', NULL, 'auth'),
+           (?, ?, ?, 'path_scope', 'src/auth/**', NULL),
+           (?, ?, ?, 'path_scope', 'src/auth/session/**', NULL)
+  `).run(
+    leaseA.id, taskA, worktreeA,
+    leaseB.id, taskB, worktreeB,
+    leaseA.id, taskA, worktreeA,
+    leaseB.id, taskB, worktreeB,
+  );
+  gateDb.close();
+
+  const scan = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'scan', '--json'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  let aiStdout = '';
+  try {
+    aiStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ai', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    aiStdout = String(err.stdout || '');
+  }
+  const aiGate = JSON.parse(aiStdout);
+  let ciStdout = '';
+  try {
+    ciStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ci', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    ciStdout = String(err.stdout || '');
+  }
+  const ciGate = JSON.parse(ciStdout);
+
+  assert(scan.ownershipConflicts.some((conflict) => conflict.type === 'subsystem_overlap' && conflict.subsystemTag === 'auth'), 'Scan reports shared subsystem ownership explicitly');
+  assert(scan.ownershipConflicts.some((conflict) => conflict.type === 'scope_overlap' && conflict.scopeA === 'src/auth/**'), 'Scan reports overlapping path scopes explicitly');
+  assert(aiGate.ownership_conflicts.length >= 2, 'AI merge gate includes hierarchical ownership overlaps in its output');
+  assert(aiGate.pairs.some((pair) => pair.reasons.some((reason) => reason.includes('reserve the auth subsystem'))), 'AI merge gate reasons mention shared subsystem ownership');
+  assert(!ciGate.ok, 'Repo CI gate rejects ownership boundary overlaps');
+  assert(ciGate.ownership_conflicts.length >= 2, 'Repo CI gate returns ownership overlaps in JSON output');
+
+  execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 25b: AI merge gate blocks missing boundary validation work for high-risk implementation', () => {
+  const repoDir = join(tmpdir(), `sw-boundary-validation-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const gateDb = initDb(repoDir);
+  registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
+  const pipeline = startPipeline(gateDb, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-boundary',
+    priority: 5,
+  });
+  const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
+  completeTask(gateDb, implementationTask.id);
+  gateDb.close();
+
+  let aiStdout = '';
+  try {
+    aiStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ai', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    aiStdout = String(err.stdout || '');
+  }
+  const aiGate = JSON.parse(aiStdout);
+
+  let ciStdout = '';
+  try {
+    ciStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ci', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    ciStdout = String(err.stdout || '');
+  }
+  const ciGate = JSON.parse(ciStdout);
+
+  assert(aiGate.status === 'blocked', 'AI merge gate blocks when a high-risk ownership boundary is missing validation work');
+  assert(aiGate.boundary_validations.some((item) => item.pipeline_id === 'pipe-boundary' && item.missing_task_types.includes('tests')), 'AI merge gate reports the missing completed tests requirement');
+  assert(aiGate.boundary_validations.some((item) => item.pipeline_id === 'pipe-boundary' && item.missing_task_types.includes('governance')), 'AI merge gate reports the missing completed governance review requirement');
+  assert(!ciGate.ok, 'Repo CI gate fails when blocking boundary validations are still missing');
+  assert(ciGate.boundary_validations.some((item) => item.pipeline_id === 'pipe-boundary'), 'Repo CI gate returns the blocking boundary validations in JSON output');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 26: AI merge gate passes isolated worktree changes', () => {
   const repoDir = join(tmpdir(), `sw-ai-gate-pass-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -1648,6 +1881,9 @@ test('Fix 28b: planner emits subsystem-aware specs for high-risk work', () => {
   assert(implementationTask.task_spec.required_deliverables.includes('source'), 'Planner keeps source as the required deliverable for implementation work');
   assert(implementationTask.task_spec.followup_deliverables.includes('tests'), 'Planner records tests as a follow-up deliverable for high-risk implementation work');
   assert(implementationTask.task_spec.followup_deliverables.includes('docs'), 'Planner records docs as a follow-up deliverable for API/schema-related implementation work');
+  assert(implementationTask.task_spec.validation_rules.required_completed_task_types.includes('tests'), 'Planner requires completed tests for high-risk ownership-boundary implementation work');
+  assert(implementationTask.task_spec.validation_rules.required_completed_task_types.includes('governance'), 'Planner requires completed governance review for sensitive ownership-boundary implementation work');
+  assert(implementationTask.task_spec.validation_rules.enforcement === 'blocked', 'Planner marks auth/schema/payment boundary validation as blocking');
   assert(implementationTask.task_spec.execution_policy.timeout_ms === 90000, 'Planner gives high-risk implementation tasks a stricter execution timeout');
   assert(implementationTask.task_spec.execution_policy.max_retries === 1, 'Planner keeps high-risk implementation retries constrained');
   assert(testsTask.dependencies.includes(implementationTask.id), 'Planner keeps generated test work dependent on implementation');

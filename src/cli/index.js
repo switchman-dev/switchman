@@ -27,7 +27,7 @@ import {
   initDb, openDb,
   DEFAULT_STALE_LEASE_MINUTES,
   createTask, startTaskLease, completeTask, failTask, getTaskSpec, listTasks, getTask, getNextPendingTask,
-  listLeases, heartbeatLease, getStaleLeases, reapStaleLeases,
+  listLeases, listScopeReservations, heartbeatLease, getStaleLeases, reapStaleLeases,
   registerWorktree, listWorktrees,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts,
   verifyAuditTrail,
@@ -121,10 +121,19 @@ function sleepSync(ms) {
 }
 
 function summarizeLeaseScope(db, lease) {
-  const allowedPaths = getTaskSpec(db, lease.task_id)?.allowed_paths || [];
-  if (allowedPaths.length === 0) return null;
-  if (allowedPaths.length === 1) return `scope:${allowedPaths[0]}`;
-  return `scope:${allowedPaths.length} paths`;
+  const reservations = listScopeReservations(db, { leaseId: lease.id });
+  const pathScopes = reservations
+    .filter((reservation) => reservation.ownership_level === 'path_scope' && reservation.scope_pattern)
+    .map((reservation) => reservation.scope_pattern);
+  if (pathScopes.length === 1) return `scope:${pathScopes[0]}`;
+  if (pathScopes.length > 1) return `scope:${pathScopes.length} paths`;
+
+  const subsystemScopes = reservations
+    .filter((reservation) => reservation.ownership_level === 'subsystem' && reservation.subsystem_tag)
+    .map((reservation) => reservation.subsystem_tag);
+  if (subsystemScopes.length === 1) return `subsystem:${subsystemScopes[0]}`;
+  if (subsystemScopes.length > 1) return `subsystem:${subsystemScopes.length}`;
+  return null;
 }
 
 function isBusyError(err) {
@@ -268,6 +277,16 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     next_step: 'let one task finish first or re-scope the conflicting work',
   }));
 
+  const ownershipConflicts = (scanReport.ownershipConflicts || []).map((conflict) => ({
+    type: conflict.type,
+    worktree_a: conflict.worktreeA,
+    worktree_b: conflict.worktreeB,
+    subsystem_tag: conflict.subsystemTag || null,
+    scope_a: conflict.scopeA || null,
+    scope_b: conflict.scopeB || null,
+    next_step: 'split the task scopes or serialize work across the shared ownership boundary',
+  }));
+
   const branchConflicts = scanReport.conflicts.map((conflict) => ({
     worktree_a: conflict.worktreeA,
     worktree_b: conflict.worktreeB,
@@ -308,6 +327,18 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       command: 'switchman scan',
       severity: 'block',
     })),
+    ...ownershipConflicts.map((conflict) => ({
+      kind: 'ownership_conflict',
+      title: conflict.type === 'subsystem_overlap'
+        ? `${conflict.worktree_a} and ${conflict.worktree_b} share subsystem ownership`
+        : `${conflict.worktree_a} and ${conflict.worktree_b} share scoped ownership`,
+      detail: conflict.type === 'subsystem_overlap'
+        ? `subsystem:${conflict.subsystem_tag}`
+        : `${conflict.scope_a} ↔ ${conflict.scope_b}`,
+      next_step: conflict.next_step,
+      command: 'switchman scan',
+      severity: 'block',
+    })),
     ...branchConflicts.map((conflict) => ({
       kind: 'branch_conflict',
       title: `${conflict.worktree_a} and ${conflict.worktree_b} have merge risk`,
@@ -326,6 +357,17 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       next_step: 'run `switchman gate ai` and review the risky worktree pairs',
       command: 'switchman gate ai',
       severity: aiGate.status === 'blocked' ? 'block' : 'warn',
+    });
+  }
+
+  for (const validation of aiGate.boundary_validations || []) {
+    attention.push({
+      kind: 'boundary_validation',
+      title: validation.summary,
+      detail: validation.rationale?.[0] || `missing ${validation.missing_task_types.join(', ')}`,
+      next_step: 'complete the missing validation work before merge',
+      command: validation.pipeline_id ? `switchman pipeline status ${validation.pipeline_id}` : 'switchman gate ai',
+      severity: validation.severity === 'blocked' ? 'block' : 'warn',
     });
   }
 
@@ -362,10 +404,12 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     merge_readiness: {
       ci_gate_ok: scanReport.conflicts.length === 0
         && scanReport.fileConflicts.length === 0
+        && (scanReport.ownershipConflicts?.length || 0) === 0
         && scanReport.unclaimedChanges.length === 0
         && scanReport.complianceSummary.non_compliant === 0
         && scanReport.complianceSummary.stale === 0,
       ai_gate_status: aiGate.status,
+      boundary_validations: aiGate.boundary_validations || [],
       compliance: scanReport.complianceSummary,
     },
     next_steps: attention.length > 0
@@ -377,7 +421,7 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
   };
 }
 
-function acquireNextTaskLease(db, worktreeName, agent, attempts = 5) {
+function acquireNextTaskLease(db, worktreeName, agent, attempts = 20) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       const task = getNextPendingTask(db);
@@ -396,7 +440,7 @@ function acquireNextTaskLease(db, worktreeName, agent, attempts = 5) {
     }
 
     if (attempt < attempts) {
-      sleepSync(25 * attempt);
+      sleepSync(75 * attempt);
     }
   }
 
@@ -1426,6 +1470,21 @@ program
         console.log('');
       }
 
+      if ((report.ownershipConflicts?.length || 0) > 0) {
+        console.log(chalk.yellow(`⚠ Ownership boundary overlaps detected:`));
+        for (const conflict of report.ownershipConflicts) {
+          if (conflict.type === 'subsystem_overlap') {
+            console.log(`  ${chalk.yellow(`subsystem:${conflict.subsystemTag}`)}`);
+            console.log(`    ${chalk.dim('reserved by:')} ${conflict.worktreeA}, ${conflict.worktreeB}`);
+          } else {
+            console.log(`  ${chalk.yellow(conflict.scopeA)}`);
+            console.log(`    ${chalk.dim('overlaps with:')} ${conflict.scopeB}`);
+            console.log(`    ${chalk.dim('reserved by:')} ${conflict.worktreeA}, ${conflict.worktreeB}`);
+          }
+        }
+        console.log('');
+      }
+
       // Branch-level conflicts
       if (report.conflicts.length > 0) {
         console.log(chalk.red(`✗ Branch conflicts detected:`));
@@ -1455,7 +1514,7 @@ program
       }
 
       // All clear
-      if (report.conflicts.length === 0 && report.fileConflicts.length === 0 && report.unclaimedChanges.length === 0) {
+      if (report.conflicts.length === 0 && report.fileConflicts.length === 0 && (report.ownershipConflicts?.length || 0) === 0 && report.unclaimedChanges.length === 0) {
         console.log(chalk.green(`✓ No conflicts detected across ${report.worktrees.length} worktree(s)`));
       }
 
@@ -1573,7 +1632,7 @@ program
       const report = await scanAllWorktrees(db, repoRoot);
       spinner.stop();
 
-      const totalConflicts = report.conflicts.length + report.fileConflicts.length + report.unclaimedChanges.length;
+      const totalConflicts = report.conflicts.length + report.fileConflicts.length + (report.ownershipConflicts?.length || 0) + report.unclaimedChanges.length;
       if (totalConflicts === 0) {
         console.log(chalk.green(`✓ No conflicts across ${report.worktrees.length} worktree(s)`));
       } else {
@@ -1595,6 +1654,18 @@ program
           const nextStep = nextStepForReason(reasonCode);
           console.log(`  ${chalk.cyan(entry.worktree)}: ${entry.files.slice(0, 5).join(', ')}${entry.files.length > 5 ? ` +${entry.files.length - 5} more` : ''}`);
           console.log(`    ${chalk.dim(humanizeReasonCode(reasonCode))}${nextStep ? ` — ${nextStep}` : ''}`);
+        }
+      }
+
+      if ((report.ownershipConflicts?.length || 0) > 0) {
+        console.log('');
+        console.log(chalk.bold('Ownership Boundary Overlaps:'));
+        for (const conflict of report.ownershipConflicts.slice(0, 5)) {
+          if (conflict.type === 'subsystem_overlap') {
+            console.log(`  ${chalk.cyan(conflict.worktreeA)}: ${chalk.dim(`subsystem:${conflict.subsystemTag}`)} ${chalk.dim('vs')} ${chalk.cyan(conflict.worktreeB)}`);
+          } else {
+            console.log(`  ${chalk.cyan(conflict.worktreeA)}: ${chalk.dim(conflict.scopeA)} ${chalk.dim('vs')} ${chalk.cyan(conflict.worktreeB)} ${chalk.dim(conflict.scopeB)}`);
+          }
         }
       }
 
@@ -1810,23 +1881,29 @@ gateCmd
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
     const report = await scanAllWorktrees(db, repoRoot);
+    const aiGate = await runAiMergeGate(db, repoRoot);
     db.close();
 
     const ok = report.conflicts.length === 0
       && report.fileConflicts.length === 0
+      && (report.ownershipConflicts?.length || 0) === 0
       && report.unclaimedChanges.length === 0
       && report.complianceSummary.non_compliant === 0
-      && report.complianceSummary.stale === 0;
+      && report.complianceSummary.stale === 0
+      && aiGate.status !== 'blocked';
 
     const result = {
       ok,
       summary: ok
         ? `Repo gate passed for ${report.worktrees.length} worktree(s).`
-        : 'Repo gate rejected unmanaged changes, stale leases, or worktree conflicts.',
+        : 'Repo gate rejected unmanaged changes, stale leases, worktree conflicts, or boundary validation failures.',
       compliance: report.complianceSummary,
       unclaimed_changes: report.unclaimedChanges,
       file_conflicts: report.fileConflicts,
+      ownership_conflicts: report.ownershipConflicts || [],
       branch_conflicts: report.conflicts,
+      ai_gate_status: aiGate.status,
+      boundary_validations: aiGate.boundary_validations || [],
     };
 
     const githubTargets = resolveGitHubOutputTargets(opts);
@@ -1856,10 +1933,26 @@ gateCmd
           console.log(`    ${chalk.yellow(conflict.file)} ${chalk.dim(conflict.worktrees.join(', '))}`);
         }
       }
+      if (result.ownership_conflicts.length > 0) {
+        console.log(chalk.bold('  Ownership conflicts:'));
+        for (const conflict of result.ownership_conflicts) {
+          if (conflict.type === 'subsystem_overlap') {
+            console.log(`    ${chalk.yellow(conflict.worktreeA)} ${chalk.dim('vs')} ${chalk.yellow(conflict.worktreeB)} ${chalk.dim(`subsystem:${conflict.subsystemTag}`)}`);
+          } else {
+            console.log(`    ${chalk.yellow(conflict.worktreeA)} ${chalk.dim('vs')} ${chalk.yellow(conflict.worktreeB)} ${chalk.dim(`${conflict.scopeA} ↔ ${conflict.scopeB}`)}`);
+          }
+        }
+      }
       if (result.branch_conflicts.length > 0) {
         console.log(chalk.bold('  Branch conflicts:'));
         for (const conflict of result.branch_conflicts) {
           console.log(`    ${chalk.yellow(conflict.worktreeA)} ${chalk.dim('vs')} ${chalk.yellow(conflict.worktreeB)}`);
+        }
+      }
+      if (result.boundary_validations.length > 0) {
+        console.log(chalk.bold('  Boundary validations:'));
+        for (const validation of result.boundary_validations) {
+          console.log(`    ${chalk.yellow(validation.task_id)} ${chalk.dim(validation.missing_task_types.join(', '))}`);
         }
       }
     }
@@ -1904,6 +1997,16 @@ gateCmd
           console.log(`    ${chalk.cyan(pair.worktree_a)} ${chalk.dim('vs')} ${chalk.cyan(pair.worktree_b)} ${chalk.dim(pair.status)} ${chalk.dim(`score=${pair.score}`)}`);
           for (const reason of pair.reasons.slice(0, 3)) {
             console.log(`      ${chalk.yellow(reason)}`);
+          }
+        }
+      }
+
+      if ((result.boundary_validations?.length || 0) > 0) {
+        console.log(chalk.bold('  Boundary validations:'));
+        for (const validation of result.boundary_validations.slice(0, 5)) {
+          console.log(`    ${chalk.cyan(validation.task_id)} ${chalk.dim(validation.severity)} ${chalk.dim(validation.missing_task_types.join(', '))}`);
+          if (validation.rationale?.[0]) {
+            console.log(`      ${chalk.yellow(validation.rationale[0])}`);
           }
         }
       }

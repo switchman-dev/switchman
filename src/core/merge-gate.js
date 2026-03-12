@@ -1,4 +1,4 @@
-import { logAuditEvent } from './db.js';
+import { getTaskSpec, listTasks, logAuditEvent } from './db.js';
 import { scanAllWorktrees } from './detector.js';
 
 const RISK_PATTERNS = [
@@ -83,6 +83,10 @@ function buildPairAnalysis(left, right, report) {
     (conflict.worktreeA === left.worktree && conflict.worktreeB === right.worktree)
     || (conflict.worktreeA === right.worktree && conflict.worktreeB === left.worktree),
   ) || null;
+  const ownershipConflicts = (report.ownershipConflicts || []).filter((conflict) =>
+    (conflict.worktreeA === left.worktree && conflict.worktreeB === right.worktree)
+    || (conflict.worktreeA === right.worktree && conflict.worktreeB === left.worktree),
+  );
   const sharedAreas = intersection(left.areas, right.areas);
   const sharedRiskTags = intersection(left.risk_tags, right.risk_tags);
 
@@ -97,6 +101,18 @@ function buildPairAnalysis(left, right, report) {
   if (directFileConflict.length > 0) {
     reasons.push(`direct file overlap in ${directFileConflict.map((item) => item.file).join(', ')}`);
     score = Math.max(score, 95);
+  }
+
+  if (ownershipConflicts.length > 0) {
+    for (const conflict of ownershipConflicts) {
+      if (conflict.type === 'subsystem_overlap') {
+        reasons.push(`both worktrees reserve the ${conflict.subsystemTag} subsystem`);
+        score = Math.max(score, 85);
+      } else if (conflict.type === 'scope_overlap') {
+        reasons.push(`both worktrees reserve overlapping scopes (${conflict.scopeA} vs ${conflict.scopeB})`);
+        score = Math.max(score, 90);
+      }
+    }
   }
 
   if (sharedAreas.length > 0) {
@@ -136,31 +152,80 @@ function buildPairAnalysis(left, right, report) {
     reasons,
     shared_areas: sharedAreas,
     shared_risk_tags: sharedRiskTags,
+    ownership_conflicts: ownershipConflicts,
     conflicting_files: branchConflict?.conflictingFiles || directFileConflict.map((item) => item.file),
   };
 }
 
-function summarizeOverall(pairAnalyses, worktreeAnalyses) {
+function summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations) {
   const blockedPairs = pairAnalyses.filter((item) => item.status === 'blocked');
   const warnedPairs = pairAnalyses.filter((item) => item.status === 'warn');
   const riskyWorktrees = worktreeAnalyses.filter((item) => item.score >= 40);
+  const blockedValidations = boundaryValidations.filter((item) => item.severity === 'blocked');
+  const warnedValidations = boundaryValidations.filter((item) => item.severity === 'warn');
 
-  if (blockedPairs.length > 0) {
+  if (blockedPairs.length > 0 || blockedValidations.length > 0) {
     return {
       status: 'blocked',
-      summary: `AI merge gate blocked: ${blockedPairs.length} worktree pair(s) show high integration risk.`,
+      summary: `AI merge gate blocked: ${blockedPairs.length} risky pair(s) and ${blockedValidations.length} boundary validation issue(s) need resolution.`,
     };
   }
-  if (warnedPairs.length > 0 || riskyWorktrees.length > 0) {
+  if (warnedPairs.length > 0 || riskyWorktrees.length > 0 || warnedValidations.length > 0) {
     return {
       status: 'warn',
-      summary: `AI merge gate warns: ${warnedPairs.length} pair(s) or ${riskyWorktrees.length} worktree(s) need manual integration review.`,
+      summary: `AI merge gate warns: ${warnedPairs.length} pair(s), ${riskyWorktrees.length} worktree(s), or ${warnedValidations.length} boundary validation issue(s) need review.`,
     };
   }
   return {
     status: 'pass',
     summary: 'AI merge gate passed: no elevated semantic merge risks detected.',
   };
+}
+
+function evaluateBoundaryValidations(db) {
+  const tasks = listTasks(db);
+  const specsByTaskId = new Map(tasks.map((task) => [task.id, getTaskSpec(db, task.id)]));
+  const tasksByPipeline = new Map();
+
+  for (const task of tasks) {
+    const spec = specsByTaskId.get(task.id);
+    const pipelineId = spec?.pipeline_id;
+    if (!pipelineId) continue;
+    if (!tasksByPipeline.has(pipelineId)) tasksByPipeline.set(pipelineId, []);
+    tasksByPipeline.get(pipelineId).push({ task, task_spec: spec });
+  }
+
+  const findings = [];
+  for (const [pipelineId, pipelineTasks] of tasksByPipeline.entries()) {
+    const completedTaskTypes = new Set(
+      pipelineTasks
+        .filter(({ task }) => task.status === 'done')
+        .map(({ task_spec }) => task_spec?.task_type)
+        .filter(Boolean),
+    );
+
+    for (const { task, task_spec: spec } of pipelineTasks) {
+      if (!spec?.validation_rules || spec.task_type !== 'implementation') continue;
+      if (!['in_progress', 'done'].includes(task.status)) continue;
+
+      const requiredTypes = spec.validation_rules.required_completed_task_types || [];
+      const missingTaskTypes = requiredTypes.filter((taskType) => !completedTaskTypes.has(taskType));
+      if (missingTaskTypes.length === 0) continue;
+
+      findings.push({
+        pipeline_id: pipelineId,
+        task_id: task.id,
+        worktree: task.worktree || null,
+        subsystem_tags: spec.subsystem_tags || [],
+        severity: spec.validation_rules.enforcement === 'blocked' ? 'blocked' : 'warn',
+        missing_task_types: missingTaskTypes,
+        rationale: spec.validation_rules.rationale || [],
+        summary: `${task.title} is missing completed ${missingTaskTypes.join(', ')} validation work`,
+      });
+    }
+  }
+
+  return findings;
 }
 
 export async function runAiMergeGate(db, repoRoot) {
@@ -180,17 +245,20 @@ export async function runAiMergeGate(db, repoRoot) {
     }
   }
 
-  const overall = summarizeOverall(pairAnalyses, worktreeAnalyses);
+  const boundaryValidations = evaluateBoundaryValidations(db);
+  const overall = summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations);
   const result = {
     ok: overall.status === 'pass',
     status: overall.status,
     summary: overall.summary,
     worktrees: worktreeAnalyses,
     pairs: pairAnalyses,
+    boundary_validations: boundaryValidations,
     compliance: report.complianceSummary,
     unclaimed_changes: report.unclaimedChanges,
     branch_conflicts: report.conflicts,
     file_conflicts: report.fileConflicts,
+    ownership_conflicts: report.ownershipConflicts || [],
   };
 
   logAuditEvent(db, {
@@ -201,6 +269,8 @@ export async function runAiMergeGate(db, repoRoot) {
       status: result.status,
       blocked_pairs: pairAnalyses.filter((item) => item.status === 'blocked').length,
       warned_pairs: pairAnalyses.filter((item) => item.status === 'warn').length,
+      blocked_boundary_validations: boundaryValidations.filter((item) => item.severity === 'blocked').length,
+      warned_boundary_validations: boundaryValidations.filter((item) => item.severity === 'warn').length,
     }),
   });
 
