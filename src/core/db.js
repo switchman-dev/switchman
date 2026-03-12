@@ -6,7 +6,7 @@
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { join, posix, resolve } from 'path';
 
 const SWITCHMAN_DIR = '.switchman';
 const DB_FILE = 'switchman.db';
@@ -48,6 +48,22 @@ function normalizeWorktreePath(path) {
   } catch {
     return resolve(path);
   }
+}
+
+function normalizeClaimedFilePath(filePath) {
+  const rawPath = String(filePath || '').replace(/\\/g, '/').trim();
+  const normalized = posix.normalize(rawPath.replace(/^\.\/+/, ''));
+  if (
+    normalized === '' ||
+    normalized === '.' ||
+    normalized === '..' ||
+    normalized.startsWith('../') ||
+    rawPath.startsWith('/') ||
+    /^[A-Za-z]:\//.test(rawPath)
+  ) {
+    throw new Error('Claimed file paths must stay inside the repository.');
+  }
+  return normalized;
 }
 
 function makeId(prefix) {
@@ -1934,19 +1950,29 @@ export function reapStaleLeases(db, staleAfterMinutes = DEFAULT_STALE_LEASE_MINU
 export function claimFiles(db, taskId, worktree, filePaths, agent) {
   return withImmediateTransaction(db, () => {
     const lease = resolveActiveLeaseTx(db, taskId, worktree, agent);
-    const findActiveClaim = db.prepare(`
+    const activeClaims = db.prepare(`
       SELECT *
       FROM file_claims
-      WHERE file_path=? AND released_at IS NULL
-      LIMIT 1
-    `);
+      WHERE released_at IS NULL
+      ORDER BY id ASC
+    `).all();
+    const activeClaimByPath = new Map();
+    for (const claim of activeClaims) {
+      const normalizedPath = normalizeClaimedFilePath(claim.file_path);
+      if (!activeClaimByPath.has(normalizedPath)) {
+        activeClaimByPath.set(normalizedPath, claim);
+      }
+    }
+
+    const normalizeAndDeduplicate = [...new Set(filePaths.map((filePath) => normalizeClaimedFilePath(filePath)))];
+    const findClaimOwner = (normalizedPath) => activeClaimByPath.get(normalizedPath) || null;
     const insert = db.prepare(`
       INSERT INTO file_claims (task_id, lease_id, file_path, worktree, agent)
       VALUES (?, ?, ?, ?, ?)
     `);
 
-    for (const fp of filePaths) {
-      const existing = findActiveClaim.get(fp);
+    for (const normalizedPath of normalizeAndDeduplicate) {
+      const existing = findClaimOwner(normalizedPath);
       if (existing) {
         const sameLease = existing.lease_id === lease.id;
         const sameLegacyOwner = existing.lease_id == null && existing.task_id === taskId && existing.worktree === worktree;
@@ -1958,6 +1984,7 @@ export function claimFiles(db, taskId, worktree, filePaths, agent) {
               SET lease_id=?, agent=COALESCE(?, agent)
               WHERE id=?
             `).run(lease.id, agent || null, existing.id);
+            activeClaimByPath.set(normalizedPath, { ...existing, lease_id: lease.id, agent: agent || existing.agent });
           }
           continue;
         }
@@ -1965,14 +1992,21 @@ export function claimFiles(db, taskId, worktree, filePaths, agent) {
         throw new Error('One or more files are already actively claimed by another task.');
       }
 
-      insert.run(taskId, lease.id, fp, worktree, agent || null);
+      insert.run(taskId, lease.id, normalizedPath, worktree, agent || null);
+      activeClaimByPath.set(normalizedPath, {
+        task_id: taskId,
+        lease_id: lease.id,
+        file_path: normalizedPath,
+        worktree,
+        agent: agent || null,
+      });
       logAuditEventTx(db, {
         eventType: 'file_claimed',
         status: 'allowed',
         worktree,
         taskId,
         leaseId: lease.id,
-        filePath: fp,
+        filePath: normalizedPath,
       });
     }
 
@@ -2030,19 +2064,27 @@ export function getCompletedFileClaims(db, worktree = null) {
 }
 
 export function checkFileConflicts(db, filePaths, excludeWorktree) {
+  const normalizedPaths = [...new Set(filePaths.map((filePath) => normalizeClaimedFilePath(filePath)))];
   const conflicts = [];
-  const stmt = db.prepare(`
+  const claims = db.prepare(`
     SELECT fc.*, t.title as task_title, l.id as lease_id, l.status as lease_status
     FROM file_claims fc
     JOIN tasks t ON fc.task_id = t.id
     LEFT JOIN leases l ON fc.lease_id = l.id
-    WHERE fc.file_path=?
-      AND fc.released_at IS NULL
+    WHERE fc.released_at IS NULL
       AND fc.worktree != ?
       AND t.status NOT IN ('done','failed')
-  `);
-  for (const fp of filePaths) {
-    const existing = stmt.get(fp, excludeWorktree || '');
+  `).all(excludeWorktree || '');
+  const claimByNormalizedPath = new Map();
+  for (const claim of claims) {
+    const normalizedPath = normalizeClaimedFilePath(claim.file_path);
+    if (!claimByNormalizedPath.has(normalizedPath)) {
+      claimByNormalizedPath.set(normalizedPath, claim);
+    }
+  }
+
+  for (const fp of normalizedPaths) {
+    const existing = claimByNormalizedPath.get(fp);
     if (existing) conflicts.push({ file: fp, claimedBy: existing });
   }
   return conflicts;

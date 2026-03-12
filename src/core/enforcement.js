@@ -1,5 +1,5 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
-import { dirname, join, resolve, relative } from 'path';
+import { dirname, join, posix, relative, resolve } from 'path';
 import { execFileSync, spawnSync } from 'child_process';
 
 import {
@@ -212,12 +212,15 @@ function classifyObservedPath(db, repoRoot, worktree, filePath, options = {}) {
 }
 
 function normalizeRepoPath(repoRoot, targetPath) {
-  const relativePath = String(targetPath || '').replace(/\\/g, '/').replace(/^\.\/+/, '');
+  const rawPath = String(targetPath || '').replace(/\\/g, '/').trim();
+  const relativePath = posix.normalize(rawPath.replace(/^\.\/+/, ''));
   if (
     relativePath === '' ||
-    relativePath.startsWith('..') ||
     relativePath === '.' ||
-    relativePath.startsWith('/')
+    relativePath === '..' ||
+    relativePath.startsWith('../') ||
+    rawPath.startsWith('/') ||
+    /^[A-Za-z]:\//.test(rawPath)
   ) {
     throw new Error('Target path must point to a file inside the repository.');
   }
@@ -529,7 +532,17 @@ export function gatewayMovePath(db, repoRoot, { leaseId, sourcePath, destination
 }
 
 export function gatewayMakeDirectory(db, repoRoot, { leaseId, path: targetPath, worktree = null }) {
-  const normalizedPath = String(targetPath || '').replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '');
+  let normalizedPath;
+  try {
+    normalizedPath = normalizeRepoPath(repoRoot, targetPath).relativePath.replace(/\/+$/, '');
+  } catch {
+    return {
+      ok: false,
+      reason_code: 'policy_exception_required',
+      file_path: targetPath,
+      lease_id: leaseId,
+    };
+  }
   const lease = getLease(db, leaseId);
 
   if (!lease || lease.status !== 'active') {

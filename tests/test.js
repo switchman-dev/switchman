@@ -19,6 +19,7 @@ import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 import { buildTaskSpec } from '../src/core/planner.js';
 import { DEFAULT_LEASE_POLICY, loadLeasePolicy, writeLeasePolicy } from '../src/core/policy.js';
+import { resolveQueueSource } from '../src/core/queue.js';
 import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
@@ -358,6 +359,57 @@ test('Merge queue add stores a queued worktree merge item', () => {
   assert(item.status === 'queued', 'Queue item starts queued');
   assert(items.length === 1, 'Queue item is persisted');
   assert(items[0].source_worktree === 'agent1', 'Queue item stores the queued worktree name');
+  queueDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue pipeline resolution rejects incomplete pipelines and ambiguous multi-branch pipelines', () => {
+  const repoDir = join(tmpdir(), `sw-queue-pipeline-safety-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: join(tmpdir(), `sw-queue-pipeline-agent1-${Date.now()}`), branch: 'feature/pipeline-a' });
+  registerWorktree(queueDb, { name: 'agent2', path: join(tmpdir(), `sw-queue-pipeline-agent2-${Date.now()}`), branch: 'feature/pipeline-b' });
+
+  const incompleteA = createTask(queueDb, { id: 'pipe-unsafe-01', title: 'Pipeline task A' });
+  const incompleteB = createTask(queueDb, { id: 'pipe-unsafe-02', title: 'Pipeline task B' });
+  assignTask(queueDb, incompleteA, 'agent1');
+  completeTask(queueDb, incompleteA);
+
+  let incompleteError = null;
+  try {
+    resolveQueueSource(queueDb, repoDir, {
+      source_type: 'pipeline',
+      source_ref: 'pipe-unsafe',
+      source_pipeline_id: 'pipe-unsafe',
+    });
+  } catch (err) {
+    incompleteError = err;
+  }
+
+  assignTask(queueDb, incompleteB, 'agent2');
+  completeTask(queueDb, incompleteB);
+
+  let ambiguousError = null;
+  try {
+    resolveQueueSource(queueDb, repoDir, {
+      source_type: 'pipeline',
+      source_ref: 'pipe-unsafe',
+      source_pipeline_id: 'pipe-unsafe',
+    });
+  } catch (err) {
+    ambiguousError = err;
+  }
+
+  assert(String(incompleteError?.message || '').includes('not ready to queue'), 'Pipeline queueing rejects incomplete pipelines');
+  assert(String(ambiguousError?.message || '').includes('spans multiple branches'), 'Pipeline queueing rejects ambiguous multi-branch pipelines');
   queueDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -947,6 +999,31 @@ test('Fix 3c: claiming a nonexistent task is rejected', () => {
   }
   assert(threw, 'Nonexistent task cannot claim files');
   guardDb.close();
+});
+
+test('Fix 3d: claim paths are normalized before conflict checks and storage', () => {
+  const canonicalDb = initDb(join(tmpdir(), `sw-claim-normalize-${Date.now()}`));
+  const taskA = createTask(canonicalDb, { title: 'task A' });
+  const taskB = createTask(canonicalDb, { title: 'task B' });
+  assignTask(canonicalDb, taskA, 'agent-a');
+  assignTask(canonicalDb, taskB, 'agent-b');
+
+  claimFiles(canonicalDb, taskA, 'agent-a', ['./src/../src/shared.js']);
+
+  let threw = false;
+  try {
+    claimFiles(canonicalDb, taskB, 'agent-b', ['src/shared.js']);
+  } catch {
+    threw = true;
+  }
+
+  const conflicts = checkFileConflicts(canonicalDb, ['./src/shared.js'], 'agent-b');
+  const claims = getActiveFileClaims(canonicalDb).filter((claim) => claim.task_id === taskA);
+
+  assert(threw, 'Equivalent paths conflict even when claimed with different relative syntax');
+  assert(conflicts.length === 1, 'Conflict checks normalize equivalent file paths');
+  assert(claims[0].file_path === 'src/shared.js', 'Stored claim paths are canonicalized');
+  canonicalDb.close();
 });
 
 test('Lease heartbeat refreshes the active session timestamp', () => {
@@ -1676,6 +1753,55 @@ test('Fix 13: managed write gateway rejects unclaimed paths', () => {
   assert(validation.reason_code === 'path_not_claimed', 'Unclaimed write is classified correctly');
   assert(!result.ok, 'Write gateway denies an unclaimed path');
   assert(result.reason_code === 'path_not_claimed', 'Denied write returns path_not_claimed');
+  writeDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 13z: managed gateways reject path traversal outside the assigned worktree', () => {
+  const repoDir = join(tmpdir(), `sw-write-traversal-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const writeDb = initDb(repoDir);
+  registerWorktree(writeDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(writeDb, { title: 'Traversal denied task' });
+  assignTask(writeDb, taskId, 'main');
+  const lease = getActiveLeaseForTask(writeDb, taskId);
+  const escapedFileName = `escape-${Date.now()}.txt`;
+  const escapedDirName = `escape-dir-${Date.now()}`;
+  const escapedFilePath = `src/../../${escapedFileName}`;
+  const escapedDirPath = `src/../../${escapedDirName}`;
+  const outsideFile = join(repoDir, '..', escapedFileName);
+  const outsideDir = join(repoDir, '..', escapedDirName);
+
+  const validation = validateWriteAccess(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: escapedFilePath,
+    worktree: 'main',
+  });
+  const writeResult = gatewayWriteFile(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: escapedFilePath,
+    content: 'escape\n',
+    worktree: 'main',
+  });
+  const mkdirResult = gatewayMakeDirectory(writeDb, repoDir, {
+    leaseId: lease.id,
+    path: escapedDirPath,
+    worktree: 'main',
+  });
+
+  assert(!validation.ok, 'Traversal validation rejects paths that escape the repo');
+  assert(validation.reason_code === 'policy_exception_required', 'Traversal validation reports a policy exception requirement');
+  assert(!writeResult.ok, 'Write gateway denies traversal attempts');
+  assert(writeResult.reason_code === 'policy_exception_required', 'Write gateway reports policy_exception_required for traversal');
+  assert(!mkdirResult.ok, 'Mkdir gateway denies traversal attempts');
+  assert(mkdirResult.reason_code === 'policy_exception_required', 'Mkdir gateway reports policy_exception_required for traversal');
+  assert(!existsSync(outsideFile), 'Traversal denial does not create files outside the repo');
+  assert(!existsSync(outsideDir), 'Traversal denial does not create directories outside the repo');
   writeDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
