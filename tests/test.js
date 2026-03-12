@@ -306,6 +306,34 @@ test('Fix 2: SWITCHMAN_DIR constant (no stale AGENTQ_DIR)', () => {
   assert(existsSync(expectedPath), `.switchman/switchman.db created at correct path`);
 });
 
+test('Fix 2b: task add warns when a task looks too broad for a first parallel run', () => {
+  const repoDir = join(tmpdir(), `sw-task-warning-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+  initDb(repoDir).close();
+
+  const cliOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'task',
+    'add',
+    'Refactor auth across the codebase',
+    '--description',
+    'Large sweep touching all routes and shared middleware',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(cliOutput.includes('warning:'), 'task add warns when a task looks broad');
+  assert(cliOutput.includes('pipeline start'), 'task add points users toward pipeline planning for broad work');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 3: claimFiles transaction is atomic (partial failure rolls back)', () => {
   // Create a duplicate-constraint scenario: claim a file twice in one call.
   // The second insert on the same unique key should fail.

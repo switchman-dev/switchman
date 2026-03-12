@@ -47,7 +47,7 @@ switchman task add "Add auth tests" --priority 8
 switchman task add "Update auth docs" --priority 7
 ```
 
-Use tasks that naturally touch different files for your first run. Do not start with a broad refactor.
+Use real tasks from your repo. If a task looks broad enough to fan out across many files or shared areas, Switchman will warn and suggest using `switchman pipeline start` instead.
 
 ### 3. Open one Claude Code window per worktree
 

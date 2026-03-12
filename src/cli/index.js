@@ -179,6 +179,36 @@ function latestTaskFailure(task) {
   };
 }
 
+function analyzeTaskScope(title, description = '') {
+  const text = `${title}\n${description}`.toLowerCase();
+  const broadPatterns = [
+    /\brefactor\b/,
+    /\bwhole repo\b/,
+    /\bentire repo\b/,
+    /\bacross the repo\b/,
+    /\bacross the codebase\b/,
+    /\bmultiple modules\b/,
+    /\ball routes\b/,
+    /\bevery route\b/,
+    /\ball files\b/,
+    /\bevery file\b/,
+    /\brename\b.*\bacross\b/,
+    /\bsweep(ing)?\b/,
+    /\bglobal\b/,
+    /\bwide\b/,
+    /\blarge\b/,
+  ];
+  const matches = broadPatterns.filter((pattern) => pattern.test(text));
+  if (matches.length === 0) return null;
+
+  return {
+    level: 'warn',
+    summary: 'This task looks broad and may fan out across many files or shared areas.',
+    next_step: 'Split it into smaller tasks or use `switchman pipeline start` so Switchman can plan and govern the work explicitly.',
+    command: `switchman pipeline start "${title.replace(/"/g, '\\"')}"`,
+  };
+}
+
 function commandForFailedTask(task, failure) {
   if (!task?.id) return null;
   switch (failure?.reason_code) {
@@ -510,8 +540,14 @@ taskCmd
       priority: parseInt(opts.priority),
     });
     db.close();
+    const scopeWarning = analyzeTaskScope(title, opts.description || '');
     console.log(`${chalk.green('✓')} Task created: ${chalk.cyan(taskId)}`);
     console.log(`  ${chalk.dim(title)}`);
+    if (scopeWarning) {
+      console.log(chalk.yellow(`  warning: ${scopeWarning.summary}`));
+      console.log(chalk.yellow(`  next: ${scopeWarning.next_step}`));
+      console.log(chalk.cyan(`  try: ${scopeWarning.command}`));
+    }
   });
 
 taskCmd
