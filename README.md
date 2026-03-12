@@ -131,6 +131,7 @@ More help:
 - [Status and recovery](docs/status-and-recovery.md)
 - [Merge queue](docs/merge-queue.md)
 - [Stale lease policy](docs/stale-lease-policy.md)
+- [Telemetry](docs/telemetry.md)
 
 ## More docs
 
@@ -138,6 +139,7 @@ More help:
 - [Pipelines and PRs](docs/pipelines.md)
 - [Stale lease policy](docs/stale-lease-policy.md)
 - [MCP tools](docs/mcp-tools.md)
+- [Telemetry](docs/telemetry.md)
 - [Command reference](docs/command-reference.md)
 
 ## Feedback
