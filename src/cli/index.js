@@ -1548,18 +1548,77 @@ Examples:
       return;
     }
 
-    console.log(`Queue: ${items.length} item(s)`);
-    console.log(`  ${chalk.dim('queued')} ${summary.counts.queued}  ${chalk.dim('validating')} ${summary.counts.validating}  ${chalk.dim('rebasing')} ${summary.counts.rebasing}  ${chalk.dim('merging')} ${summary.counts.merging}  ${chalk.dim('retrying')} ${summary.counts.retrying}  ${chalk.dim('blocked')} ${summary.counts.blocked}  ${chalk.dim('merged')} ${summary.counts.merged}`);
-    if (summary.next) {
-      console.log(`  ${chalk.dim('next:')} ${summary.next.id} ${summary.next.source_type}:${summary.next.source_ref} ${chalk.dim(`retries:${summary.next.retry_count}/${summary.next.max_retries}`)}`);
-    }
-    for (const item of summary.blocked) {
-      console.log(`  ${statusBadge(item.status)} ${item.id} ${item.source_type}:${item.source_ref} ${chalk.dim(`retries:${item.retry_count}/${item.max_retries}`)}`);
-      if (item.last_error_summary) console.log(`    ${chalk.red('why:')} ${item.last_error_summary}`);
-      if (item.next_action) console.log(`    ${chalk.yellow('next:')} ${item.next_action}`);
-    }
-    if (recentEvents.length > 0) {
+    const queueHealth = summary.counts.blocked > 0 ? 'block' : summary.counts.retrying > 0 ? 'warn' : 'healthy';
+    const queueHealthColor = colorForHealth(queueHealth);
+    const focus = summary.blocked[0] || summary.retrying[0] || summary.next || null;
+    const focusLine = focus
+      ? `${focus.id} ${focus.source_type}:${focus.source_ref}${focus.last_error_summary ? ` ${chalk.dim(`• ${focus.last_error_summary}`)}` : ''}`
+      : 'Nothing waiting. Landing queue is clear.';
+
+    console.log('');
+    console.log(queueHealthColor('='.repeat(72)));
+    console.log(`${queueHealthColor(healthLabel(queueHealth))} ${chalk.bold('switchman queue status')} ${chalk.dim('• landing mission control')}`);
+    console.log(queueHealthColor('='.repeat(72)));
+    console.log(renderSignalStrip([
+      renderChip('queued', summary.counts.queued, summary.counts.queued > 0 ? chalk.yellow : chalk.green),
+      renderChip('retrying', summary.counts.retrying, summary.counts.retrying > 0 ? chalk.yellow : chalk.green),
+      renderChip('blocked', summary.counts.blocked, summary.counts.blocked > 0 ? chalk.red : chalk.green),
+      renderChip('merging', summary.counts.merging, summary.counts.merging > 0 ? chalk.blue : chalk.green),
+      renderChip('merged', summary.counts.merged, summary.counts.merged > 0 ? chalk.green : chalk.white),
+    ]));
+    console.log(renderMetricRow([
+      { label: 'items', value: items.length, color: chalk.white },
+      { label: 'validating', value: summary.counts.validating, color: chalk.blue },
+      { label: 'rebasing', value: summary.counts.rebasing, color: chalk.blue },
+      { label: 'target', value: summary.next?.target_branch || 'main', color: chalk.cyan },
+    ]));
+    console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
+
+    const queueFocusLines = summary.next
+      ? [
+        `${renderChip('NEXT', summary.next.id, chalk.green)} ${summary.next.source_type}:${summary.next.source_ref} ${chalk.dim(`retries:${summary.next.retry_count}/${summary.next.max_retries}`)}`,
+        `  ${chalk.yellow('run:')} switchman queue run`,
+      ]
+      : [chalk.dim('No queued landing work right now.')];
+
+    const queueBlockedLines = summary.blocked.length > 0
+      ? summary.blocked.slice(0, 4).flatMap((item) => {
+        const lines = [`${renderChip('BLOCKED', item.id, chalk.red)} ${item.source_type}:${item.source_ref} ${chalk.dim(`retries:${item.retry_count}/${item.max_retries}`)}`];
+        if (item.last_error_summary) lines.push(`  ${chalk.red('why:')} ${item.last_error_summary}`);
+        if (item.next_action) lines.push(`  ${chalk.yellow('next:')} ${item.next_action}`);
+        return lines;
+      })
+      : [chalk.green('Nothing blocked.')];
+
+    const queueWatchLines = items.filter((item) => ['retrying', 'merging', 'rebasing', 'validating'].includes(item.status)).length > 0
+      ? items
+        .filter((item) => ['retrying', 'merging', 'rebasing', 'validating'].includes(item.status))
+        .slice(0, 4)
+        .flatMap((item) => {
+          const lines = [`${renderChip(item.status.toUpperCase(), item.id, item.status === 'retrying' ? chalk.yellow : chalk.blue)} ${item.source_type}:${item.source_ref}`];
+          if (item.last_error_summary) lines.push(`  ${chalk.dim(item.last_error_summary)}`);
+          return lines;
+        })
+      : [chalk.green('No in-flight queue items right now.')];
+
+    const queueCommandLines = [
+      `${chalk.cyan('$')} switchman queue run`,
+      `${chalk.cyan('$')} switchman queue status --json`,
+      ...(summary.blocked[0] ? [`${chalk.cyan('$')} switchman queue retry ${summary.blocked[0].id}`] : []),
+    ];
+
+    console.log('');
+    for (const block of [
+      renderPanel('Landing focus', queueFocusLines, chalk.green),
+      renderPanel('Blocked', queueBlockedLines, summary.counts.blocked > 0 ? chalk.red : chalk.green),
+      renderPanel('In flight', queueWatchLines, queueWatchLines[0] === 'No in-flight queue items right now.' ? chalk.green : chalk.blue),
+      renderPanel('Next commands', queueCommandLines, chalk.cyan),
+    ]) {
+      for (const line of block) console.log(line);
       console.log('');
+    }
+
+    if (recentEvents.length > 0) {
       console.log(chalk.bold('Recent Queue Events:'));
       for (const event of recentEvents) {
         console.log(`  ${chalk.cyan(event.queue_item_id)} ${chalk.dim(event.event_type)} ${chalk.dim(event.status || '')} ${chalk.dim(event.created_at)}`.trim());
@@ -1742,20 +1801,74 @@ pipelineCmd
         return;
       }
 
+      const pipelineHealth = result.status === 'blocked'
+        ? 'block'
+        : result.counts.failed > 0
+          ? 'warn'
+          : result.counts.in_progress > 0
+            ? 'warn'
+            : 'healthy';
+      const pipelineHealthColor = colorForHealth(pipelineHealth);
+      const failedTask = result.tasks.find((task) => task.status === 'failed');
+      const runningTask = result.tasks.find((task) => task.status === 'in_progress');
+      const nextPendingTask = result.tasks.find((task) => task.status === 'pending');
+      const focusTask = failedTask || runningTask || nextPendingTask || result.tasks[0] || null;
+      const focusLine = focusTask
+        ? `${focusTask.title} ${chalk.dim(focusTask.id)}`
+        : 'No pipeline tasks found.';
+
+      console.log('');
+      console.log(pipelineHealthColor('='.repeat(72)));
+      console.log(`${pipelineHealthColor(healthLabel(pipelineHealth))} ${chalk.bold('switchman pipeline status')} ${chalk.dim('• pipeline mission control')}`);
       console.log(`${chalk.bold(result.title)} ${chalk.dim(result.pipeline_id)}`);
-      console.log(`  ${chalk.dim('done')} ${result.counts.done}  ${chalk.dim('in_progress')} ${result.counts.in_progress}  ${chalk.dim('pending')} ${result.counts.pending}  ${chalk.dim('failed')} ${result.counts.failed}`);
-      for (const task of result.tasks) {
+      console.log(pipelineHealthColor('='.repeat(72)));
+      console.log(renderSignalStrip([
+        renderChip('done', result.counts.done, result.counts.done > 0 ? chalk.green : chalk.white),
+        renderChip('running', result.counts.in_progress, result.counts.in_progress > 0 ? chalk.blue : chalk.green),
+        renderChip('pending', result.counts.pending, result.counts.pending > 0 ? chalk.yellow : chalk.green),
+        renderChip('failed', result.counts.failed, result.counts.failed > 0 ? chalk.red : chalk.green),
+      ]));
+      console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
+
+      const runningLines = result.tasks.filter((task) => task.status === 'in_progress').slice(0, 4).map((task) => {
         const worktree = task.worktree || task.suggested_worktree || 'unassigned';
         const blocked = task.blocked_by?.length ? ` ${chalk.dim(`blocked by ${task.blocked_by.join(', ')}`)}` : '';
         const type = task.task_spec?.task_type ? ` ${chalk.dim(`[${task.task_spec.task_type}]`)}` : '';
-        console.log(`  ${statusBadge(task.status)} ${task.id} ${task.title}${type} ${chalk.dim(worktree)}${blocked}`);
+        return `${chalk.cyan(worktree)} -> ${task.title}${type} ${chalk.dim(task.id)}${blocked}`;
+      });
+
+      const blockedLines = result.tasks.filter((task) => task.status === 'failed').slice(0, 4).flatMap((task) => {
+        const type = task.task_spec?.task_type ? ` ${chalk.dim(`[${task.task_spec.task_type}]`)}` : '';
+        const lines = [`${renderChip('BLOCKED', task.id, chalk.red)} ${task.title}${type}`];
         if (task.failure?.summary) {
           const reasonLabel = humanizeReasonCode(task.failure.reason_code);
-          console.log(`    ${chalk.red('why:')} ${task.failure.summary} ${chalk.dim(`(${reasonLabel})`)}`);
+          lines.push(`  ${chalk.red('why:')} ${task.failure.summary} ${chalk.dim(`(${reasonLabel})`)}`);
         }
-        if (task.next_action) {
-          console.log(`    ${chalk.yellow('next:')} ${task.next_action}`);
-        }
+        if (task.next_action) lines.push(`  ${chalk.yellow('next:')} ${task.next_action}`);
+        return lines;
+      });
+
+      const nextLines = result.tasks.filter((task) => task.status === 'pending').slice(0, 4).map((task) => {
+        const worktree = task.suggested_worktree || task.worktree || 'unassigned';
+        const blocked = task.blocked_by?.length ? ` ${chalk.dim(`blocked by ${task.blocked_by.join(', ')}`)}` : '';
+        return `${renderChip('NEXT', task.id, chalk.green)} ${task.title} ${chalk.dim(worktree)}${blocked}`;
+      });
+
+      const commandLines = [
+        `${chalk.cyan('$')} switchman pipeline exec ${result.pipeline_id} "/path/to/agent-command"`,
+        `${chalk.cyan('$')} switchman pipeline pr ${result.pipeline_id}`,
+        ...(result.counts.failed > 0 ? [`${chalk.cyan('$')} switchman pipeline status ${result.pipeline_id}`] : []),
+      ];
+
+      console.log('');
+      for (const block of [
+        renderPanel('Running now', runningLines.length > 0 ? runningLines : [chalk.dim('No tasks are actively running.')], runningLines.length > 0 ? chalk.cyan : chalk.green),
+        renderPanel('Blocked', blockedLines.length > 0 ? blockedLines : [chalk.green('Nothing blocked.')], blockedLines.length > 0 ? chalk.red : chalk.green),
+        renderPanel('Next up', nextLines.length > 0 ? nextLines : [chalk.dim('No pending tasks left.')], chalk.green),
+        renderPanel('Next commands', commandLines, chalk.cyan),
+      ]) {
+        for (const line of block) console.log(line);
+        console.log('');
       }
     } catch (err) {
       db.close();
@@ -2700,60 +2813,71 @@ program
       return;
     }
 
-    const badge = report.health === 'healthy'
-      ? chalk.green('HEALTHY')
-      : report.health === 'warn'
-        ? chalk.yellow('ATTENTION')
-        : chalk.red('BLOCKED');
-    console.log(`${badge} ${report.summary}`);
-    console.log(chalk.dim(repoRoot));
+    const doctorColor = colorForHealth(report.health);
+    const blockedCount = report.attention.filter((item) => item.severity === 'block').length;
+    const warningCount = report.attention.filter((item) => item.severity !== 'block').length;
+    const focusItem = report.attention[0] || report.active_work[0] || null;
+    const focusLine = focusItem
+      ? `${focusItem.title || focusItem.task_title}${focusItem.detail ? ` ${chalk.dim(`• ${focusItem.detail}`)}` : ''}`
+      : 'Nothing urgent. Repo health looks steady.';
+
     console.log('');
+    console.log(doctorColor('='.repeat(72)));
+    console.log(`${doctorColor(healthLabel(report.health))} ${chalk.bold('switchman doctor')} ${chalk.dim('• repo health mission control')}`);
+    console.log(chalk.dim(repoRoot));
+    console.log(chalk.dim(report.summary));
+    console.log(doctorColor('='.repeat(72)));
+    console.log(renderSignalStrip([
+      renderChip('blocked', blockedCount, blockedCount > 0 ? chalk.red : chalk.green),
+      renderChip('watch', warningCount, warningCount > 0 ? chalk.yellow : chalk.green),
+      renderChip('leases', report.counts.active_leases, report.counts.active_leases > 0 ? chalk.blue : chalk.green),
+      renderChip('stale', report.counts.stale_leases, report.counts.stale_leases > 0 ? chalk.red : chalk.green),
+      renderChip('merge', report.merge_readiness.ci_gate_ok ? 'clear' : 'hold', report.merge_readiness.ci_gate_ok ? chalk.green : chalk.red),
+    ]));
+    console.log(renderMetricRow([
+      { label: 'tasks', value: `${report.counts.pending}/${report.counts.in_progress}/${report.counts.done}/${report.counts.failed}`, color: chalk.white },
+      { label: 'AI gate', value: report.merge_readiness.ai_gate_status, color: report.merge_readiness.ai_gate_status === 'blocked' ? chalk.red : report.merge_readiness.ai_gate_status === 'warn' ? chalk.yellow : chalk.green },
+    ]));
+    console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
 
-    console.log(chalk.bold('At a glance:'));
-    console.log(`  ${chalk.dim('tasks')} ${report.counts.pending} pending, ${report.counts.in_progress} in progress, ${report.counts.done} done, ${report.counts.failed} failed`);
-    console.log(`  ${chalk.dim('leases')} ${report.counts.active_leases} active, ${report.counts.stale_leases} stale`);
-    console.log(`  ${chalk.dim('merge')} CI ${report.merge_readiness.ci_gate_ok ? chalk.green('clear') : chalk.red('blocked')}  AI ${report.merge_readiness.ai_gate_status}`);
-
-    if (report.active_work.length > 0) {
-      console.log('');
-      console.log(chalk.bold('Running now:'));
-      for (const item of report.active_work.slice(0, 5)) {
+    const runningLines = report.active_work.length > 0
+      ? report.active_work.slice(0, 5).map((item) => {
         const leaseId = activeLeases.find((lease) => lease.task_id === item.task_id && lease.worktree === item.worktree)?.id || null;
         const boundary = item.boundary_validation
-          ? ` ${chalk.dim(`validation:${item.boundary_validation.status}`)}`
+          ? ` ${renderChip('validation', item.boundary_validation.status, item.boundary_validation.status === 'accepted' ? chalk.green : chalk.yellow)}`
           : '';
         const stale = (item.dependency_invalidations?.length || 0) > 0
-          ? ` ${chalk.dim(`stale:${item.dependency_invalidations.length}`)}`
+          ? ` ${renderChip('stale', item.dependency_invalidations.length, chalk.yellow)}`
           : '';
-        console.log(`  ${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}${leaseId ? ` ${chalk.dim(`lease:${leaseId}`)}` : ''}${item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : ''}${boundary}${stale}`);
-      }
-    }
+        return `${chalk.cyan(item.worktree)} -> ${item.task_title} ${chalk.dim(item.task_id)}${leaseId ? ` ${chalk.dim(`lease:${leaseId}`)}` : ''}${item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : ''}${boundary}${stale}`;
+      })
+      : [chalk.dim('Nothing active right now.')];
+
+    const attentionLines = report.attention.length > 0
+      ? report.attention.slice(0, 6).flatMap((item) => {
+        const lines = [`${item.severity === 'block' ? renderChip('BLOCKED', item.kind || 'item', chalk.red) : renderChip('WATCH', item.kind || 'item', chalk.yellow)} ${item.title}`];
+        if (item.detail) lines.push(`  ${chalk.dim(item.detail)}`);
+        lines.push(`  ${chalk.yellow('next:')} ${item.next_step}`);
+        if (item.command) lines.push(`  ${chalk.cyan('run:')} ${item.command}`);
+        return lines;
+      })
+      : [chalk.green('Nothing urgent.')];
+
+    const nextStepLines = [
+      ...report.next_steps.slice(0, 4).map((step) => `- ${step}`),
+      '',
+      ...report.suggested_commands.slice(0, 4).map((command) => `${chalk.cyan('$')} ${command}`),
+    ];
 
     console.log('');
     console.log(chalk.bold('Attention now:'));
-    if (report.attention.length === 0) {
-      console.log(`  ${chalk.green('Nothing urgent.')}`);
-    } else {
-      for (const item of report.attention.slice(0, 6)) {
-        const itemBadge = item.severity === 'block' ? chalk.red('block') : chalk.yellow('warn ');
-        console.log(`  ${itemBadge} ${item.title}`);
-        if (item.detail) console.log(`        ${chalk.dim(item.detail)}`);
-        console.log(`        ${chalk.yellow('next:')} ${item.next_step}`);
-        if (item.command) console.log(`        ${chalk.cyan('run:')} ${item.command}`);
-      }
-    }
-
-    console.log('');
-    console.log(chalk.bold('Recommended next steps:'));
-    for (const step of report.next_steps) {
-      console.log(`  - ${step}`);
-    }
-    if (report.suggested_commands.length > 0) {
+    for (const block of [
+      renderPanel('Running now', runningLines, chalk.cyan),
+      renderPanel('Attention now', attentionLines, report.attention.some((item) => item.severity === 'block') ? chalk.red : report.attention.length > 0 ? chalk.yellow : chalk.green),
+      renderPanel('Recommended next steps', nextStepLines, chalk.green),
+    ]) {
+      for (const line of block) console.log(line);
       console.log('');
-      console.log(chalk.bold('Suggested commands:'));
-      for (const command of report.suggested_commands) {
-        console.log(`  ${chalk.cyan(command)}`);
-      }
     }
   });
 
