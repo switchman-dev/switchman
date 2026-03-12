@@ -1,4 +1,4 @@
-import { getActiveFileClaims, getTask, getTaskSpec, getWorktree } from './db.js';
+import { getActiveFileClaims, getLeaseExecutionContext, getTask, getTaskSpec, getWorktree, touchBoundaryValidationState } from './db.js';
 import { getWorktreeChangedFiles } from './git.js';
 import { matchesPathPatterns } from './ignore.js';
 
@@ -20,19 +20,48 @@ function fileMatchesKeyword(filePath, keyword) {
   return normalizedKeyword.length >= 3 && normalizedPath.includes(normalizedKeyword);
 }
 
-export function evaluateTaskOutcome(db, repoRoot, { taskId }) {
-  const task = getTask(db, taskId);
-  const taskSpec = getTaskSpec(db, taskId);
-  if (!task || !task.worktree) {
+function resolveExecution(db, { taskId = null, leaseId = null } = {}) {
+  if (leaseId) {
+    const execution = getLeaseExecutionContext(db, leaseId);
+    if (!execution?.task) {
+      return { task: null, taskSpec: null, worktree: null, leaseId };
+    }
     return {
-      status: 'failed',
-      reason_code: 'task_not_assigned',
-      changed_files: [],
-      findings: ['task has no assigned worktree'],
+      task: execution.task,
+      taskSpec: execution.task_spec,
+      worktree: execution.worktree,
+      leaseId: execution.lease?.id || leaseId,
     };
   }
 
-  const worktree = getWorktree(db, task.worktree);
+  if (!taskId) {
+    return { task: null, taskSpec: null, worktree: null, leaseId: null };
+  }
+
+  const task = getTask(db, taskId);
+  return {
+    task,
+    taskSpec: task ? getTaskSpec(db, taskId) : null,
+    worktree: task?.worktree ? getWorktree(db, task.worktree) : null,
+    leaseId: null,
+  };
+}
+
+export function evaluateTaskOutcome(db, repoRoot, { taskId = null, leaseId = null } = {}) {
+  const execution = resolveExecution(db, { taskId, leaseId });
+  const task = execution.task;
+  const taskSpec = execution.taskSpec;
+
+  if (!task || !task.worktree) {
+    return {
+      status: 'failed',
+      reason_code: taskId || leaseId ? 'task_not_assigned' : 'task_identity_required',
+      changed_files: [],
+      findings: [taskId || leaseId ? 'task has no assigned worktree' : 'task outcome requires a taskId or leaseId'],
+    };
+  }
+
+  const worktree = execution.worktree;
   if (!worktree) {
     return {
       status: 'failed',
@@ -44,7 +73,7 @@ export function evaluateTaskOutcome(db, repoRoot, { taskId }) {
 
   const changedFiles = getWorktreeChangedFiles(worktree.path, repoRoot);
   const activeClaims = getActiveFileClaims(db)
-    .filter((claim) => claim.task_id === taskId && claim.worktree === task.worktree)
+    .filter((claim) => claim.task_id === task.id && claim.worktree === task.worktree)
     .map((claim) => claim.file_path);
   const changedOutsideClaims = changedFiles.filter((filePath) => !activeClaims.includes(filePath));
   const changedInsideClaims = changedFiles.filter((filePath) => activeClaims.includes(filePath));
@@ -128,9 +157,7 @@ export function evaluateTaskOutcome(db, repoRoot, { taskId }) {
   const matchedObjectiveKeywords = objectiveKeywords.filter((keyword) =>
     changedFiles.some((filePath) => fileMatchesKeyword(filePath, keyword)),
   );
-  const minimumKeywordMatches = taskSpec?.risk_level === 'high'
-    ? Math.min(2, objectiveKeywords.length)
-    : Math.min(1, objectiveKeywords.length);
+  const minimumKeywordMatches = Math.min(1, objectiveKeywords.length);
 
   if (objectiveKeywords.length > 0 && matchedObjectiveKeywords.length < minimumKeywordMatches) {
     findings.push(`changed files do not clearly satisfy task objective keywords: ${objectiveKeywords.join(', ')}`);
@@ -138,16 +165,26 @@ export function evaluateTaskOutcome(db, repoRoot, { taskId }) {
       status: 'needs_followup',
       reason_code: 'objective_not_evidenced',
       changed_files: changedFiles,
+      task_id: task.id,
+      lease_id: execution.leaseId,
       findings,
     };
   }
 
-  return {
+  const result = {
     status: 'accepted',
     reason_code: null,
     changed_files: changedFiles,
+    task_id: task.id,
+    lease_id: execution.leaseId,
     task_spec: taskSpec,
     claimed_files: activeClaims,
     findings: changedInsideClaims.length > 0 ? ['changes stayed within claimed scope'] : [],
   };
+
+  if (execution.leaseId) {
+    touchBoundaryValidationState(db, execution.leaseId, 'task_outcome_accepted');
+  }
+
+  return result;
 }

@@ -1,10 +1,10 @@
 # Switchman
 
-**Stop your AI agents from overwriting each other.**
+**Run 10+ agents on one codebase. Safely.**
 
-When you run multiple Claude Code instances on the same repo, they have no idea what each other is doing. One agent edits a file while another rewrites it. Hours of work disappear at merge time.
+Switchman acts like a project manager for your AI coding assistants. It hands out tasks, stops agents from editing the same file at the same time, and double-checks their work before saving.
 
-Switchman gives them a shared task queue and file locking so they stay on separate tracks — and you stay in control.
+When you run multiple agents on the same repo, they need shared coordination or they collide, duplicate work, and create risky merges. Switchman gives them leases, scoped ownership, and repo-level gates so they can move in parallel without stepping on each other.
 
 ---
 
@@ -25,35 +25,39 @@ Questions, feedback, or testing Switchman with your team? Join the [Discord](htt
 
 ---
 
-## First successful run: 3 agents on one repo
+## First remarkable run
 
-If you only try one thing, try this.
+If you only try one thing, try this: run several agents on a real repo and watch Switchman keep the run organized.
 
-### 1. Create a test repo and three agent worktrees
+### 1. Create agent worktrees
 
 ```bash
 cd my-project
-switchman setup --agents 3
+switchman setup --agents 5
 ```
 
 This gives you:
 - one shared Switchman database in `.switchman/`
-- three linked worktrees
+- five linked worktrees
 - local `.mcp.json` files so Claude Code can discover Switchman automatically
 
-### 2. Add three small, separate tasks
+You can start with 3 agents if you want. The point of the demo is to feel safe parallelism quickly.
+
+### 2. Add a few clearly separate tasks
 
 ```bash
 switchman task add "Implement auth helper" --priority 9
 switchman task add "Add auth tests" --priority 8
 switchman task add "Update auth docs" --priority 7
+switchman task add "Add rate limiting" --priority 6
+switchman task add "Write API changelog" --priority 5
 ```
 
 Use real tasks from your repo. If a task looks broad enough to fan out across many files or shared areas, Switchman will warn and suggest using `switchman pipeline start` instead.
 
-### 3. Open one Claude Code window per worktree
+### 3. Open one agent per worktree
 
-Open each generated worktree folder in its own Claude Code window.
+Open each generated worktree folder in its own Claude Code window or agent session.
 
 If Claude Code sees the local `.mcp.json`, each agent can use Switchman without extra setup.
 
@@ -74,28 +78,41 @@ Do not read or write `.switchman/switchman.db` directly.
 Do not bypass Switchman for file coordination.
 ```
 
-### 5. Watch the run
+### 5. Watch the run from the repo root
 
-In the repo root:
+In another terminal:
 
 ```bash
 switchman status
 switchman scan
+switchman gate ci
 ```
 
-What a good first run looks like:
-- all three tasks end in `done`
+What a strong first run looks like:
+- agents pick up different tasks without manual coordination
+- blocked claims are surfaced immediately instead of becoming merge-time surprises
+- tasks finish with clear ownership and execution history
 - `switchman scan` reports no conflicts
 - `switchman gate ci` passes
 
-### 6. If you want a built-in local demo instead
+### 6. If you want a built-in demo instead
 
 ```bash
 bash examples/setup.sh
 bash examples/walkthrough.sh
 ```
 
-That runs the included 3-agent demo against the example API in [examples/README.md](/Users/ned/Documents/GitHub/switchman/examples/README.md).
+That runs the included demo against the example API in [examples/README.md](/Users/ned/Documents/GitHub/switchman/examples/README.md).
+
+---
+
+## What Switchman does
+
+- hands out work so agents stay on separate tracks
+- prevents overlapping edits with file claims and scoped ownership
+- keeps long-running work alive with leases and heartbeats
+- flags stale or risky work before merge
+- checks the repo with merge gates, boundary validation, and CI output
 
 ---
 
@@ -103,16 +120,16 @@ That runs the included 3-agent demo against the example API in [examples/README.
 
 ### Option A — Claude Code (recommended)
 
-Claude Code has a native Switchman integration via MCP. Your agents coordinate automatically — no manual CLI calls, no extra prompting.
+Claude Code has a native Switchman integration via MCP. Your agents can coordinate automatically instead of relying on copy-pasted shell rituals.
 
 **Step 1 — Create your agent workspaces**
 
 ```bash
 cd my-project
-switchman setup --agents 3
+switchman setup --agents 5
 ```
 
-That's it. Switchman creates three isolated workspaces, one per agent, and initialises the database. You'll see the folder paths printed — you'll need them in step 4.
+That's it. Switchman creates isolated workspaces, one per agent, and initialises the database. You'll see the folder paths printed — you'll need them in step 5.
 
 **Step 2 — Add Switchman to Claude Code**
 
@@ -157,19 +174,20 @@ Open a separate Claude Code window in each folder that `switchman setup` created
 
 ```bash
 switchman scan
+switchman gate ci
 ```
 
 ---
 
 ### Option B — Any other agent (Cursor, Windsurf, Aider, etc.)
 
-Switchman works as a CLI tool with any agent that can run terminal commands. The coordination isn't automatic — you'll need to prompt your agents to use Switchman commands.
+Switchman works as a CLI tool with any agent that can run terminal commands. The coordination is still governed, but you'll need to prompt your agents to use Switchman commands.
 
 **Step 1 — Create your agent workspaces**
 
 ```bash
 cd my-project
-switchman setup --agents 3
+switchman setup --agents 5
 ```
 
 **Step 2 — Add your tasks**
@@ -198,6 +216,7 @@ Never edit a file you haven't claimed. If a claim fails, do not use --force.
 
 ```bash
 switchman scan
+switchman gate ci
 ```
 
 ---

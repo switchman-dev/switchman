@@ -20,6 +20,10 @@ import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipel
 import { buildTaskSpec } from '../src/core/planner.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
+const TEST_ZDOTDIR = join(tmpdir(), `switchman-zdotdir-${Date.now()}`);
+
+mkdirSync(TEST_ZDOTDIR, { recursive: true });
+process.env.ZDOTDIR = TEST_ZDOTDIR;
 
 // Import modules
 import {
@@ -362,7 +366,7 @@ test('Fix 1b: parallel CLI task acquisition avoids transient database lock failu
     "${process.execPath}" "${cliPath}" task next --json --worktree agent3 --agent parallel-agent3 > "${join(outputDir, 'agent3.json')}" &
     pid3=$!
     wait "$pid1" "$pid2" "$pid3"
-  `, { cwd: repoDir, shell: '/bin/zsh' });
+  `, { cwd: repoDir, shell: '/bin/sh' });
 
   const payloads = ['agent1', 'agent2', 'agent3'].map((name) => JSON.parse(readFileSync(join(outputDir, `${name}.json`), 'utf8')));
   const taskIds = payloads.map((payload) => payload.task?.id).filter(Boolean);
@@ -401,7 +405,7 @@ test('Fix 1c: CLI task done succeeds while a transient SQLite write lock is pres
   `;
   execSync(`${JSON.stringify(process.execPath)} -e ${JSON.stringify(lockScript)} >/dev/null 2>&1 & sleep 0.1`, {
     cwd: repoDir,
-    shell: '/bin/zsh',
+    shell: '/bin/sh',
   });
 
   execFileSync(process.execPath, [cliPath, 'task', 'done', taskId], {
@@ -695,7 +699,7 @@ test('Fix 5: getWorktreeChangedFiles includes untracked files', () => {
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
   execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
-  execSync('mkdir -p src && printf "hello\\n" > src/new-file.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "hello\\n" > src/new-file.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const changed = getWorktreeChangedFiles(repoDir, repoDir);
   assert(changed.includes('src/new-file.js'), 'Untracked file appears in changed-files scan');
@@ -752,7 +756,7 @@ test('Fix 8: worktree compliance marks unmanaged changes as non-compliant', () =
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
   execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
-  execSync('mkdir -p src && printf "x\\n" > src/unclaimed.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "x\\n" > src/unclaimed.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const enforceDb = initDb(repoDir);
   registerWorktree(enforceDb, { name: 'main', path: repoDir, branch: 'main' });
@@ -777,7 +781,7 @@ test('Fix 8b: completed claimed work remains governed for compliance checks', ()
   const taskId = createTask(enforceDb, { title: 'Implement: governed change' });
   assignTask(enforceDb, taskId, 'main');
   claimFiles(enforceDb, taskId, 'main', ['src/governed.js']);
-  execSync('mkdir -p src && printf "ok\\n" > src/governed.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "ok\\n" > src/governed.js', { cwd: repoDir, shell: '/bin/sh' });
   completeTask(enforceDb, taskId);
 
   const compliance = evaluateWorktreeCompliance(enforceDb, repoDir, { name: 'main', path: repoDir, branch: 'main' });
@@ -805,7 +809,7 @@ test('Fix 8c: active task-scoped changes remain governed for compliance checks',
     expected_output_types: ['source'],
     required_deliverables: ['source'],
   });
-  execSync('mkdir -p src/scoped && printf "ok\\n" > src/scoped/governed.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src/scoped && printf "ok\\n" > src/scoped/governed.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const compliance = evaluateWorktreeCompliance(enforceDb, repoDir, { name: 'main', path: repoDir, branch: 'main' });
   assert(compliance.compliance_state === 'managed', 'In-scope task-owned changes remain managed without an explicit file claim');
@@ -827,7 +831,7 @@ test('Fix 9: commit gate passes for claimed files under an active lease', () => 
   const taskId = createTask(gateDb, { title: 'Gate pass task' });
   assignTask(gateDb, taskId, 'main');
   claimFiles(gateDb, taskId, 'main', ['src/claimed.js']);
-  execSync('mkdir -p src && printf "ok\\n" > src/claimed.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "ok\\n" > src/claimed.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const result = runCommitGate(gateDb, repoDir, { cwd: repoDir });
   assert(result.ok, 'Commit gate allows claimed changes under the active lease');
@@ -846,7 +850,7 @@ test('Fix 10: commit gate rejects unclaimed files', () => {
 
   const gateDb = initDb(repoDir);
   registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
-  execSync('mkdir -p src && printf "bad\\n" > src/unclaimed.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "bad\\n" > src/unclaimed.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const result = runCommitGate(gateDb, repoDir, { cwd: repoDir });
   assert(!result.ok, 'Commit gate rejects unclaimed changes');
@@ -1269,7 +1273,7 @@ test('Fix 15: runtime monitor logs denied direct writes immediately', () => {
   registerWorktree(monitorDb, { name: 'main', path: repoDir, branch: 'main' });
   monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
 
-  execSync('mkdir -p src && printf "drift\\n" > src/drift.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "drift\\n" > src/drift.js', { cwd: repoDir, shell: '/bin/sh' });
   const result = monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
   const audit = listAuditEvents(monitorDb, { eventType: 'write_observed', status: 'denied', limit: 10 });
 
@@ -1295,7 +1299,7 @@ test('Fix 16: runtime monitor treats claimed in-scope writes as allowed', () => 
   claimFiles(monitorDb, taskId, 'main', ['src/observed.js']);
   monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
 
-  execSync('mkdir -p src && printf "claimed\\n" > src/observed.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "claimed\\n" > src/observed.js', { cwd: repoDir, shell: '/bin/sh' });
   const result = monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
 
   assert(result.summary.allowed === 1, 'Monitor reports the claimed write as allowed');
@@ -1349,7 +1353,7 @@ test('Fix 18: runtime quarantine moves denied added files out of the worktree', 
   registerWorktree(monitorDb, { name: 'main', path: repoDir, branch: 'main' });
   monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
 
-  execSync('mkdir -p src && printf "rogue\\n" > src/rogue.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "rogue\\n" > src/rogue.js', { cwd: repoDir, shell: '/bin/sh' });
   const result = monitorWorktreesOnce(monitorDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }], { quarantine: true });
   const event = result.events.find((item) => item.file_path === 'src/rogue.js');
 
@@ -1381,7 +1385,7 @@ test('Fix 19: enforcement policy allows generated outputs without explicit claim
   assignTask(policyDb, taskId, 'main');
   monitorWorktreesOnce(policyDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
 
-  execSync('mkdir -p generated && printf "artifact\\n" > generated/output.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p generated && printf "artifact\\n" > generated/output.js', { cwd: repoDir, shell: '/bin/sh' });
   const result = monitorWorktreesOnce(policyDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
   const event = result.events.find((item) => item.file_path === 'generated/output.js');
 
@@ -1464,7 +1468,7 @@ test('Fix 22: repo CI gate rejects unmanaged changes across worktrees', () => {
   execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
 
   initDb(repoDir).close();
-  execSync('mkdir -p src && printf "drift\\n" > src/rogue.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "drift\\n" > src/rogue.js', { cwd: repoDir, shell: '/bin/sh' });
   let status = 0;
   let stdout = '';
   try {
@@ -1592,8 +1596,8 @@ test('Fix 25: AI merge gate blocks high-risk overlapping subsystem changes', () 
   execSync(`git worktree add -b feature-auth-a "${featureA}"`, { cwd: repoDir });
   execSync(`git worktree add -b feature-auth-b "${featureB}"`, { cwd: repoDir });
 
-  execSync('mkdir -p src/auth && printf "one\\n" > src/auth/login.js', { cwd: featureA, shell: '/bin/zsh' });
-  execSync('mkdir -p src/auth && printf "two\\n" > src/auth/session.js', { cwd: featureB, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "one\\n" > src/auth/login.js', { cwd: featureA, shell: '/bin/sh' });
+  execSync('mkdir -p src/auth && printf "two\\n" > src/auth/session.js', { cwd: featureB, shell: '/bin/sh' });
 
   const gateDb = initDb(repoDir);
   registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
@@ -1722,8 +1726,8 @@ test('Fix 25aa: scan and gates report semantic exported-object overlaps explicit
   execSync(`git worktree add -b feature-semantic-a "${featureA}"`, { cwd: repoDir });
   execSync(`git worktree add -b feature-semantic-b "${featureB}"`, { cwd: repoDir });
 
-  execSync('mkdir -p src/auth && printf "export function ensureAuth() { return true; }\\n" > src/auth/guard.js', { cwd: featureA, shell: '/bin/zsh' });
-  execSync('mkdir -p src/auth && printf "export function ensureAuth() { return false; }\\n" > src/auth/policy.js', { cwd: featureB, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "export function ensureAuth() { return true; }\\n" > src/auth/guard.js', { cwd: featureA, shell: '/bin/sh' });
+  execSync('mkdir -p src/auth && printf "export function ensureAuth() { return false; }\\n" > src/auth/policy.js', { cwd: featureB, shell: '/bin/sh' });
 
   const db = initDb(repoDir);
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
@@ -1846,7 +1850,7 @@ test('Fix 25c: accepted high-risk boundary work creates incremental validation s
   const governanceTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'governance');
   assignTask(db, implementationTask.id, 'main');
   const lease = getActiveLeaseForTask(db, implementationTask.id);
-  execSync('mkdir -p src/auth && printf "ok\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "ok\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const outcome = evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
   const pendingState = getBoundaryValidationState(db, lease.id);
@@ -1903,7 +1907,7 @@ test('Fix 25d: shared-boundary changes mark dependent work stale until it is ret
   const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
   assignTask(db, implementationTask.id, 'main');
   const currentLease = getActiveLeaseForTask(db, implementationTask.id);
-  execSync('mkdir -p src/auth && printf "new\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "new\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
   const outcome = evaluateTaskOutcome(db, repoDir, { leaseId: currentLease.id });
   const staleInvalidations = listDependencyInvalidations(db, { affectedTaskId: previousTaskId });
 
@@ -1933,8 +1937,8 @@ test('Fix 26: AI merge gate passes isolated worktree changes', () => {
   execSync(`git worktree add -b feature-ui "${featureA}"`, { cwd: repoDir });
   execSync(`git worktree add -b feature-docs "${featureB}"`, { cwd: repoDir });
 
-  execSync('mkdir -p src/ui && printf "button\\n" > src/ui/button.js', { cwd: featureA, shell: '/bin/zsh' });
-  execSync('printf "docs\\n" > docs.md', { cwd: featureB, shell: '/bin/zsh' });
+  execSync('mkdir -p src/ui && printf "button\\n" > src/ui/button.js', { cwd: featureA, shell: '/bin/sh' });
+  execSync('printf "docs\\n" > docs.md', { cwd: featureB, shell: '/bin/sh' });
 
   const gateDb = initDb(repoDir);
   registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
@@ -2156,7 +2160,7 @@ test('Fix 28ab: doctor and repo gate surface stale dependency invalidations', ()
   const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
   assignTask(db, implementationTask.id, 'main');
   const lease = getActiveLeaseForTask(db, implementationTask.id);
-  execSync('mkdir -p src/auth && printf "stale\\n" > src/auth/guard.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "stale\\n" > src/auth/guard.js', { cwd: repoDir, shell: '/bin/sh' });
   evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
   db.close();
 
@@ -2682,8 +2686,8 @@ test('Fix 31: pipeline review avoids duplicate governance tasks when merge risk 
   const featureB = join(tmpdir(), `sw-pipeline-review-b-${Date.now()}`);
   execSync(`git worktree add -b review-auth-a "${featureA}"`, { cwd: repoDir });
   execSync(`git worktree add -b review-auth-b "${featureB}"`, { cwd: repoDir });
-  execSync('mkdir -p src/auth && printf "one\\n" > src/auth/login.js', { cwd: featureA, shell: '/bin/zsh' });
-  execSync('mkdir -p src/auth && printf "two\\n" > src/auth/session.js', { cwd: featureB, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "one\\n" > src/auth/login.js', { cwd: featureA, shell: '/bin/sh' });
+  execSync('mkdir -p src/auth && printf "two\\n" > src/auth/session.js', { cwd: featureB, shell: '/bin/sh' });
 
   const pipelineDb = initDb(repoDir);
   registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
@@ -2913,7 +2917,7 @@ test('Fix 37: task outcome evaluator accepts in-scope claimed source changes', (
   const taskId = createTask(db, { title: 'Implement: update source' });
   assignTask(db, taskId, 'main');
   claimFiles(db, taskId, 'main', ['src/example.js']);
-  execSync('mkdir -p src && printf "ok\\n" > src/example.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "ok\\n" > src/example.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const result = evaluateTaskOutcome(db, repoDir, { taskId });
   assert(result.status === 'accepted', 'Outcome evaluator accepts claimed source changes for implementation tasks');
@@ -2935,7 +2939,7 @@ test('Fix 37aa: task outcome evaluator can resolve execution from lease identity
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
   const taskId = createTask(db, { title: 'Implement: update auth helper via lease' });
   const lease = startTaskLease(db, taskId, 'main', 'codex');
-  execSync('mkdir -p src', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src', { cwd: repoDir, shell: '/bin/sh' });
   claimFiles(db, taskId, 'main', ['src/auth-helper.js']);
   upsertTaskSpec(db, taskId, {
     task_type: 'implementation',
@@ -2975,7 +2979,7 @@ test('Fix 37b: task outcome evaluator enforces structured task scope', () => {
     expected_output_types: ['docs'],
     success_criteria: ['change a docs file'],
   });
-  execSync('mkdir -p src && printf "oops\\n" > src/example.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src && printf "oops\\n" > src/example.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const result = evaluateTaskOutcome(db, repoDir, { taskId });
   assert(result.status === 'needs_followup', 'Outcome evaluator flags changes outside the structured task scope');
@@ -3009,7 +3013,7 @@ test('Fix 37c: task outcome evaluator allows implementation work when follow-up 
     risk_level: 'high',
     success_criteria: ['change auth source while tests/docs are handled by follow-up tasks'],
   });
-  execSync('mkdir -p src/auth && printf "ok\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src/auth && printf "ok\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const result = evaluateTaskOutcome(db, repoDir, { taskId });
   assert(result.status === 'accepted', 'Outcome evaluator accepts implementation work when only source is required for the current task');
@@ -3044,7 +3048,7 @@ test('Fix 37d: task outcome evaluator checks objective evidence beyond scope', (
   });
   releaseFileClaims(db, taskId);
   claimFiles(db, taskId, 'main', ['src/general/handler.js']);
-  execSync('mkdir -p src/general && printf "ok\\n" > src/general/handler.js', { cwd: repoDir, shell: '/bin/zsh' });
+  execSync('mkdir -p src/general && printf "ok\\n" > src/general/handler.js', { cwd: repoDir, shell: '/bin/sh' });
 
   const result = evaluateTaskOutcome(db, repoDir, { taskId });
   assert(result.status === 'needs_followup', 'Outcome evaluator rejects in-scope changes that do not evidence the task objective strongly enough');
