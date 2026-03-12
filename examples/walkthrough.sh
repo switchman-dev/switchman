@@ -10,10 +10,17 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TASKAPI_DIR="$SCRIPT_DIR/taskapi"
 WT_RATE="$SCRIPT_DIR/worktrees/agent-rate-limiting"
 WT_VALID="$SCRIPT_DIR/worktrees/agent-validation"
 WT_TESTS="$SCRIPT_DIR/worktrees/agent-tests"
+
+if [ -f "$REPO_ROOT/src/cli/index.js" ]; then
+  SWITCHMAN=(node "$REPO_ROOT/src/cli/index.js")
+else
+  SWITCHMAN=(switchman)
+fi
 
 # Colours
 CYAN='\033[0;36m'
@@ -44,7 +51,7 @@ read -r
 step "1. Starting state"
 info "4 tasks waiting in the queue, 3 worktrees ready"
 echo ""
-switchman status
+"${SWITCHMAN[@]}" status
 
 read -r
 
@@ -54,7 +61,7 @@ step "2. Agent 1 picks up the highest-priority task"
 agent "agent-rate-limiting" "calling: switchman lease next --json"
 echo ""
 
-TASK1=$(switchman lease next --json --worktree agent-rate-limiting --agent claude-code 2>/dev/null || echo "null")
+TASK1=$("${SWITCHMAN[@]}" lease next --json --worktree agent-rate-limiting --agent claude-code 2>/dev/null || echo "null")
 TASK1_ID=$(echo "$TASK1" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['task']['id'])" 2>/dev/null || echo "")
 
 if [ -z "$TASK1_ID" ]; then
@@ -73,7 +80,7 @@ step "3. Agent 1 claims the files it needs"
 agent "agent-rate-limiting" "I'll be editing the middleware and server files"
 echo ""
 
-switchman claim "$TASK1_ID" agent-rate-limiting \
+"${SWITCHMAN[@]}" claim "$TASK1_ID" agent-rate-limiting \
   src/middleware/auth.js \
   src/server.js
 
@@ -87,7 +94,7 @@ step "4. Agent 2 picks up the next task"
 agent "agent-validation" "calling: switchman lease next --json"
 echo ""
 
-TASK2=$(switchman lease next --json --worktree agent-validation --agent claude-code 2>/dev/null || echo "null")
+TASK2=$("${SWITCHMAN[@]}" lease next --json --worktree agent-validation --agent claude-code 2>/dev/null || echo "null")
 TASK2_ID=$(echo "$TASK2" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['task']['id'])" 2>/dev/null || echo "")
 ok "Task + lease assigned to agent-validation"
 
@@ -100,7 +107,7 @@ agent "agent-validation" "Input validation also touches auth.js..."
 echo ""
 
 # This should warn about the conflict
-switchman claim "$TASK2_ID" agent-validation \
+"${SWITCHMAN[@]}" claim "$TASK2_ID" agent-validation \
   src/middleware/auth.js \
   src/middleware/validate.js \
   src/routes/tasks.js || true
@@ -117,7 +124,7 @@ step "6. Agent 2 claims only the files that aren't taken"
 agent "agent-validation" "Claiming only validate.js and routes/tasks.js instead"
 echo ""
 
-switchman claim "$TASK2_ID" agent-validation \
+"${SWITCHMAN[@]}" claim "$TASK2_ID" agent-validation \
   src/middleware/validate.js \
   src/routes/tasks.js
 
@@ -131,7 +138,7 @@ step "7. Full conflict scan across all worktrees"
 info "This is what you'd run before any merge"
 echo ""
 
-switchman scan
+"${SWITCHMAN[@]}" scan
 
 read -r
 
@@ -141,7 +148,7 @@ step "8. Agent 1 finishes — marks task done and releases files"
 agent "agent-rate-limiting" "Rate limiting implemented and committed."
 echo ""
 
-switchman task done "$TASK1_ID"
+"${SWITCHMAN[@]}" task done "$TASK1_ID"
 ok "Task done. src/middleware/auth.js and src/server.js are now free."
 
 read -r
@@ -149,7 +156,7 @@ read -r
 # ── Step 9: Final status ──────────────────────────────────────────────────────
 
 step "9. Final status"
-switchman status
+"${SWITCHMAN[@]}" status
 
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"

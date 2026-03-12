@@ -35,12 +35,30 @@ npm install -g .   # from the switchman repo root
 Then from the switchman repo root:
 ```bash
 bash examples/setup.sh
+bash examples/demo.sh
 bash examples/walkthrough.sh
 ```
 
 If you want the shortest path:
 - `setup.sh` creates the repo, worktrees, and seed tasks
+- `demo.sh` is the 45-90 second recordable version
 - `walkthrough.sh` shows one complete 3-agent happy path, including a real claim conflict
+
+## Recordable demo
+
+If you want the short “wow” version for recording or showing the product quickly:
+
+```bash
+bash examples/setup.sh
+bash examples/demo.sh
+```
+
+What it shows:
+- a clean repo dashboard
+- one agent locking files safely
+- another agent getting blocked from overlapping work
+- both branches landing through the queue
+- a clean `switchman gate ci` at the end
 
 ## What the walkthrough shows
 

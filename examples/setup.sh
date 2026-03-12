@@ -15,8 +15,15 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TASKAPI_DIR="$SCRIPT_DIR/taskapi"
 WORKTREES_DIR="$SCRIPT_DIR/worktrees"
+
+if [ -f "$REPO_ROOT/src/cli/index.js" ]; then
+  SWITCHMAN=(node "$REPO_ROOT/src/cli/index.js")
+else
+  SWITCHMAN=(switchman)
+fi
 
 echo ""
 echo "━━━ Switchman Example Setup ━━━━━━━━━━━━━━━━━━"
@@ -68,26 +75,26 @@ git worktree list
 
 echo ""
 echo "→ Initialising Switchman in taskapi..."
-switchman init
+"${SWITCHMAN[@]}" init
 
 # ── Step 4: Seed tasks ────────────────────────────────────────────────────────
 
 echo ""
 echo "→ Seeding 4 parallel tasks..."
 
-switchman task add "Add rate limiting to all API routes" \
+"${SWITCHMAN[@]}" task add "Add rate limiting to all API routes" \
   --priority 8 \
   --description "Token bucket: 100 req/min per API key. Return 429 with Retry-After header."
 
-switchman task add "Add input validation to POST /tasks and PATCH /tasks/:id" \
+"${SWITCHMAN[@]}" task add "Add input validation to POST /tasks and PATCH /tasks/:id" \
   --priority 7 \
   --description "Validate title length, status enum, priority enum. Return 400 with descriptive errors."
 
-switchman task add "Write tests for the auth middleware" \
+"${SWITCHMAN[@]}" task add "Write tests for the auth middleware" \
   --priority 6 \
   --description "Test requireAuth and requireAdmin: valid key, missing key, bad key, wrong role."
 
-switchman task add "Add pagination to GET /tasks" \
+"${SWITCHMAN[@]}" task add "Add pagination to GET /tasks" \
   --priority 5 \
   --description "Add ?page=1&limit=20. Return { tasks, count, page, totalPages }."
 
@@ -96,7 +103,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "✓ Setup complete."
 echo ""
 echo "Tasks ready:"
-switchman task list
+"${SWITCHMAN[@]}" task list
 echo ""
 echo "→ Next: bash examples/walkthrough.sh"
 echo ""
