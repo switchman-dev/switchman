@@ -1714,7 +1714,18 @@ export function assignTask(db, taskId, worktree, agent) {
 }
 
 export function completeTask(db, taskId) {
-  withImmediateTransaction(db, () => {
+  return withImmediateTransaction(db, () => {
+    const task = getTaskTx(db, taskId);
+    if (!task) {
+      throw new Error(`Task ${taskId} does not exist.`);
+    }
+    if (task.status === 'done') {
+      return {
+        ok: false,
+        status: 'already_done',
+        task: getTaskTx(db, taskId),
+      };
+    }
     const activeLease = getActiveLeaseForTaskTx(db, taskId);
     finalizeTaskWithLeaseTx(db, taskId, activeLease, {
       taskStatus: 'done',
@@ -1722,6 +1733,11 @@ export function completeTask(db, taskId) {
       auditStatus: 'allowed',
       auditEventType: 'task_completed',
     });
+    return {
+      ok: true,
+      status: 'completed',
+      task: getTaskTx(db, taskId),
+    };
   });
 }
 

@@ -2417,10 +2417,12 @@ function completeTaskWithRetries(repoRoot, taskId, attempts = 20) {
     let db = null;
     try {
       db = openDb(repoRoot);
-      completeTask(db, taskId);
-      releaseFileClaims(db, taskId);
+      const result = completeTask(db, taskId);
+      if (result?.status === 'completed') {
+        releaseFileClaims(db, taskId);
+      }
       db.close();
-      return;
+      return result;
     } catch (err) {
       lastError = err;
       try { db?.close(); } catch { /* no-op */ }
@@ -2957,7 +2959,11 @@ taskCmd
   .action((taskId) => {
     const repoRoot = getRepo();
     try {
-      completeTaskWithRetries(repoRoot, taskId);
+      const result = completeTaskWithRetries(repoRoot, taskId);
+      if (result?.status === 'already_done') {
+        console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} was already marked done — no new changes were recorded`);
+        return;
+      }
       console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
     } catch (err) {
       console.error(chalk.red(err.message));

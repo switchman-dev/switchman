@@ -3031,6 +3031,37 @@ test('Fix 1c: CLI task done succeeds while a transient SQLite write lock is pres
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 1d: CLI task done warns clearly when the task was already completed', () => {
+  const repoDir = join(tmpdir(), `sw-task-done-twice-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Complete twice' });
+  assignTask(db, taskId, 'main');
+  db.close();
+
+  execFileSync(process.execPath, [cliPath, 'task', 'done', taskId], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const secondOutput = execFileSync(process.execPath, [cliPath, 'task', 'done', taskId], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(secondOutput.includes('already marked done'), 'Second task done call warns that the task was already completed');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 2: SWITCHMAN_DIR constant (no stale AGENTQ_DIR)', () => {
   // Verify the database is created at the correct path using the renamed constant
   const fixDir = join(tmpdir(), `sw-const-${Date.now()}`);

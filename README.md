@@ -23,6 +23,10 @@ Why Node 22.5+?
 - Switchman uses the built-in `node:sqlite` runtime support for its repo-local coordination database.
 - Keeping that dependency in the Node runtime makes install and recovery simpler, but it currently means targeting newer Node releases on purpose.
 
+TypeScript and API surface
+- Switchman is CLI-first today. The supported interface is the `switchman` command and the MCP integration, not a stable embeddable library API yet.
+- That means there are no published TypeScript types right now by design. We plan to add typed surfaces once the programmatic API is stable enough to support cleanly.
+
 ```bash
 npm install -g switchman-dev
 ```
