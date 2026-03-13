@@ -60,6 +60,17 @@ import {
   sendTelemetryEvent,
 } from '../core/telemetry.js';
 
+const originalProcessEmit = process.emit.bind(process);
+process.emit = function patchedProcessEmit(event, ...args) {
+  if (event === 'warning') {
+    const [warning] = args;
+    if (warning?.name === 'ExperimentalWarning' && warning?.message?.includes('SQLite')) {
+      return false;
+    }
+  }
+  return originalProcessEmit(event, ...args);
+};
+
 function installMcpConfig(targetDirs) {
   return targetDirs.flatMap((targetDir) => upsertAllProjectMcpConfigs(targetDir));
 }

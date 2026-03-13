@@ -2984,6 +2984,7 @@ test('Setup prints a first-run verification summary', () => {
   assert(output.includes('Cursor MCP'), 'Setup verification checks local editor config');
   assert(output.includes('Try next:'), 'Setup verification suggests exact next commands');
   assert(output.includes('switchman status --watch'), 'Setup points the operator at the live status dashboard');
+  assert(!output.includes('ExperimentalWarning'), 'Setup hides the SQLite experimental warning from first-run output');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -5929,6 +5930,7 @@ test('Status text surfaces one front-door operator view', () => {
   });
 
   assert(textOutput.includes('switchman status'), 'Status text includes the dashboard banner');
+  assert(!textOutput.includes('ExperimentalWarning'), 'Status text hides the SQLite experimental warning');
   assert(textOutput.includes('Now:'), 'Status text starts with a plain-language summary');
   assert(textOutput.includes('Attention:'), 'Status text highlights the top thing to look at');
   assert(textOutput.includes('Run next:'), 'Status text gives one exact next command near the top');
