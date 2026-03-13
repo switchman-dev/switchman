@@ -66,11 +66,13 @@ import {
   registerWorktree,
   listWorktrees,
   claimFiles,
+  createPolicyOverride,
   releaseFileClaims,
   checkFileConflicts,
   getActiveFileClaims,
   listAuditEvents,
   logAuditEvent,
+  revokePolicyOverride,
   verifyAuditTrail,
   retryMergeQueueItem,
 } from '../src/core/db.js';
@@ -494,6 +496,84 @@ test('Fix 29a: queue add blocks pipeline landing when policy requirements are st
   assert(output.includes('switchman pipeline review pipe-policy-queue-add'), 'queue add points at pipeline review as the remediation command');
   assert(queueItems.length === 0, 'queue add does not enqueue a policy-blocked pipeline');
   verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 29a1: policy overrides can unblock governed landing gates and stay visible in the policy record', () => {
+  const repoDir = join(tmpdir(), `sw-queue-add-policy-override-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  execSync('git checkout -b feature/policy-override-queue-add', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: join(repoDir, 'agent1'), branch: 'feature/policy-override-queue-add' });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      schema: {
+        required_completed_task_types: ['tests', 'governance', 'docs'],
+        enforcement: 'blocked',
+        rationale: ['schema changes require explicit evidence before landing'],
+      },
+    },
+  });
+
+  const taskId = createTask(queueDb, { id: 'pipe-policy-override-queue-add-01', title: 'Implement schema change' });
+  upsertTaskSpec(queueDb, taskId, {
+    pipeline_id: 'pipe-policy-override-queue-add',
+    task_type: 'implementation',
+    subsystem_tags: ['schema'],
+    risk_level: 'high',
+    validation_rules: {
+      required_completed_task_types: ['tests', 'governance', 'docs'],
+      enforcement: 'blocked',
+      rationale: ['schema changes require explicit evidence before landing'],
+    },
+  });
+  completeTask(queueDb, taskId);
+  createPolicyOverride(queueDb, {
+    pipelineId: 'pipe-policy-override-queue-add',
+    taskTypes: ['tests', 'governance', 'docs'],
+    requirementKeys: ['completed_task_type:tests', 'completed_task_type:governance', 'completed_task_type:docs'],
+    reason: 'Validation evidence is being tracked outside this landing path for the rollout window.',
+    approvedBy: 'release-manager',
+  });
+  queueDb.close();
+
+  const verifyDb = openDb(repoDir);
+  const override = createPolicyOverride(verifyDb, {
+    pipelineId: 'pipe-policy-override-queue-add',
+    taskTypes: ['governance'],
+    requirementKeys: ['completed_task_type:governance'],
+    reason: 'Temporary governance exception for test coverage review.',
+    approvedBy: 'security-lead',
+  });
+  const revoked = revokePolicyOverride(verifyDb, override.id, {
+    revokedBy: 'security-lead',
+    reason: 'Governance review is required again.',
+  });
+  verifyDb.close();
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'status',
+    'pipe-policy-override-queue-add',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(statusJson.policy_state.missing_task_types.length === 0, 'Policy state clears missing requirements once they are explicitly overridden');
+  assert(statusJson.policy_state.overridden_task_types.includes('docs'), 'Pipeline status records the overridden task type');
+  assert(statusJson.policy_state.overrides.some((entry) => entry.reason === 'Validation evidence is being tracked outside this landing path for the rollout window.'), 'Pipeline status carries the active override record');
+  assert(statusJson.policy_state.satisfaction_history.some((entry) => entry.event_type === 'policy_override_active'), 'Pipeline status policy record includes the active override history');
+  assert(revoked.status === 'revoked', 'Policy overrides can be revoked after being recorded');
+
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -1551,6 +1631,274 @@ test('Merge queue status shows stale pipeline items as held back behind clearer 
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Merge queue status groups stale queue items by shared stale wave for coordinated revalidation', () => {
+  const repoDir = join(tmpdir(), `sw-queue-stale-wave-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const clearPath = join(tmpdir(), `sw-queue-wave-clear-${Date.now()}`);
+  execSync(`git worktree add -b feature/wave-clear "${clearPath}"`, { cwd: repoDir });
+  writeFileSync(join(clearPath, 'clear.txt'), 'clear\n');
+  execSync('git add clear.txt', { cwd: clearPath });
+  execSync('git commit -m "clear queued work"', { cwd: clearPath });
+
+  const staleAPath = join(tmpdir(), `sw-queue-wave-a-${Date.now()}`);
+  execSync(`git worktree add -b feature/wave-a "${staleAPath}"`, { cwd: repoDir });
+  writeFileSync(join(staleAPath, 'a.txt'), 'a\n');
+  execSync('git add a.txt', { cwd: staleAPath });
+  execSync('git commit -m "stale wave a"', { cwd: staleAPath });
+
+  const staleBPath = join(tmpdir(), `sw-queue-wave-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/wave-b "${staleBPath}"`, { cwd: repoDir });
+  writeFileSync(join(staleBPath, 'b.txt'), 'b\n');
+  execSync('git add b.txt', { cwd: staleBPath });
+  execSync('git commit -m "stale wave b"', { cwd: staleBPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'wave-clear', path: clearPath, branch: 'feature/wave-clear' });
+  registerWorktree(queueDb, { name: 'wave-a', path: staleAPath, branch: 'feature/wave-a' });
+  registerWorktree(queueDb, { name: 'wave-b', path: staleBPath, branch: 'feature/wave-b' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/wave-a',
+    sourcePipelineId: 'pipe-wave-a',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/wave-b',
+    sourcePipelineId: 'pipe-wave-b',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/wave-clear',
+    targetBranch: 'main',
+  });
+
+  const affectedATaskId = createTask(queueDb, { id: 'pipe-wave-a-queue-01', title: 'Wave A consumer', priority: 5 });
+  upsertTaskSpec(queueDb, affectedATaskId, {
+    pipeline_id: 'pipe-wave-a',
+    task_type: 'implementation',
+    allowed_paths: ['src/api/**'],
+    subsystem_tags: ['api'],
+  });
+  const affectedBTaskId = createTask(queueDb, { id: 'pipe-wave-b-queue-01', title: 'Wave B consumer', priority: 5 });
+  upsertTaskSpec(queueDb, affectedBTaskId, {
+    pipeline_id: 'pipe-wave-b',
+    task_type: 'implementation',
+    allowed_paths: ['src/api/**'],
+    subsystem_tags: ['api'],
+  });
+  const sourceTaskId = createTask(queueDb, { id: 'pipe-wave-source-queue-01', title: 'Shared module change', priority: 6 });
+  upsertTaskSpec(queueDb, sourceTaskId, {
+    pipeline_id: 'pipe-wave-source',
+    task_type: 'implementation',
+    allowed_paths: ['src/shared/**'],
+    subsystem_tags: ['auth'],
+  });
+  assignTask(queueDb, sourceTaskId, 'wave-a');
+  const sourceLease = getActiveLeaseForTask(queueDb, sourceTaskId);
+
+  for (const [taskId, pipelineId, dependentFile] of [
+    [affectedATaskId, 'pipe-wave-a', 'src/api/a.ts'],
+    [affectedBTaskId, 'pipe-wave-b', 'src/api/b.ts'],
+  ]) {
+    queueDb.prepare(`
+      INSERT INTO dependency_invalidations (
+        source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+        affected_task_id, affected_pipeline_id, affected_worktree,
+        status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      sourceLease.id,
+      sourceTaskId,
+      'pipe-wave-source',
+      'agent-wave',
+      taskId,
+      pipelineId,
+      pipelineId === 'pipe-wave-a' ? 'wave-a' : 'wave-b',
+      'stale',
+      'shared_module_drift',
+      null,
+      null,
+      null,
+      JSON.stringify({
+        source_task_title: 'Shared module change',
+        source_task_priority: 6,
+        affected_task_priority: 5,
+        module_paths: ['src/shared/session.ts'],
+        dependent_files: [dependentFile],
+        dependent_areas: ['src/api'],
+        revalidation_set: 'shared_module',
+        severity: 'warn',
+      }),
+    );
+  }
+  queueDb.close();
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const heldWaveA = statusJson.summary.recommendations.find((item) => item.source_ref === 'feature/wave-a');
+  const heldWaveB = statusJson.summary.recommendations.find((item) => item.source_ref === 'feature/wave-b');
+  assert(statusJson.summary.next.source_ref === 'feature/wave-clear', 'Queue keeps the clear branch at the front when the stale wave affects other queued goals');
+  assert(heldWaveA.action === 'hold' && heldWaveB.action === 'hold', 'Queue recommendations hold both stale-wave items back');
+  assert(heldWaveA.stale_wave_count === 1, 'Queue recommendations record that the item belongs to one stale causal wave');
+  assert(heldWaveA.stale_wave_size === 2, 'Queue recommendations record the size of the shared stale wave');
+  assert(heldWaveA.stale_wave_summary.includes('shared module drift'), 'Queue recommendations surface the stale wave summary');
+  assert(heldWaveA.summary.includes('coordinated revalidation'), 'Queue recommendations steer the operator toward coordinated revalidation for shared stale waves');
+
+  execSync(`git worktree remove "${clearPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${staleAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${staleBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run persists shared stale waves as wave-blocked queue items', () => {
+  const repoDir = join(tmpdir(), `sw-queue-wave-blocked-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const staleAPath = join(tmpdir(), `sw-queue-wave-blocked-a-${Date.now()}`);
+  execSync(`git worktree add -b feature/wave-blocked-a "${staleAPath}"`, { cwd: repoDir });
+  writeFileSync(join(staleAPath, 'a.txt'), 'a\n');
+  execSync('git add a.txt', { cwd: staleAPath });
+  execSync('git commit -m "wave blocked a"', { cwd: staleAPath });
+
+  const staleBPath = join(tmpdir(), `sw-queue-wave-blocked-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/wave-blocked-b "${staleBPath}"`, { cwd: repoDir });
+  writeFileSync(join(staleBPath, 'b.txt'), 'b\n');
+  execSync('git add b.txt', { cwd: staleBPath });
+  execSync('git commit -m "wave blocked b"', { cwd: staleBPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'wave-blocked-a', path: staleAPath, branch: 'feature/wave-blocked-a' });
+  registerWorktree(queueDb, { name: 'wave-blocked-b', path: staleBPath, branch: 'feature/wave-blocked-b' });
+  const itemA = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/wave-blocked-a',
+    sourcePipelineId: 'pipe-wave-blocked-a',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/wave-blocked-b',
+    sourcePipelineId: 'pipe-wave-blocked-b',
+    targetBranch: 'main',
+  });
+
+  const affectedATaskId = createTask(queueDb, { id: 'pipe-wave-blocked-a-01', title: 'Wave blocked A consumer', priority: 5 });
+  upsertTaskSpec(queueDb, affectedATaskId, {
+    pipeline_id: 'pipe-wave-blocked-a',
+    task_type: 'implementation',
+    allowed_paths: ['src/api/**'],
+    subsystem_tags: ['api'],
+  });
+  const affectedBTaskId = createTask(queueDb, { id: 'pipe-wave-blocked-b-01', title: 'Wave blocked B consumer', priority: 5 });
+  upsertTaskSpec(queueDb, affectedBTaskId, {
+    pipeline_id: 'pipe-wave-blocked-b',
+    task_type: 'implementation',
+    allowed_paths: ['src/api/**'],
+    subsystem_tags: ['api'],
+  });
+  const sourceTaskId = createTask(queueDb, { id: 'pipe-wave-blocked-source-01', title: 'Shared module change', priority: 6 });
+  upsertTaskSpec(queueDb, sourceTaskId, {
+    pipeline_id: 'pipe-wave-blocked-source',
+    task_type: 'implementation',
+    allowed_paths: ['src/shared/**'],
+    subsystem_tags: ['auth'],
+  });
+  assignTask(queueDb, sourceTaskId, 'wave-blocked-a');
+  const sourceLease = getActiveLeaseForTask(queueDb, sourceTaskId);
+
+  for (const [taskId, pipelineId, worktreeName, dependentFile] of [
+    [affectedATaskId, 'pipe-wave-blocked-a', 'wave-blocked-a', 'src/api/a.ts'],
+    [affectedBTaskId, 'pipe-wave-blocked-b', 'wave-blocked-b', 'src/api/b.ts'],
+  ]) {
+    queueDb.prepare(`
+      INSERT INTO dependency_invalidations (
+        source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+        affected_task_id, affected_pipeline_id, affected_worktree,
+        status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      sourceLease.id,
+      sourceTaskId,
+      'pipe-wave-blocked-source',
+      'agent-wave-blocked',
+      taskId,
+      pipelineId,
+      worktreeName,
+      'stale',
+      'shared_module_drift',
+      null,
+      null,
+      null,
+      JSON.stringify({
+        source_task_title: 'Shared module change',
+        source_task_priority: 6,
+        affected_task_priority: 5,
+        module_paths: ['src/shared/session.ts'],
+        dependent_files: [dependentFile],
+        dependent_areas: ['src/api'],
+        revalidation_set: 'shared_module',
+        severity: 'warn',
+      }),
+    );
+  }
+  queueDb.close();
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const verifyDb = openDb(repoDir);
+  const waveBlockedItem = listMergeQueue(verifyDb).find((item) => item.status === 'wave_blocked');
+  const retriedWaveBlocked = waveBlockedItem ? retryMergeQueueItem(verifyDb, waveBlockedItem.id) : null;
+  verifyDb.close();
+
+  assert(cliResult.processed.length === 0, 'Queue run does not process shared stale-wave items');
+  assert(
+    ['feature/wave-blocked-a', 'feature/wave-blocked-b'].includes(cliResult.deferred.source_ref),
+    'Queue run reports one of the shared stale-wave items as the deferred focus',
+  );
+  assert(cliResult.deferred.recommendation.action === 'hold', 'Queue run still recommends a hold decision for the shared stale wave');
+  assert(Boolean(waveBlockedItem), 'Deferred shared stale-wave items are persisted as wave_blocked');
+  assert(waveBlockedItem.last_error_code === 'queue_wave_blocked', 'Wave-blocked queue items record a dedicated queue code');
+  assert(waveBlockedItem.next_action?.startsWith('switchman task retry-stale --pipeline pipe-wave-blocked-'), 'Wave-blocked queue items keep the exact coordinated revalidation command');
+  assert(retriedWaveBlocked?.status === 'retrying', 'Queue retry can reopen wave-blocked items');
+
+  execSync(`git worktree remove "${staleAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${staleBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Merge queue status marks retrying items as retry decisions', () => {
   const repoDir = join(tmpdir(), `sw-queue-retry-decision-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -2262,7 +2610,7 @@ test('Fix 55a: initDb records the current schema version explicitly', () => {
   const version = Object.values(row || {})[0];
   db.close();
 
-  assert(version === 4, 'New Switchman databases record schema version 4 explicitly');
+  assert(version === 5, 'New Switchman databases record schema version 5 explicitly');
 
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -5827,6 +6175,392 @@ test('Fix 28ab3: stale clusters prioritize urgent contract revalidation ahead of
   assert(doctorJson.merge_readiness.stale_clusters[0].affected_pipeline_id === 'pipe-high', 'High-priority contract drift sorts to the front of stale clusters');
   assert(doctorJson.merge_readiness.stale_clusters[0].rerun_priority === 'urgent', 'High-priority contract drift is marked urgent for rerun');
   assert(doctorJson.merge_readiness.stale_clusters[0].rerun_priority_score > doctorJson.merge_readiness.stale_clusters[1].rerun_priority_score, 'Urgent contract drift gets a higher rerun priority score than lower-priority stale work');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28ab4: dependency invalidations detect shared module drift across goals', () => {
+  const repoDir = join(tmpdir(), `sw-shared-module-stale-${Date.now()}`);
+  mkdirSync(join(repoDir, 'src/api'), { recursive: true });
+  mkdirSync(join(repoDir, 'src/shared'), { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'src/shared/session.ts'), 'export function getSession() { return null; }\n');
+  writeFileSync(join(repoDir, 'src/api/router.ts'), "import { getSession } from '../shared/session';\nexport function loadRoute() { return getSession(); }\n");
+  execSync('git add src/shared/session.ts src/api/router.ts', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const oldTaskId = createTask(db, { title: 'Keep API router aligned with shared session helper', priority: 6 });
+  upsertTaskSpec(db, oldTaskId, {
+    pipeline_id: 'pipe-api-consumer',
+    task_type: 'implementation',
+    allowed_paths: ['src/api/**'],
+    subsystem_tags: ['api'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, oldTaskId, 'main');
+  const oldLease = getActiveLeaseForTask(db, oldTaskId);
+  completeLeaseTask(db, oldLease.id);
+
+  const newTaskId = createTask(db, { title: 'Update shared session helper', priority: 5 });
+  upsertTaskSpec(db, newTaskId, {
+    pipeline_id: 'pipe-shared-session',
+    task_type: 'implementation',
+    allowed_paths: ['src/shared/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+    objective_keywords: ['session'],
+  });
+  assignTask(db, newTaskId, 'main');
+  const lease = getActiveLeaseForTask(db, newTaskId);
+  writeFileSync(join(repoDir, 'src/shared/session.ts'), 'export function getSession() { return { userId: "1" }; }\n');
+
+  evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
+
+  const invalidations = listDependencyInvalidations(db, { affectedTaskId: oldTaskId });
+  const sharedModuleInvalidation = invalidations.find((item) => item.reason_type === 'shared_module_drift');
+  assert(Boolean(sharedModuleInvalidation), 'Dependency invalidations include a shared module drift reason');
+  assert(sharedModuleInvalidation.details.module_paths.includes('src/shared/session.ts'), 'Shared module drift records the changed module path');
+  assert(sharedModuleInvalidation.details.dependent_files.includes('src/api/router.ts'), 'Shared module drift records dependent files in the affected goal');
+  assert(sharedModuleInvalidation.details.revalidation_set === 'shared_module', 'Shared module drift classifies the revalidation set as shared_module');
+  db.close();
+
+  const doctorJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const sharedModuleCluster = doctorJson.merge_readiness.stale_clusters.find((item) => item.affected_pipeline_id === 'pipe-api-consumer');
+  assert(Boolean(sharedModuleCluster), 'Doctor JSON groups shared module drift into a stale cluster');
+  assert(sharedModuleCluster.revalidation_set_type === 'shared_module', 'Shared module drift stale clusters are labeled as shared-module revalidation sets');
+  assert(sharedModuleCluster.rerun_priority_score > 0, 'Shared module drift contributes rerun priority for stale cluster ordering');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28ab5: stale clusters prioritize broader shared-module stale waves ahead of narrower ones', () => {
+  const repoDir = join(tmpdir(), `sw-shared-module-priority-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const broadTaskId = createTask(db, { id: 'pipe-broad-01', title: 'Revalidate broad shared module consumer', priority: 5 });
+  upsertTaskSpec(db, broadTaskId, {
+    pipeline_id: 'pipe-broad',
+    task_type: 'implementation',
+    allowed_paths: ['src/api/**'],
+    subsystem_tags: ['api'],
+  });
+  const narrowTaskId = createTask(db, { id: 'pipe-narrow-01', title: 'Revalidate narrow shared module consumer', priority: 5 });
+  upsertTaskSpec(db, narrowTaskId, {
+    pipeline_id: 'pipe-narrow',
+    task_type: 'implementation',
+    allowed_paths: ['src/ui/**'],
+    subsystem_tags: ['ui'],
+  });
+
+  const sourceTaskId = createTask(db, { id: 'pipe-source-module-01', title: 'Change shared session helper', priority: 4 });
+  upsertTaskSpec(db, sourceTaskId, {
+    pipeline_id: 'pipe-source-module',
+    task_type: 'implementation',
+    allowed_paths: ['src/shared/**'],
+    subsystem_tags: ['auth'],
+  });
+  assignTask(db, sourceTaskId, 'main');
+  const sourceLease = getActiveLeaseForTask(db, sourceTaskId);
+
+  db.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-source-module',
+    'agent-source',
+    broadTaskId,
+    'pipe-broad',
+    'main',
+    'stale',
+    'shared_module_drift',
+    null,
+    null,
+    null,
+    JSON.stringify({
+      source: 'test',
+      source_task_title: 'Change shared session helper',
+      affected_task_title: 'Revalidate broad shared module consumer',
+      source_task_priority: 4,
+      affected_task_priority: 5,
+      module_paths: ['src/shared/session.ts'],
+      dependent_files: ['src/api/router.ts', 'src/api/auth.ts', 'src/api/session.ts'],
+      dependent_areas: ['src/api', 'src/core'],
+      revalidation_set: 'shared_module',
+      severity: 'warn',
+    }),
+  );
+
+  db.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-source-module',
+    'agent-source',
+    narrowTaskId,
+    'pipe-narrow',
+    'main',
+    'stale',
+    'shared_module_drift',
+    null,
+    null,
+    null,
+    JSON.stringify({
+      source: 'test',
+      source_task_title: 'Change shared session helper',
+      affected_task_title: 'Revalidate narrow shared module consumer',
+      source_task_priority: 4,
+      affected_task_priority: 5,
+      module_paths: ['src/shared/session.ts'],
+      dependent_files: ['src/ui/session-badge.tsx'],
+      dependent_areas: ['src/ui'],
+      revalidation_set: 'shared_module',
+      severity: 'warn',
+    }),
+  );
+  db.close();
+
+  const doctorJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(doctorJson.merge_readiness.stale_clusters[0].affected_pipeline_id === 'pipe-broad', 'Broader shared-module stale wave sorts ahead of narrower stale work');
+  assert(doctorJson.merge_readiness.stale_clusters[0].rerun_breadth_score > doctorJson.merge_readiness.stale_clusters[1].rerun_breadth_score, 'Broader shared-module stale wave gets a higher breadth score');
+  assert(doctorJson.merge_readiness.stale_clusters[0].rerun_priority_score > doctorJson.merge_readiness.stale_clusters[1].rerun_priority_score, 'Broader shared-module stale wave gets a higher rerun priority score');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28ab6: stale clusters group multiple pipelines into one causal stale wave', () => {
+  const repoDir = join(tmpdir(), `sw-stale-causal-wave-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const sourceTaskId = createTask(db, { id: 'pipe-source-wave-01', title: 'Change shared contract module', priority: 6 });
+  upsertTaskSpec(db, sourceTaskId, {
+    pipeline_id: 'pipe-source-wave',
+    task_type: 'implementation',
+    allowed_paths: ['src/shared/**'],
+    subsystem_tags: ['auth'],
+  });
+  assignTask(db, sourceTaskId, 'main');
+  const sourceLease = getActiveLeaseForTask(db, sourceTaskId);
+
+  const affectedPipelines = [
+    { taskId: 'pipe-wave-a-01', pipelineId: 'pipe-wave-a', title: 'API consumer A', dependent: 'src/api/a.ts' },
+    { taskId: 'pipe-wave-b-01', pipelineId: 'pipe-wave-b', title: 'API consumer B', dependent: 'src/api/b.ts' },
+  ];
+
+  for (const pipeline of affectedPipelines) {
+    const taskId = createTask(db, { id: pipeline.taskId, title: pipeline.title, priority: 5 });
+    upsertTaskSpec(db, taskId, {
+      pipeline_id: pipeline.pipelineId,
+      task_type: 'implementation',
+      allowed_paths: ['src/api/**'],
+      subsystem_tags: ['api'],
+    });
+    db.prepare(`
+      INSERT INTO dependency_invalidations (
+        source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+        affected_task_id, affected_pipeline_id, affected_worktree,
+        status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      sourceLease.id,
+      sourceTaskId,
+      'pipe-source-wave',
+      'agent-source',
+      taskId,
+      pipeline.pipelineId,
+      'main',
+      'stale',
+      'shared_module_drift',
+      null,
+      null,
+      null,
+      JSON.stringify({
+        source: 'test',
+        source_task_title: 'Change shared contract module',
+        affected_task_title: pipeline.title,
+        source_task_priority: 6,
+        affected_task_priority: 5,
+        module_paths: ['src/shared/session.ts'],
+        dependent_files: [pipeline.dependent],
+        dependent_areas: ['src/api'],
+        revalidation_set: 'shared_module',
+        severity: 'warn',
+      }),
+    );
+  }
+  db.close();
+
+  const doctorJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const waveA = doctorJson.merge_readiness.stale_clusters.find((cluster) => cluster.affected_pipeline_id === 'pipe-wave-a');
+  const waveB = doctorJson.merge_readiness.stale_clusters.find((cluster) => cluster.affected_pipeline_id === 'pipe-wave-b');
+  assert(Boolean(waveA) && Boolean(waveB), 'Doctor JSON includes both stale clusters in the causal wave');
+  assert(waveA.causal_group_id === waveB.causal_group_id, 'Clusters caused by the same upstream module share one causal group id');
+  assert(waveA.causal_group_size === 2 && waveB.causal_group_size === 2, 'Clusters record the size of the shared stale wave');
+  assert(waveA.related_affected_pipelines.includes('pipe-wave-b'), 'Each cluster lists the other affected pipeline in the stale wave');
+  assert(waveA.causal_group_summary.includes('shared module drift'), 'Clusters summarize the upstream stale wave cause');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28ab7: pipeline summaries and GitHub outputs expose stale causal waves', () => {
+  const repoDir = join(tmpdir(), `sw-stale-wave-summary-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const pipelineId = 'pipe-wave-summary';
+  startPipeline(db, {
+    pipelineId,
+    title: 'Wave summary pipeline',
+    description: 'Ship API consumer from a shared stale wave',
+    priority: 5,
+  });
+  completeTask(db, 'pipe-wave-summary-01');
+
+  const sourceTaskId = createTask(db, { id: 'pipe-wave-source-01', title: 'Change shared module', priority: 6 });
+  upsertTaskSpec(db, sourceTaskId, {
+    pipeline_id: 'pipe-wave-source',
+    task_type: 'implementation',
+    allowed_paths: ['src/shared/**'],
+    subsystem_tags: ['auth'],
+  });
+  assignTask(db, sourceTaskId, 'main');
+  const sourceLease = getActiveLeaseForTask(db, sourceTaskId);
+
+  db.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-wave-source',
+    'agent-source',
+    'pipe-wave-summary-01',
+    pipelineId,
+    'main',
+    'stale',
+    'shared_module_drift',
+    null,
+    null,
+    null,
+    JSON.stringify({
+      source: 'test',
+      source_task_title: 'Change shared module',
+      affected_task_title: 'Ship API consumer',
+      source_task_priority: 6,
+      affected_task_priority: 5,
+      module_paths: ['src/shared/session.ts'],
+      dependent_files: ['src/api/router.ts', 'src/api/auth.ts'],
+      dependent_areas: ['src/api'],
+      revalidation_set: 'shared_module',
+      severity: 'warn',
+    }),
+  );
+  db.close();
+
+  const summaryJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'bundle',
+    pipelineId,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(summaryJson.summary.stale_causal_waves.length >= 1, 'Pipeline bundle JSON includes stale causal waves');
+  assert(summaryJson.summary.pr_artifact.stale_causal_waves.length >= 1, 'PR artifact carries stale causal wave state');
+  assert(summaryJson.summary.markdown.includes('## Stale Waves'), 'PR summary markdown includes a stale waves section');
+  assert(summaryJson.summary.trust_audit.some((entry) => entry.event_type === 'stale_wave_active'), 'Pipeline bundle trust audit includes active stale-wave entries');
+  assert(summaryJson.landing_summary.trust_audit.some((entry) => entry.event_type === 'stale_wave_active'), 'Landing summary trust audit includes active stale-wave entries');
+
+  const stepSummaryPath = join(repoDir, 'step-summary.md');
+  const outputPath = join(repoDir, 'github-output.txt');
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'bundle',
+    pipelineId,
+    '--github-step-summary',
+    stepSummaryPath,
+    '--github-output',
+    outputPath,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const stepSummary = readFileSync(stepSummaryPath, 'utf8');
+  const output = readFileSync(outputPath, 'utf8');
+  assert(stepSummary.includes('## Stale Waves'), 'GitHub step summary includes stale causal waves');
+  assert(output.includes('switchman_stale_wave_count='), 'GitHub outputs include stale wave count');
+  assert(output.includes('switchman_stale_wave_summary='), 'GitHub outputs include stale wave summary');
 
   rmSync(repoDir, { recursive: true, force: true });
 });

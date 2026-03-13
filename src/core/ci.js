@@ -182,6 +182,11 @@ export function formatPipelineLandingMarkdown(result) {
       ? result.stale_clusters.map((cluster) => `- ${cluster.title}: ${cluster.detail} -> ${cluster.next_action}`)
       : ['- None']),
     '',
+    '## Stale Waves',
+    ...(result.stale_causal_waves?.length
+      ? result.stale_causal_waves.map((wave) => `- ${wave.summary}: affects ${wave.affected_pipeline_ids.join(', ') || 'unknown'} -> ${wave.cluster_count} cluster(s), ${wave.invalidation_count} invalidation(s)`)
+      : ['- None']),
+    '',
     '## Policy & Stale Audit',
     ...(result.trust_audit?.length
       ? result.trust_audit.map((entry) => `- ${entry.created_at}: [${entry.category}] ${entry.summary} -> ${entry.next_action}`)
@@ -193,6 +198,7 @@ export function formatPipelineLandingMarkdown(result) {
     `- Target branch: ${result.queue_state?.target_branch || 'main'}`,
     ...(result.queue_state?.merged_commit ? [`- Merged commit: ${result.queue_state.merged_commit}`] : []),
     ...(result.queue_state?.last_error_summary ? [`- Queue error: ${result.queue_state.last_error_summary}`] : []),
+    ...(result.queue_state?.policy_override_summary ? [`- Policy override: ${result.queue_state.policy_override_summary}`] : []),
     '',
     '## Next Action',
     `- ${result.next_action}`,
@@ -220,8 +226,11 @@ export function writeGitHubPipelineLandingStatus({ result, stepSummaryPath = nul
       `switchman_queue_merged_commit=${result.queue_state?.merged_commit || ''}`,
       `switchman_stale_cluster_count=${result.stale_clusters?.length || 0}`,
       `switchman_stale_cluster_summary=${JSON.stringify((result.stale_clusters || []).map((cluster) => `${cluster.affected_pipeline_id || cluster.affected_task_ids[0]}:${cluster.invalidation_count}`).join(' | '))}`,
+      `switchman_stale_wave_count=${result.stale_causal_waves?.length || 0}`,
+      `switchman_stale_wave_summary=${JSON.stringify((result.stale_causal_waves || []).map((wave) => `${wave.summary}:${wave.affected_pipeline_ids.join(',')}`).join(' | '))}`,
       `switchman_trust_audit_count=${result.trust_audit?.length || 0}`,
       `switchman_trust_audit_summary=${JSON.stringify((result.trust_audit || []).slice(0, 3).map((entry) => `${entry.category}:${entry.summary}`).join(' | '))}`,
+      `switchman_policy_override_summary=${JSON.stringify(result.policy_override_summary || '')}`,
       `switchman_landing_next_action=${JSON.stringify(result.next_action)}`,
       `switchman_check_name=${JSON.stringify('Switchman Pipeline Landing')}`,
       `switchman_check_status=${checkInfo.status}`,

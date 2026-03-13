@@ -34,6 +34,7 @@ import {
   registerWorktree, listWorktrees, updateWorktreeStatus,
   enqueueMergeItem, escalateMergeQueueItem, getMergeQueueItem, listMergeQueue, listMergeQueueEvents, removeMergeQueueItem, retryMergeQueueItem,
   markMergeQueueState,
+  createPolicyOverride, listPolicyOverrides, revokePolicyOverride,
   finishOperationJournalEntry, listOperationJournal, listTempResources, updateTempResource,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts, retryTask,
   listAuditEvents, verifyAuditTrail,
@@ -483,6 +484,9 @@ function inferQueueExplainNextAction(item, resolved, resolutionError) {
   if (item.status === 'retrying' && item.backoff_until) {
     return item.next_action || `Wait until ${item.backoff_until}, or run \`switchman queue retry ${item.id}\` to retry sooner.`;
   }
+  if (item.status === 'wave_blocked') {
+    return item.next_action || `Run \`switchman explain queue ${item.id}\` to review the shared stale wave, then revalidate the affected pipelines together.`;
+  }
   if (item.status === 'escalated') {
     return item.next_action || `Run \`switchman explain queue ${item.id}\` to review the landing risk, then \`switchman queue retry ${item.id}\` when it is ready again.`;
   }
@@ -544,18 +548,22 @@ function buildStaleTaskExplainReport(db, taskId) {
     invalidations: invalidations.map((item) => ({
       ...item,
       details: item.details || {},
-      revalidation_set: item.details?.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
+      revalidation_set: item.details?.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'shared_module_drift' ? 'shared_module' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
       stale_area: item.reason_type === 'subsystem_overlap'
         ? `subsystem:${item.subsystem_tag}`
         : item.reason_type === 'semantic_contract_drift'
           ? `contract:${(item.details?.contract_names || []).join('|') || 'unknown'}`
         : item.reason_type === 'semantic_object_overlap'
           ? `object:${(item.details?.object_names || []).join('|') || 'unknown'}`
+        : item.reason_type === 'shared_module_drift'
+          ? `module:${(item.details?.module_paths || []).join('|') || 'unknown'}`
         : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
       summary: item.reason_type === 'semantic_contract_drift'
         ? `${item.details?.source_task_title || item.source_task_id} changed shared contract ${(item.details?.contract_names || []).join(', ') || 'unknown'}`
         : item.reason_type === 'semantic_object_overlap'
           ? `${item.details?.source_task_title || item.source_task_id} changed shared exported object ${(item.details?.object_names || []).join(', ') || 'unknown'}`
+          : item.reason_type === 'shared_module_drift'
+            ? `${item.details?.source_task_title || item.source_task_id} changed shared module ${(item.details?.module_paths || []).join(', ') || 'unknown'} used by ${(item.details?.dependent_files || []).join(', ') || item.affected_task_id}`
           : `${item.details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
     })),
     next_action: invalidations.length > 0
@@ -568,20 +576,24 @@ function normalizeDependencyInvalidation(item) {
   const details = item.details || {};
   return {
     ...item,
-    severity: item.severity || details.severity || (item.reason_type === 'semantic_contract_drift' ? 'blocked' : item.reason_type === 'semantic_object_overlap' ? 'warn' : 'warn'),
+    severity: item.severity || details.severity || (item.reason_type === 'semantic_contract_drift' ? 'blocked' : 'warn'),
     details,
-    revalidation_set: details.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
+    revalidation_set: details.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'shared_module_drift' ? 'shared_module' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
     stale_area: item.reason_type === 'subsystem_overlap'
       ? `subsystem:${item.subsystem_tag}`
       : item.reason_type === 'semantic_contract_drift'
         ? `contract:${(details.contract_names || []).join('|') || 'unknown'}`
       : item.reason_type === 'semantic_object_overlap'
         ? `object:${(details.object_names || []).join('|') || 'unknown'}`
+      : item.reason_type === 'shared_module_drift'
+        ? `module:${(details.module_paths || []).join('|') || 'unknown'}`
       : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
     summary: item.reason_type === 'semantic_contract_drift'
       ? `${details?.source_task_title || item.source_task_id} changed shared contract ${(details.contract_names || []).join(', ') || 'unknown'}`
       : item.reason_type === 'semantic_object_overlap'
         ? `${details?.source_task_title || item.source_task_id} changed shared exported object ${(details.object_names || []).join(', ') || 'unknown'}`
+        : item.reason_type === 'shared_module_drift'
+          ? `${details?.source_task_title || item.source_task_id} changed shared module ${(details.module_paths || []).join(', ') || 'unknown'} used by ${(details.dependent_files || []).join(', ') || item.affected_task_id}`
         : `${details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
   };
 }
@@ -603,6 +615,9 @@ function buildStaleClusters(invalidations = []) {
         affected_worktrees: new Set(),
         stale_areas: new Set(),
         revalidation_sets: new Set(),
+        dependent_files: new Set(),
+        dependent_areas: new Set(),
+        module_paths: new Set(),
         invalidations: [],
         severity: 'warn',
         highest_affected_priority: 0,
@@ -618,12 +633,15 @@ function buildStaleClusters(invalidations = []) {
     if (invalidation.affected_worktree) cluster.affected_worktrees.add(invalidation.affected_worktree);
     cluster.stale_areas.add(invalidation.stale_area);
     if (invalidation.revalidation_set) cluster.revalidation_sets.add(invalidation.revalidation_set);
+    for (const filePath of invalidation.details?.dependent_files || []) cluster.dependent_files.add(filePath);
+    for (const area of invalidation.details?.dependent_areas || []) cluster.dependent_areas.add(area);
+    for (const modulePath of invalidation.details?.module_paths || []) cluster.module_paths.add(modulePath);
     if (invalidation.severity === 'blocked') cluster.severity = 'block';
     cluster.highest_affected_priority = Math.max(cluster.highest_affected_priority, Number(invalidation.details?.affected_task_priority || 0));
     cluster.highest_source_priority = Math.max(cluster.highest_source_priority, Number(invalidation.details?.source_task_priority || 0));
   }
 
-  return [...clusters.values()]
+  const clusterEntries = [...clusters.values()]
     .map((cluster) => {
       const affectedTaskIds = [...cluster.affected_task_ids];
       const sourceTaskTitles = [...cluster.source_task_titles];
@@ -636,13 +654,19 @@ function buildStaleClusters(invalidations = []) {
         affected_task_ids: affectedTaskIds,
         invalidation_count: cluster.invalidations.length,
         source_task_ids: [...cluster.source_task_ids],
+        source_pipeline_ids: [...new Set(cluster.invalidations.map((item) => item.source_pipeline_id).filter(Boolean))],
         source_task_titles: sourceTaskTitles,
         source_worktrees: sourceWorktrees,
         affected_worktrees: affectedWorktrees,
         stale_areas: staleAreas,
         revalidation_sets: [...cluster.revalidation_sets],
+        dependent_files: [...cluster.dependent_files],
+        dependent_areas: [...cluster.dependent_areas],
+        module_paths: [...cluster.module_paths],
         revalidation_set_type: cluster.revalidation_sets.has('contract')
           ? 'contract'
+          : cluster.revalidation_sets.has('shared_module')
+            ? 'shared_module'
           : cluster.revalidation_sets.has('semantic_object')
             ? 'semantic_object'
             : cluster.revalidation_sets.has('subsystem')
@@ -650,27 +674,37 @@ function buildStaleClusters(invalidations = []) {
               : 'scope',
         rerun_priority: cluster.severity === 'block'
           ? (cluster.revalidation_sets.has('contract') || cluster.highest_affected_priority >= 8 ? 'urgent' : 'high')
+          : cluster.revalidation_sets.has('shared_module') && cluster.dependent_files.size >= 3
+            ? 'high'
           : cluster.highest_affected_priority >= 8
             ? 'high'
             : cluster.highest_affected_priority >= 5
               ? 'medium'
               : 'low',
         rerun_priority_score: (cluster.severity === 'block' ? 100 : 0)
-          + (cluster.revalidation_sets.has('contract') ? 30 : cluster.revalidation_sets.has('semantic_object') ? 15 : 0)
+          + (cluster.revalidation_sets.has('contract') ? 30 : cluster.revalidation_sets.has('shared_module') ? 20 : cluster.revalidation_sets.has('semantic_object') ? 15 : 0)
           + (cluster.highest_affected_priority * 3)
+          + (cluster.dependent_files.size * 4)
+          + (cluster.dependent_areas.size * 2)
+          + cluster.module_paths.size
           + cluster.invalidations.length,
+        rerun_breadth_score: (cluster.dependent_files.size * 4) + (cluster.dependent_areas.size * 2) + cluster.module_paths.size,
         highest_affected_priority: cluster.highest_affected_priority,
         highest_source_priority: cluster.highest_source_priority,
         severity: cluster.severity,
         invalidations: cluster.invalidations,
         title: cluster.affected_pipeline_id
-          ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
-          : `${affectedTaskIds[0]} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
+          ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('shared_module') ? 'shared-module' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
+          : `${affectedTaskIds[0]} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('shared_module') ? 'shared-module' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
         detail: `${sourceTaskTitles[0] || cluster.invalidations[0]?.source_task_id || 'unknown source'} -> ${affectedWorktrees.join(', ') || 'unknown target'} (${staleAreas.join(', ')})`,
         next_step: cluster.revalidation_sets.has('contract')
           ? (cluster.affected_pipeline_id
             ? 'retry the stale pipeline tasks together so the affected contract can be revalidated before merge'
             : 'retry the stale task so the affected contract can be revalidated before merge')
+          : cluster.revalidation_sets.has('shared_module')
+            ? (cluster.affected_pipeline_id
+              ? 'retry the stale pipeline tasks together so dependent shared-module work can be revalidated before merge'
+              : 'retry the stale task so its shared-module dependency can be revalidated before merge')
           : cluster.affected_pipeline_id
             ? 'retry the stale pipeline tasks together so the whole cluster can be revalidated before merge'
             : 'retry the stale task so it can be revalidated before merge',
@@ -678,11 +712,48 @@ function buildStaleClusters(invalidations = []) {
           ? `switchman task retry-stale --pipeline ${cluster.affected_pipeline_id}`
           : `switchman task retry ${affectedTaskIds[0]}`,
       };
-    })
-    .sort((a, b) =>
+    });
+
+  const causeGroups = new Map();
+  for (const cluster of clusterEntries) {
+    const primary = cluster.invalidations[0] || {};
+    const details = primary.details || {};
+    const causeKey = cluster.revalidation_set_type === 'contract'
+      ? `contract:${(details.contract_names || []).join('|') || cluster.stale_areas.join('|')}|source:${cluster.source_task_ids.join('|') || 'unknown'}`
+      : cluster.revalidation_set_type === 'shared_module'
+        ? `shared_module:${(details.module_paths || cluster.module_paths || []).join('|') || cluster.stale_areas.join('|')}|source:${cluster.source_task_ids.join('|') || 'unknown'}`
+        : cluster.revalidation_set_type === 'semantic_object'
+          ? `semantic_object:${(details.object_names || []).join('|') || cluster.stale_areas.join('|')}|source:${cluster.source_task_ids.join('|') || 'unknown'}`
+          : `dependency:${cluster.stale_areas.join('|')}|source:${cluster.source_task_ids.join('|') || 'unknown'}`;
+    if (!causeGroups.has(causeKey)) causeGroups.set(causeKey, []);
+    causeGroups.get(causeKey).push(cluster);
+  }
+
+  for (const [causeKey, relatedClusters] of causeGroups.entries()) {
+    const relatedPipelines = [...new Set(relatedClusters.map((cluster) => cluster.affected_pipeline_id).filter(Boolean))];
+    const primary = relatedClusters[0];
+    const details = primary.invalidations[0]?.details || {};
+    const causeSummary = primary.revalidation_set_type === 'contract'
+      ? `shared contract drift in ${(details.contract_names || []).join(', ') || 'unknown contract'}`
+      : primary.revalidation_set_type === 'shared_module'
+        ? `shared module drift in ${(details.module_paths || primary.module_paths || []).join(', ') || 'unknown module'}`
+        : primary.revalidation_set_type === 'semantic_object'
+          ? `shared exported object drift in ${(details.object_names || []).join(', ') || 'unknown object'}`
+          : `shared dependency drift across ${primary.stale_areas.join(', ')}`;
+    for (let index = 0; index < relatedClusters.length; index += 1) {
+      relatedClusters[index].causal_group_id = `cause-${causeKey}`;
+      relatedClusters[index].causal_group_size = relatedClusters.length;
+      relatedClusters[index].causal_group_rank = index + 1;
+      relatedClusters[index].causal_group_summary = causeSummary;
+      relatedClusters[index].related_affected_pipelines = relatedPipelines;
+    }
+  }
+
+  return clusterEntries.sort((a, b) =>
       b.rerun_priority_score - a.rerun_priority_score
       || (a.severity === 'block' ? -1 : 1) - (b.severity === 'block' ? -1 : 1)
       || (a.revalidation_set_type === 'contract' ? -1 : 1) - (b.revalidation_set_type === 'contract' ? -1 : 1)
+      || (a.revalidation_set_type === 'shared_module' ? -1 : 1) - (b.revalidation_set_type === 'shared_module' ? -1 : 1)
       || b.invalidation_count - a.invalidation_count
       || String(a.affected_pipeline_id || a.affected_task_ids[0]).localeCompare(String(b.affected_pipeline_id || b.affected_task_ids[0])));
 }
@@ -758,13 +829,17 @@ function summarizePipelineAuditHistoryEvent(event, pipelineId) {
         next_action: defaultNextAction,
       };
     case 'dependency_invalidations_updated':
+      {
+        const reasonTypes = details.reason_types || [];
+        const revalidationSets = details.revalidation_sets || [];
       return {
         label: 'Stale work detected',
-        summary: `Marked stale work after ${details.source_task_title || details.source_task_id || 'an upstream task'} changed a shared boundary.`,
+        summary: `Marked stale work after ${details.source_task_title || details.source_task_id || 'an upstream task'} changed a shared boundary${revalidationSets.length > 0 ? ` across ${revalidationSets.join(', ')} revalidation` : reasonTypes.length > 0 ? ` across ${reasonTypes.join(', ')}` : ''}.`,
         next_action: details.affected_pipeline_id
           ? `switchman explain stale --pipeline ${details.affected_pipeline_id}`
           : defaultNextAction,
       };
+      }
     case 'boundary_validation_state':
       return {
         label: 'Boundary validation updated',
@@ -849,7 +924,7 @@ function summarizePipelineQueueHistoryEvent(item, event) {
     case 'merge_queue_enqueued':
       return {
         label: 'Queued for landing',
-        summary: `Queued ${item.id} to land ${item.source_ref} onto ${item.target_branch}.`,
+        summary: `Queued ${item.id} to land ${item.source_ref} onto ${item.target_branch}.${details.policy_override_summary ? ` ${details.policy_override_summary}` : ''}`,
         next_action: 'switchman queue status',
       };
     case 'merge_queue_started':
@@ -1839,7 +1914,7 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       ? 'warn'
       : 'healthy';
 
-  const repoPolicyState = summarizePipelinePolicyState({
+  const repoPolicyState = summarizePipelinePolicyState(db, {
     tasks,
     counts: {
       done: tasks.filter((task) => task.status === 'done').length,
@@ -2165,8 +2240,9 @@ function renderUnifiedStatusReport(report) {
     ? report.merge_readiness.stale_clusters.slice(0, 4).flatMap((cluster) => {
       const lines = [`${renderChip(cluster.severity === 'block' ? 'STALE' : 'WATCH', cluster.affected_pipeline_id || cluster.affected_task_ids[0], cluster.severity === 'block' ? chalk.red : chalk.yellow)} ${cluster.title}`];
       lines.push(`  ${chalk.dim(cluster.detail)}`);
+      if (cluster.causal_group_size > 1) lines.push(`  ${chalk.dim('cause:')} ${cluster.causal_group_summary} ${chalk.dim(`(${cluster.causal_group_rank}/${cluster.causal_group_size} in same stale wave)`)}${cluster.related_affected_pipelines?.length ? ` ${chalk.dim(`related:${cluster.related_affected_pipelines.join(', ')}`)}` : ''}`);
       lines.push(`  ${chalk.dim('areas:')} ${cluster.stale_areas.join(', ')}`);
-      lines.push(`  ${chalk.dim('rerun priority:')} ${cluster.rerun_priority} ${chalk.dim(`score:${cluster.rerun_priority_score}`)}${cluster.highest_affected_priority ? ` ${chalk.dim(`affected-priority:${cluster.highest_affected_priority}`)}` : ''}`);
+      lines.push(`  ${chalk.dim('rerun priority:')} ${cluster.rerun_priority} ${chalk.dim(`score:${cluster.rerun_priority_score}`)}${cluster.highest_affected_priority ? ` ${chalk.dim(`affected-priority:${cluster.highest_affected_priority}`)}` : ''}${cluster.rerun_breadth_score ? ` ${chalk.dim(`breadth:${cluster.rerun_breadth_score}`)}` : ''}`);
       lines.push(`  ${chalk.yellow('next:')} ${cluster.next_step}`);
       lines.push(`  ${chalk.cyan('run:')} ${cluster.command}`);
       return lines;
@@ -2178,10 +2254,14 @@ function renderUnifiedStatusReport(report) {
       `${renderChip(report.merge_readiness.policy_state.enforcement.toUpperCase(), report.merge_readiness.policy_state.domains.join(','), report.merge_readiness.policy_state.enforcement === 'blocked' ? chalk.red : chalk.yellow)} ${report.merge_readiness.policy_state.summary}`,
       `  ${chalk.dim('required:')} ${report.merge_readiness.policy_state.required_task_types.join(', ') || 'none'}`,
       `  ${chalk.dim('missing:')} ${report.merge_readiness.policy_state.missing_task_types.join(', ') || 'none'}`,
+      `  ${chalk.dim('overridden:')} ${report.merge_readiness.policy_state.overridden_task_types.join(', ') || 'none'}`,
       ...report.merge_readiness.policy_state.requirement_status
         .filter((requirement) => requirement.evidence.length > 0)
         .slice(0, 3)
         .map((requirement) => `  ${chalk.dim(`${requirement.task_type}:`)} ${requirement.evidence.map((entry) => entry.artifact_path ? `${entry.task_id} (${entry.artifact_path})` : entry.task_id).join(', ')}`),
+      ...report.merge_readiness.policy_state.overrides
+        .slice(0, 3)
+        .map((entry) => `  ${chalk.dim(`override ${entry.id}:`)} ${(entry.task_types || []).join(', ') || 'all'} by ${entry.approved_by || 'unknown'}`),
     ]
     : [chalk.green('No explicit change policy requirements are active.')];
 
@@ -2951,6 +3031,12 @@ Pipeline landing rule:
           targetBranch: opts.target,
           maxRetries: opts.maxRetries,
           submittedBy: opts.submittedBy || null,
+          eventDetails: policyGate.override_applied
+            ? {
+              policy_override_summary: policyGate.override_summary,
+              overridden_task_types: policyGate.policy_state?.overridden_task_types || [],
+            }
+            : null,
         };
       } else if (branch) {
         payload = {
@@ -2975,6 +3061,9 @@ Pipeline landing rule:
       console.log(`${chalk.green('✓')} Queued ${chalk.cyan(result.id)} for ${chalk.bold(result.target_branch)}`);
       console.log(`  ${chalk.dim('source:')} ${result.source_type} ${result.source_ref}`);
       if (result.source_worktree) console.log(`  ${chalk.dim('worktree:')} ${result.source_worktree}`);
+      if (payload.eventDetails?.policy_override_summary) {
+        console.log(`  ${chalk.dim('policy override:')} ${payload.eventDetails.policy_override_summary}`);
+      }
     } catch (err) {
       db.close();
       printErrorWithNext(err.message, 'switchman queue add --help');
@@ -3052,7 +3141,7 @@ What it helps you answer:
 
     const queueHealth = summary.counts.blocked > 0
       ? 'block'
-      : summary.counts.retrying > 0 || summary.counts.held > 0 || summary.counts.escalated > 0
+      : summary.counts.retrying > 0 || summary.counts.held > 0 || summary.counts.wave_blocked > 0 || summary.counts.escalated > 0
         ? 'warn'
         : 'healthy';
     const queueHealthColor = colorForHealth(queueHealth);
@@ -3069,6 +3158,7 @@ What it helps you answer:
       renderChip('queued', summary.counts.queued, summary.counts.queued > 0 ? chalk.yellow : chalk.green),
       renderChip('retrying', summary.counts.retrying, summary.counts.retrying > 0 ? chalk.yellow : chalk.green),
       renderChip('held', summary.counts.held, summary.counts.held > 0 ? chalk.yellow : chalk.green),
+      renderChip('wave blocked', summary.counts.wave_blocked, summary.counts.wave_blocked > 0 ? chalk.yellow : chalk.green),
       renderChip('escalated', summary.counts.escalated, summary.counts.escalated > 0 ? chalk.red : chalk.green),
       renderChip('blocked', summary.counts.blocked, summary.counts.blocked > 0 ? chalk.red : chalk.green),
       renderChip('merging', summary.counts.merging, summary.counts.merging > 0 ? chalk.blue : chalk.green),
@@ -3110,12 +3200,12 @@ What it helps you answer:
       })
       : [chalk.green('Nothing blocked.')];
 
-    const queueWatchLines = items.filter((item) => ['retrying', 'held', 'escalated', 'merging', 'rebasing', 'validating'].includes(item.status)).length > 0
+    const queueWatchLines = items.filter((item) => ['retrying', 'held', 'wave_blocked', 'escalated', 'merging', 'rebasing', 'validating'].includes(item.status)).length > 0
       ? items
-        .filter((item) => ['retrying', 'held', 'escalated', 'merging', 'rebasing', 'validating'].includes(item.status))
+        .filter((item) => ['retrying', 'held', 'wave_blocked', 'escalated', 'merging', 'rebasing', 'validating'].includes(item.status))
         .slice(0, 4)
         .flatMap((item) => {
-          const lines = [`${renderChip(item.status.toUpperCase(), item.id, item.status === 'retrying' || item.status === 'held' ? chalk.yellow : item.status === 'escalated' ? chalk.red : chalk.blue)} ${item.source_type}:${item.source_ref}`];
+          const lines = [`${renderChip(item.status.toUpperCase(), item.id, item.status === 'retrying' || item.status === 'held' || item.status === 'wave_blocked' ? chalk.yellow : item.status === 'escalated' ? chalk.red : chalk.blue)} ${item.source_type}:${item.source_ref}`];
           if (item.last_error_summary) lines.push(`  ${chalk.dim(item.last_error_summary)}`);
           if (item.next_action) lines.push(`  ${chalk.yellow('next:')} ${item.next_action}`);
           return lines;
@@ -3681,7 +3771,7 @@ Examples:
           last_recovery: null,
         };
       }
-      const policyState = summarizePipelinePolicyState(result, loadChangePolicy(repoRoot), []);
+      const policyState = summarizePipelinePolicyState(db, result, loadChangePolicy(repoRoot), []);
       db.close();
 
       if (opts.json) {
@@ -3786,10 +3876,14 @@ Examples:
           `  ${chalk.dim('required:')} ${policyState.required_task_types.join(', ') || 'none'}`,
           `  ${chalk.dim('satisfied:')} ${policyState.satisfied_task_types.join(', ') || 'none'}`,
           `  ${chalk.dim('missing:')} ${policyState.missing_task_types.join(', ') || 'none'}`,
+          `  ${chalk.dim('overridden:')} ${policyState.overridden_task_types.join(', ') || 'none'}`,
           ...policyState.requirement_status
             .filter((requirement) => requirement.evidence.length > 0)
             .slice(0, 4)
             .map((requirement) => `  ${chalk.dim(`${requirement.task_type}:`)} ${requirement.evidence.map((entry) => entry.artifact_path ? `${entry.task_id} (${entry.artifact_path})` : entry.task_id).join(', ')}`),
+          ...policyState.overrides
+            .slice(0, 3)
+            .map((entry) => `  ${chalk.dim(`override ${entry.id}:`)} ${(entry.task_types || []).join(', ') || 'all'} by ${entry.approved_by || 'unknown'}`),
         ]
         : [chalk.green('No explicit change policy requirements are active for this pipeline.')];
 
@@ -5199,8 +5293,9 @@ Examples:
       ? report.merge_readiness.stale_clusters.slice(0, 5).flatMap((cluster) => {
         const lines = [`${cluster.severity === 'block' ? renderChip('STALE', cluster.affected_pipeline_id || cluster.affected_task_ids[0], chalk.red) : renderChip('WATCH', cluster.affected_pipeline_id || cluster.affected_task_ids[0], chalk.yellow)} ${cluster.title}`];
         lines.push(`  ${chalk.dim(cluster.detail)}`);
+        if (cluster.causal_group_size > 1) lines.push(`  ${chalk.dim('cause:')} ${cluster.causal_group_summary} ${chalk.dim(`(${cluster.causal_group_rank}/${cluster.causal_group_size} in same stale wave)`)}${cluster.related_affected_pipelines?.length ? ` ${chalk.dim(`related:${cluster.related_affected_pipelines.join(', ')}`)}` : ''}`);
         lines.push(`  ${chalk.dim('areas:')} ${cluster.stale_areas.join(', ')}`);
-        lines.push(`  ${chalk.dim('rerun priority:')} ${cluster.rerun_priority} ${chalk.dim(`score:${cluster.rerun_priority_score}`)}${cluster.highest_affected_priority ? ` ${chalk.dim(`affected-priority:${cluster.highest_affected_priority}`)}` : ''}`);
+        lines.push(`  ${chalk.dim('rerun priority:')} ${cluster.rerun_priority} ${chalk.dim(`score:${cluster.rerun_priority_score}`)}${cluster.highest_affected_priority ? ` ${chalk.dim(`affected-priority:${cluster.highest_affected_priority}`)}` : ''}${cluster.rerun_breadth_score ? ` ${chalk.dim(`breadth:${cluster.rerun_breadth_score}`)}` : ''}`);
         lines.push(`  ${chalk.yellow('next:')} ${cluster.next_step}`);
         lines.push(`  ${chalk.cyan('run:')} ${cluster.command}`);
         return lines;
@@ -5873,6 +5968,104 @@ policyCmd
     for (const [domain, rule] of Object.entries(policy.domain_rules || {})) {
       console.log(`  ${chalk.cyan(domain)} ${chalk.dim(rule.enforcement)}`);
       console.log(`    ${chalk.dim('requires:')} ${(rule.required_completed_task_types || []).join(', ') || 'none'}`);
+    }
+  });
+
+policyCmd
+  .command('override <pipelineId>')
+  .description('Record a policy override for one pipeline requirement or task type')
+  .requiredOption('--task-types <types>', 'Comma-separated task types to override, e.g. tests,governance')
+  .requiredOption('--reason <text>', 'Why this override is being granted')
+  .option('--by <actor>', 'Who approved the override', 'operator')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const taskTypes = String(opts.taskTypes || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    if (taskTypes.length === 0) {
+      db.close();
+      printErrorWithNext('At least one task type is required for a policy override.', 'switchman policy override <pipelineId> --task-types tests --reason "why"');
+      process.exit(1);
+    }
+
+    const override = createPolicyOverride(db, {
+      pipelineId,
+      taskTypes,
+      requirementKeys: taskTypes.map((taskType) => `completed_task_type:${taskType}`),
+      reason: opts.reason,
+      approvedBy: opts.by || null,
+    });
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify({ override }, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.yellow('!')} Policy override ${chalk.cyan(override.id)} recorded for ${chalk.cyan(pipelineId)}`);
+    console.log(`  ${chalk.dim('task types:')} ${taskTypes.join(', ')}`);
+    console.log(`  ${chalk.dim('approved by:')} ${opts.by || 'operator'}`);
+    console.log(`  ${chalk.dim('reason:')} ${opts.reason}`);
+    console.log(`  ${chalk.dim('next:')} switchman pipeline status ${pipelineId}`);
+  });
+
+policyCmd
+  .command('revoke <overrideId>')
+  .description('Revoke a previously recorded policy override')
+  .option('--reason <text>', 'Why the override is being revoked')
+  .option('--by <actor>', 'Who revoked the override', 'operator')
+  .option('--json', 'Output raw JSON')
+  .action((overrideId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const override = revokePolicyOverride(db, overrideId, {
+      revokedBy: opts.by || null,
+      reason: opts.reason || null,
+    });
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify({ override }, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.green('✓')} Policy override ${chalk.cyan(override.id)} revoked`);
+    console.log(`  ${chalk.dim('pipeline:')} ${override.pipeline_id}`);
+    console.log(`  ${chalk.dim('revoked by:')} ${opts.by || 'operator'}`);
+    if (opts.reason) {
+      console.log(`  ${chalk.dim('reason:')} ${opts.reason}`);
+    }
+  });
+
+policyCmd
+  .command('list-overrides <pipelineId>')
+  .description('Show policy overrides recorded for a pipeline')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const overrides = listPolicyOverrides(db, { pipelineId, limit: 100 });
+    db.close();
+
+    if (opts.json) {
+      console.log(JSON.stringify({ pipeline_id: pipelineId, overrides }, null, 2));
+      return;
+    }
+
+    console.log(chalk.bold(`Policy overrides for ${pipelineId}`));
+    if (overrides.length === 0) {
+      console.log(`  ${chalk.green('No overrides recorded.')}`);
+      return;
+    }
+    for (const entry of overrides) {
+      console.log(`  ${chalk.cyan(entry.id)} ${chalk.dim(entry.status)}`);
+      console.log(`    ${chalk.dim('task types:')} ${(entry.task_types || []).join(', ') || 'none'}`);
+      console.log(`    ${chalk.dim('approved by:')} ${entry.approved_by || 'unknown'}`);
+      console.log(`    ${chalk.dim('reason:')} ${entry.reason}`);
     }
   });
 

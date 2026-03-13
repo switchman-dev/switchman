@@ -8,13 +8,13 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join, posix, resolve } from 'path';
 import { matchesPathPatterns } from './ignore.js';
-import { buildSemanticIndexForPath } from './semantic.js';
+import { buildModuleDependencyIndexForPath, buildSemanticIndexForPath, classifySubsystemsForPath, listTrackedFiles } from './semantic.js';
 
 const SWITCHMAN_DIR = '.switchman';
 const DB_FILE = 'switchman.db';
 const AUDIT_KEY_FILE = 'audit.key';
 const MIGRATION_STATE_FILE = 'migration-state.json';
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
 
 // How long (ms) a writer will wait for a lock before giving up.
 // 5 seconds is generous for a CLI tool with 3-10 concurrent agents.
@@ -500,6 +500,30 @@ function applySchemaVersion4(db) {
   `);
 }
 
+function applySchemaVersion5(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS policy_overrides (
+      id                TEXT PRIMARY KEY,
+      pipeline_id       TEXT NOT NULL,
+      requirement_keys  TEXT NOT NULL DEFAULT '[]',
+      task_types        TEXT NOT NULL DEFAULT '[]',
+      status            TEXT NOT NULL DEFAULT 'active',
+      reason            TEXT NOT NULL,
+      approved_by       TEXT,
+      details           TEXT,
+      created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+      revoked_at        TEXT,
+      revoked_by        TEXT,
+      revoked_reason    TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_policy_overrides_pipeline
+      ON policy_overrides(pipeline_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_policy_overrides_status
+      ON policy_overrides(status, created_at);
+  `);
+}
+
 function ensureSchemaMigrated(db) {
   const repoRoot = db.__switchmanRepoRoot;
   if (!repoRoot) {
@@ -544,6 +568,9 @@ function ensureSchemaMigrated(db) {
       }
       if (currentVersion < 4) {
         applySchemaVersion4(db);
+      }
+      if (currentVersion < 5) {
+        applySchemaVersion5(db);
       }
       setSchemaVersion(db, CURRENT_SCHEMA_VERSION);
     });
@@ -616,6 +643,18 @@ function taskSpecMatchesObject(taskSpec = null, object = null) {
   return subsystemTags.some((tag) => (object.subsystem_tags || []).includes(tag));
 }
 
+function taskSpecMatchesFilePath(taskSpec = null, filePath = null) {
+  if (!taskSpec || !filePath) return false;
+  const allowedPaths = Array.isArray(taskSpec.allowed_paths) ? taskSpec.allowed_paths.filter(Boolean) : [];
+  if (allowedPaths.length > 0 && matchesPathPatterns(filePath, allowedPaths)) {
+    return true;
+  }
+
+  const subsystemTags = Array.isArray(taskSpec.subsystem_tags) ? taskSpec.subsystem_tags.filter(Boolean) : [];
+  const fileSubsystems = classifySubsystemsForPath(filePath);
+  return subsystemTags.some((tag) => fileSubsystems.includes(tag));
+}
+
 function buildSemanticDependencyOverlap(db, sourceSpec, affectedSpec, changedFiles = []) {
   const repoRoot = db.__switchmanRepoRoot;
   if (!repoRoot || !sourceSpec || !affectedSpec || changedFiles.length === 0) {
@@ -627,18 +666,48 @@ function buildSemanticDependencyOverlap(db, sourceSpec, affectedSpec, changedFil
     changedFiles.includes(object.file_path)
     && taskSpecMatchesObject(sourceSpec, object),
   );
-  if (sourceObjects.length === 0) return [];
-
-  const affectedObjects = changedObjects.filter((object) => taskSpecMatchesObject(affectedSpec, object));
+  const trackedSourceFiles = listTrackedFiles(repoRoot, { sourceOnly: true });
+  const semanticCandidateFiles = [...new Set([...trackedSourceFiles, ...changedFiles])];
+  const affectedObjects = buildSemanticIndexForPath(repoRoot, semanticCandidateFiles).objects
+    .filter((object) => taskSpecMatchesObject(affectedSpec, object));
   const affectedKeys = new Set(affectedObjects.map((object) => `${object.kind}:${object.name}`));
-  return sourceObjects
+  const overlaps = sourceObjects
     .filter((object) => affectedKeys.has(`${object.kind}:${object.name}`))
     .map((object) => ({
+      overlap_type: ['interface', 'type'].includes(object.kind) ? 'contract' : 'exported_object',
       kind: object.kind,
       name: object.name,
       file_path: object.file_path,
       area: object.area || null,
     }));
+
+  const sourceChangedFiles = changedFiles.filter((filePath) => taskSpecMatchesFilePath(sourceSpec, filePath));
+  if (sourceChangedFiles.length === 0) return overlaps;
+
+  const moduleDependencies = buildModuleDependencyIndexForPath(repoRoot, { filePaths: semanticCandidateFiles }).dependencies || [];
+  const sharedModuleDependents = moduleDependencies.filter((dependency) =>
+    sourceChangedFiles.includes(dependency.imported_path)
+    && taskSpecMatchesFilePath(affectedSpec, dependency.file_path)
+    && !sourceChangedFiles.includes(dependency.file_path)
+  );
+  const dependentFiles = [...new Set(sharedModuleDependents.map((item) => item.file_path))];
+  const sharedModulePaths = [...new Set(sharedModuleDependents.map((item) => item.imported_path))];
+
+  if (dependentFiles.length > 0) {
+    overlaps.push({
+      overlap_type: 'shared_module',
+      kind: 'module',
+      name: sharedModulePaths[0],
+      file_path: sharedModulePaths[0],
+      area: sharedModuleDependents[0]?.area || null,
+      dependent_files: dependentFiles,
+      module_paths: sharedModulePaths,
+      subsystem_tags: [...new Set(sharedModuleDependents.flatMap((item) => item.subsystem_tags || []))],
+      dependent_areas: [...new Set(sharedModuleDependents.map((item) => item.area).filter(Boolean))],
+    });
+  }
+
+  return overlaps;
 }
 
 function buildLeaseScopeReservations(lease, taskSpec) {
@@ -1179,8 +1248,9 @@ function syncDependencyInvalidationsForLeaseTx(db, leaseId, source = 'write', co
       });
     }
 
-    const semanticContractOverlap = semanticOverlap.filter((item) => ['interface', 'type'].includes(item.kind));
-    const semanticObjectOverlap = semanticOverlap.filter((item) => !['interface', 'type'].includes(item.kind));
+    const semanticContractOverlap = semanticOverlap.filter((item) => item.overlap_type === 'contract');
+    const semanticObjectOverlap = semanticOverlap.filter((item) => item.overlap_type === 'exported_object');
+    const sharedModuleOverlap = semanticOverlap.filter((item) => item.overlap_type === 'shared_module');
 
     if (semanticContractOverlap.length > 0) {
       desired.push({
@@ -1235,6 +1305,36 @@ function syncDependencyInvalidationsForLeaseTx(db, leaseId, source = 'write', co
           object_kinds: [...new Set(semanticObjectOverlap.map((item) => item.kind))],
           object_files: [...new Set(semanticObjectOverlap.map((item) => item.file_path))],
           revalidation_set: 'semantic_object',
+          severity: 'warn',
+        },
+      });
+    }
+
+    if (sharedModuleOverlap.length > 0) {
+      desired.push({
+        source_lease_id: leaseId,
+        source_task_id: sourceTask.id,
+        source_pipeline_id: sourcePipelineId,
+        source_worktree: sourceWorktree,
+        affected_task_id: affectedTask.id,
+        affected_pipeline_id: affectedSpec.pipeline_id || null,
+        affected_worktree: affectedWorktree,
+        status: 'stale',
+        reason_type: 'shared_module_drift',
+        subsystem_tag: null,
+        source_scope_pattern: null,
+        affected_scope_pattern: null,
+        details: {
+          source,
+          source_task_title: sourceTask.title,
+          affected_task_title: affectedTask.title,
+          source_task_priority: Number(sourceTask.priority || 0),
+          affected_task_priority: Number(affectedTask.priority || 0),
+          module_paths: [...new Set(sharedModuleOverlap.flatMap((item) => item.module_paths || [item.file_path]).filter(Boolean))],
+          dependent_files: [...new Set(sharedModuleOverlap.flatMap((item) => item.dependent_files || []))],
+          dependent_areas: [...new Set(sharedModuleOverlap.flatMap((item) => item.dependent_areas || []).filter(Boolean))],
+          dependent_subsystems: [...new Set(sharedModuleOverlap.flatMap((item) => item.subsystem_tags || []).filter(Boolean))],
+          revalidation_set: 'shared_module',
           severity: 'warn',
         },
       });
@@ -1703,6 +1803,7 @@ export function enqueueMergeItem(db, {
   targetBranch = 'main',
   maxRetries = 1,
   submittedBy = null,
+  eventDetails = null,
 } = {}) {
   const itemId = id || makeId('mq');
   db.prepare(`
@@ -1731,6 +1832,7 @@ export function enqueueMergeItem(db, {
       source_worktree: sourceWorktree || null,
       source_pipeline_id: sourcePipelineId || null,
       target_branch: targetBranch || 'main',
+      ...(eventDetails || {}),
     }),
   });
 
@@ -1891,6 +1993,170 @@ export function listTempResources(db, {
   `).all(...params, limit);
 }
 
+export function getPolicyOverride(db, overrideId) {
+  const entry = db.prepare(`
+    SELECT *
+    FROM policy_overrides
+    WHERE id=?
+  `).get(overrideId);
+  if (!entry) return null;
+  return {
+    ...entry,
+    requirement_keys: (() => {
+      try {
+        return JSON.parse(entry.requirement_keys || '[]');
+      } catch {
+        return [];
+      }
+    })(),
+    task_types: (() => {
+      try {
+        return JSON.parse(entry.task_types || '[]');
+      } catch {
+        return [];
+      }
+    })(),
+    details: (() => {
+      try {
+        return entry.details ? JSON.parse(entry.details) : null;
+      } catch {
+        return null;
+      }
+    })(),
+  };
+}
+
+export function listPolicyOverrides(db, {
+  pipelineId = null,
+  status = null,
+  limit = 100,
+} = {}) {
+  const clauses = [];
+  const params = [];
+  if (pipelineId) {
+    clauses.push('pipeline_id=?');
+    params.push(pipelineId);
+  }
+  if (status) {
+    clauses.push('status=?');
+    params.push(status);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`
+    SELECT *
+    FROM policy_overrides
+    ${where}
+    ORDER BY datetime(created_at) DESC, id DESC
+    LIMIT ?
+  `).all(...params, limit).map((entry) => ({
+    ...entry,
+    requirement_keys: (() => {
+      try {
+        return JSON.parse(entry.requirement_keys || '[]');
+      } catch {
+        return [];
+      }
+    })(),
+    task_types: (() => {
+      try {
+        return JSON.parse(entry.task_types || '[]');
+      } catch {
+        return [];
+      }
+    })(),
+    details: (() => {
+      try {
+        return entry.details ? JSON.parse(entry.details) : null;
+      } catch {
+        return null;
+      }
+    })(),
+  }));
+}
+
+export function createPolicyOverride(db, {
+  pipelineId,
+  requirementKeys = [],
+  taskTypes = [],
+  reason,
+  approvedBy = null,
+  details = null,
+} = {}) {
+  if (!pipelineId) throw new Error('pipelineId is required for a policy override.');
+  if (!reason || !String(reason).trim()) throw new Error('A policy override reason is required.');
+
+  const overrideId = makeId('po');
+  const normalizedRequirementKeys = [...new Set((requirementKeys || []).map((value) => String(value || '').trim()).filter(Boolean))];
+  const normalizedTaskTypes = [...new Set((taskTypes || []).map((value) => String(value || '').trim()).filter(Boolean))];
+
+  return withImmediateTransaction(db, () => {
+    db.prepare(`
+      INSERT INTO policy_overrides (
+        id, pipeline_id, requirement_keys, task_types, status, reason, approved_by, details
+      )
+      VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+    `).run(
+      overrideId,
+      pipelineId,
+      JSON.stringify(normalizedRequirementKeys),
+      JSON.stringify(normalizedTaskTypes),
+      String(reason).trim(),
+      approvedBy || null,
+      details == null ? null : JSON.stringify(details),
+    );
+    logAuditEventTx(db, {
+      eventType: 'policy_override_created',
+      status: 'warn',
+      reasonCode: 'policy_override',
+      details: JSON.stringify({
+        override_id: overrideId,
+        pipeline_id: pipelineId,
+        requirement_keys: normalizedRequirementKeys,
+        task_types: normalizedTaskTypes,
+        reason: String(reason).trim(),
+        approved_by: approvedBy || null,
+        details: details || null,
+      }),
+    });
+    return getPolicyOverride(db, overrideId);
+  });
+}
+
+export function revokePolicyOverride(db, overrideId, {
+  revokedBy = null,
+  reason = null,
+} = {}) {
+  return withImmediateTransaction(db, () => {
+    const existing = getPolicyOverride(db, overrideId);
+    if (!existing) {
+      throw new Error(`Policy override ${overrideId} does not exist.`);
+    }
+    if (existing.status !== 'active') {
+      return existing;
+    }
+    db.prepare(`
+      UPDATE policy_overrides
+      SET status='revoked',
+          revoked_at=datetime('now'),
+          revoked_by=?,
+          revoked_reason=?
+      WHERE id=?
+    `).run(revokedBy || null, reason || null, overrideId);
+    logAuditEventTx(db, {
+      eventType: 'policy_override_revoked',
+      status: 'info',
+      reasonCode: 'policy_override_revoked',
+      details: JSON.stringify({
+        override_id: overrideId,
+        pipeline_id: existing.pipeline_id,
+        revoked_by: revokedBy || null,
+        revoked_reason: reason || null,
+      }),
+    });
+    return getPolicyOverride(db, overrideId);
+  });
+}
+
 export function createTempResource(db, {
   id = null,
   scopeType,
@@ -1962,7 +2228,7 @@ export function updateTempResource(db, resourceId, {
 export function startMergeQueueItem(db, itemId) {
   return withImmediateTransaction(db, () => {
     const item = getMergeQueueItem(db, itemId);
-    if (!item || !['queued', 'retrying', 'held', 'escalated'].includes(item.status)) {
+    if (!item || !['queued', 'retrying', 'held', 'wave_blocked', 'escalated'].includes(item.status)) {
       return null;
     }
 
@@ -1972,7 +2238,7 @@ export function startMergeQueueItem(db, itemId) {
           started_at=COALESCE(started_at, datetime('now')),
           last_attempt_at=datetime('now'),
           updated_at=datetime('now')
-      WHERE id=? AND status IN ('queued', 'retrying', 'held', 'escalated')
+      WHERE id=? AND status IN ('queued', 'retrying', 'held', 'wave_blocked', 'escalated')
     `).run(itemId);
 
     logMergeQueueEvent(db, itemId, {
@@ -2046,7 +2312,7 @@ export function markMergeQueueState(db, itemId, {
 
 export function retryMergeQueueItem(db, itemId) {
   const item = getMergeQueueItem(db, itemId);
-  if (!item || !['blocked', 'failed', 'held', 'escalated', 'retrying'].includes(item.status)) {
+  if (!item || !['blocked', 'failed', 'held', 'wave_blocked', 'escalated', 'retrying'].includes(item.status)) {
     return null;
   }
 

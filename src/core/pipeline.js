@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { basename, join } from 'path';
 
-import { completeLeaseTask, createTask, createTempResource, failLeaseTask, finishOperationJournalEntry, getTaskSpec, listAuditEvents, listBoundaryValidationStates, listDependencyInvalidations, listLeases, listMergeQueue, listTasks, listTempResources, listWorktrees, logAuditEvent, retryTask, startOperationJournalEntry, startTaskLease, updateTempResource, upsertTaskSpec } from './db.js';
+import { completeLeaseTask, createTask, createTempResource, failLeaseTask, finishOperationJournalEntry, getTaskSpec, listAuditEvents, listBoundaryValidationStates, listDependencyInvalidations, listLeases, listMergeQueue, listPolicyOverrides, listTasks, listTempResources, listWorktrees, logAuditEvent, retryTask, startOperationJournalEntry, startTaskLease, updateTempResource, upsertTaskSpec } from './db.js';
 import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
@@ -82,6 +82,8 @@ function buildPipelineTrustAudit(db, pipelineId, { limit = 8 } = {}) {
     'boundary_validation_state',
     'dependency_invalidations_updated',
     'pipeline_followups_created',
+    'policy_override_created',
+    'policy_override_revoked',
     'task_retried',
     'pipeline_task_retry_scheduled',
   ]);
@@ -114,16 +116,25 @@ function buildPipelineTrustAudit(db, pipelineId, { limit = 8 } = {}) {
         };
       }
       case 'dependency_invalidations_updated':
+        {
+          const reasonTypes = details.reason_types || [];
+          const revalidationSets = details.revalidation_sets || [];
+          const reasonSummary = revalidationSets.length > 0
+            ? ` across ${revalidationSets.join(', ')} revalidation`
+            : reasonTypes.length > 0
+              ? ` across ${reasonTypes.join(', ')}`
+              : '';
         return {
           category: 'stale',
           created_at: event.created_at,
           event_type: event.event_type,
           status: event.status,
           reason_code: event.reason_code || null,
-          summary: `A shared change marked ${details.stale_count || 0} dependent task${details.stale_count === 1 ? '' : 's'} stale.`,
+          summary: `A shared change marked ${details.stale_count || 0} dependent task${details.stale_count === 1 ? '' : 's'} stale${reasonSummary}.`,
           affected_task_ids: details.affected_task_ids || [],
           next_action: `switchman explain stale --pipeline ${pipelineId}`,
         };
+        }
       case 'pipeline_followups_created':
         return {
           category: 'remediation',
@@ -136,6 +147,26 @@ function buildPipelineTrustAudit(db, pipelineId, { limit = 8 } = {}) {
             : 'No new follow-up tasks were needed after review.',
           created_count: details.created_count || 0,
           next_action: details.created_count > 0 ? `switchman pipeline status ${pipelineId}` : `switchman pipeline status ${pipelineId}`,
+        };
+      case 'policy_override_created':
+        return {
+          category: 'policy',
+          created_at: event.created_at,
+          event_type: event.event_type,
+          status: event.status,
+          reason_code: event.reason_code || null,
+          summary: `Policy override ${details.override_id || 'unknown'} was approved${details.task_types?.length ? ` for ${details.task_types.join(', ')}` : ''}${details.reason ? `: ${details.reason}` : ''}.`,
+          next_action: `switchman pipeline status ${pipelineId}`,
+        };
+      case 'policy_override_revoked':
+        return {
+          category: 'policy',
+          created_at: event.created_at,
+          event_type: event.event_type,
+          status: event.status,
+          reason_code: event.reason_code || null,
+          summary: `Policy override ${details.override_id || 'unknown'} was revoked${details.revoked_reason ? `: ${details.revoked_reason}` : ''}.`,
+          next_action: `switchman pipeline status ${pipelineId}`,
         };
       case 'task_retried':
       case 'pipeline_task_retry_scheduled':
@@ -174,7 +205,20 @@ function buildPipelineTrustAudit(db, pipelineId, { limit = 8 } = {}) {
       next_action: cluster.next_action,
     }));
 
-  return [...mappedEvents, ...staleClusterEntries]
+  const staleWaveEntries = summarizeStaleCausalWaves(
+    buildStaleClusters(listDependencyInvalidations(db, { pipelineId }), { pipelineId }),
+  ).map((wave) => ({
+    category: 'stale',
+    created_at: null,
+    event_type: 'stale_wave_active',
+    status: 'warn',
+    reason_code: 'dependent_work_stale',
+    summary: `${wave.summary}. Affects ${wave.affected_pipeline_ids.join(', ') || 'unknown'} across ${wave.cluster_count} stale cluster${wave.cluster_count === 1 ? '' : 's'}.`,
+    affected_pipeline_ids: wave.affected_pipeline_ids,
+    next_action: `switchman explain stale --pipeline ${pipelineId}`,
+  }));
+
+  return [...mappedEvents, ...staleWaveEntries, ...staleClusterEntries]
     .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
     .slice(0, limit);
 }
@@ -242,6 +286,48 @@ function buildPipelinePolicySatisfactionHistory(policyState) {
     .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
 }
 
+function buildPipelinePolicyOverrideState(db, pipelineId, requiredTaskTypes = []) {
+  if (!db || !pipelineId) {
+    return {
+      active_overrides: [],
+      active_task_types: [],
+      active_requirement_keys: [],
+      override_history: [],
+    };
+  }
+
+  const overrides = listPolicyOverrides(db, { pipelineId, limit: 200 });
+  const activeOverrides = overrides.filter((entry) => entry.status === 'active');
+  const activeTaskTypes = uniq(activeOverrides.flatMap((entry) => entry.task_types || []));
+  const activeRequirementKeys = uniq(activeOverrides.flatMap((entry) => entry.requirement_keys || []));
+
+  const overrideHistory = overrides.map((entry) => ({
+    category: 'policy',
+    created_at: entry.status === 'active' ? entry.created_at : (entry.revoked_at || entry.created_at),
+    event_type: entry.status === 'active' ? 'policy_override_active' : 'policy_override_revoked',
+    status: entry.status === 'active' ? 'warn' : 'info',
+    reason_code: entry.status === 'active' ? 'policy_override' : 'policy_override_revoked',
+    override_id: entry.id,
+    task_types: entry.task_types || [],
+    requirement_keys: entry.requirement_keys || [],
+    approved_by: entry.approved_by || null,
+    summary: entry.status === 'active'
+      ? `Policy override ${entry.id} allows ${entry.task_types?.join(', ') || 'governed requirements'} for pipeline ${pipelineId}.`
+      : `Policy override ${entry.id} was revoked${entry.revoked_reason ? `: ${entry.revoked_reason}` : ''}.`,
+    next_action: `switchman pipeline status ${pipelineId}`,
+  }));
+
+  const missingButOverridden = requiredTaskTypes.filter((taskType) => activeTaskTypes.includes(taskType));
+
+  return {
+    active_overrides: activeOverrides,
+    active_task_types: activeTaskTypes,
+    active_requirement_keys: activeRequirementKeys,
+    missing_but_overridden: missingButOverridden,
+    override_history: overrideHistory,
+  };
+}
+
 function withTaskSpec(db, task) {
   return {
     ...task,
@@ -265,22 +351,27 @@ function normalizeDependencyInvalidation(item) {
   const details = item.details || {};
   const objectNames = Array.isArray(details.object_names) ? details.object_names : [];
   const contractNames = Array.isArray(details.contract_names) ? details.contract_names : [];
+  const modulePaths = Array.isArray(details.module_paths) ? details.module_paths : [];
   return {
     ...item,
-    severity: item.severity || details.severity || (item.reason_type === 'semantic_contract_drift' ? 'blocked' : item.reason_type === 'semantic_object_overlap' ? 'warn' : 'warn'),
+    severity: item.severity || details.severity || (item.reason_type === 'semantic_contract_drift' ? 'blocked' : 'warn'),
     details,
-    revalidation_set: details.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
+    revalidation_set: details.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'shared_module_drift' ? 'shared_module' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
     stale_area: item.reason_type === 'subsystem_overlap'
       ? `subsystem:${item.subsystem_tag}`
       : item.reason_type === 'semantic_contract_drift'
         ? `contract:${contractNames.join('|') || 'unknown'}`
       : item.reason_type === 'semantic_object_overlap'
         ? `object:${objectNames.join('|') || 'unknown'}`
+      : item.reason_type === 'shared_module_drift'
+        ? `module:${modulePaths.join('|') || 'unknown'}`
       : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
     summary: item.reason_type === 'semantic_contract_drift'
       ? `${details?.source_task_title || item.source_task_id} changed shared contract ${contractNames.join(', ') || 'unknown'}`
       : item.reason_type === 'semantic_object_overlap'
       ? `${details?.source_task_title || item.source_task_id} changed shared exported object ${objectNames.join(', ') || 'unknown'}`
+      : item.reason_type === 'shared_module_drift'
+        ? `${details?.source_task_title || item.source_task_id} changed shared module ${modulePaths.join(', ') || 'unknown'} used by ${(details.dependent_files || []).join(', ') || item.affected_task_id}`
       : `${details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
   };
 }
@@ -301,6 +392,9 @@ function buildStaleClusters(invalidations = [], { pipelineId = null } = {}) {
         source_worktrees: new Set(),
         stale_areas: new Set(),
         revalidation_sets: new Set(),
+        dependent_files: new Set(),
+        dependent_areas: new Set(),
+        module_paths: new Set(),
         invalidations: [],
         severity: 'warn',
         highest_affected_priority: 0,
@@ -314,22 +408,32 @@ function buildStaleClusters(invalidations = [], { pipelineId = null } = {}) {
     if (invalidation.source_worktree) cluster.source_worktrees.add(invalidation.source_worktree);
     cluster.stale_areas.add(invalidation.stale_area);
     if (invalidation.revalidation_set) cluster.revalidation_sets.add(invalidation.revalidation_set);
+    for (const filePath of invalidation.details?.dependent_files || []) cluster.dependent_files.add(filePath);
+    for (const area of invalidation.details?.dependent_areas || []) cluster.dependent_areas.add(area);
+    for (const modulePath of invalidation.details?.module_paths || []) cluster.module_paths.add(modulePath);
     if (invalidation.severity === 'blocked') cluster.severity = 'block';
     cluster.highest_affected_priority = Math.max(cluster.highest_affected_priority, Number(invalidation.details?.affected_task_priority || 0));
     cluster.highest_source_priority = Math.max(cluster.highest_source_priority, Number(invalidation.details?.source_task_priority || 0));
   }
 
-  return [...clusters.values()].map((cluster) => ({
+  const clusterEntries = [...clusters.values()].map((cluster) => ({
     key: cluster.key,
     affected_pipeline_id: cluster.affected_pipeline_id,
     affected_task_ids: [...cluster.affected_task_ids],
     invalidation_count: cluster.invalidations.length,
+    source_task_ids: [...new Set(cluster.invalidations.map((item) => item.source_task_id).filter(Boolean))],
+    source_pipeline_ids: [...new Set(cluster.invalidations.map((item) => item.source_pipeline_id).filter(Boolean))],
     source_task_titles: [...cluster.source_task_titles],
     source_worktrees: [...cluster.source_worktrees],
     stale_areas: [...cluster.stale_areas],
     revalidation_sets: [...cluster.revalidation_sets],
+    dependent_files: [...cluster.dependent_files],
+    dependent_areas: [...cluster.dependent_areas],
+    module_paths: [...cluster.module_paths],
     revalidation_set_type: cluster.revalidation_sets.has('contract')
       ? 'contract'
+      : cluster.revalidation_sets.has('shared_module')
+        ? 'shared_module'
       : cluster.revalidation_sets.has('semantic_object')
         ? 'semantic_object'
         : cluster.revalidation_sets.has('subsystem')
@@ -337,34 +441,141 @@ function buildStaleClusters(invalidations = [], { pipelineId = null } = {}) {
           : 'scope',
     rerun_priority: cluster.severity === 'block'
       ? (cluster.revalidation_sets.has('contract') || cluster.highest_affected_priority >= 8 ? 'urgent' : 'high')
+      : cluster.revalidation_sets.has('shared_module') && cluster.dependent_files.size >= 3
+        ? 'high'
       : cluster.highest_affected_priority >= 8
         ? 'high'
         : cluster.highest_affected_priority >= 5
           ? 'medium'
           : 'low',
     rerun_priority_score: (cluster.severity === 'block' ? 100 : 0)
-      + (cluster.revalidation_sets.has('contract') ? 30 : cluster.revalidation_sets.has('semantic_object') ? 15 : 0)
+      + (cluster.revalidation_sets.has('contract') ? 30 : cluster.revalidation_sets.has('shared_module') ? 20 : cluster.revalidation_sets.has('semantic_object') ? 15 : 0)
       + (cluster.highest_affected_priority * 3)
+      + (cluster.dependent_files.size * 4)
+      + (cluster.dependent_areas.size * 2)
+      + cluster.module_paths.size
       + cluster.invalidations.length,
+    rerun_breadth_score: (cluster.dependent_files.size * 4) + (cluster.dependent_areas.size * 2) + cluster.module_paths.size,
     highest_affected_priority: cluster.highest_affected_priority,
     highest_source_priority: cluster.highest_source_priority,
     severity: cluster.severity,
     invalidations: cluster.invalidations,
     title: cluster.affected_pipeline_id
-      ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
-      : `${[...cluster.affected_task_ids][0]} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
+      ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('shared_module') ? 'shared-module' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
+      : `${[...cluster.affected_task_ids][0]} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('shared_module') ? 'shared-module' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
     detail: `${[...cluster.source_task_titles][0] || cluster.invalidations[0]?.source_task_id || 'unknown source'} (${[...cluster.stale_areas].join(', ')})`,
     next_action: cluster.affected_pipeline_id
       ? `switchman task retry-stale --pipeline ${cluster.affected_pipeline_id}`
       : `switchman task retry ${[...cluster.affected_task_ids][0]}`,
-  })).sort((a, b) =>
+  }));
+
+  const causeGroups = new Map();
+  for (const cluster of clusterEntries) {
+    const primary = cluster.invalidations[0] || {};
+    const details = primary.details || {};
+    const causeKey = cluster.revalidation_set_type === 'contract'
+      ? `contract:${(details.contract_names || []).join('|') || cluster.stale_areas.join('|')}|source:${cluster.source_task_ids.join('|') || 'unknown'}`
+      : cluster.revalidation_set_type === 'shared_module'
+        ? `shared_module:${(details.module_paths || cluster.module_paths || []).join('|') || cluster.stale_areas.join('|')}|source:${cluster.source_task_ids.join('|') || 'unknown'}`
+        : cluster.revalidation_set_type === 'semantic_object'
+          ? `semantic_object:${(details.object_names || []).join('|') || cluster.stale_areas.join('|')}|source:${cluster.source_task_ids.join('|') || 'unknown'}`
+          : `dependency:${cluster.stale_areas.join('|')}|source:${cluster.source_task_ids.join('|') || 'unknown'}`;
+    if (!causeGroups.has(causeKey)) causeGroups.set(causeKey, []);
+    causeGroups.get(causeKey).push(cluster);
+  }
+
+  for (const [causeKey, relatedClusters] of causeGroups.entries()) {
+    const relatedPipelines = [...new Set(relatedClusters.map((cluster) => cluster.affected_pipeline_id).filter(Boolean))];
+    const primary = relatedClusters[0];
+    const details = primary.invalidations[0]?.details || {};
+    const causeSummary = primary.revalidation_set_type === 'contract'
+      ? `shared contract drift in ${(details.contract_names || []).join(', ') || 'unknown contract'}`
+      : primary.revalidation_set_type === 'shared_module'
+        ? `shared module drift in ${(details.module_paths || primary.module_paths || []).join(', ') || 'unknown module'}`
+        : primary.revalidation_set_type === 'semantic_object'
+          ? `shared exported object drift in ${(details.object_names || []).join(', ') || 'unknown object'}`
+          : `shared dependency drift across ${primary.stale_areas.join(', ')}`;
+    for (let index = 0; index < relatedClusters.length; index += 1) {
+      relatedClusters[index].causal_group_id = `cause-${causeKey}`;
+      relatedClusters[index].causal_group_size = relatedClusters.length;
+      relatedClusters[index].causal_group_rank = index + 1;
+      relatedClusters[index].causal_group_summary = causeSummary;
+      relatedClusters[index].related_affected_pipelines = relatedPipelines;
+    }
+  }
+
+  return clusterEntries.sort((a, b) =>
     b.rerun_priority_score - a.rerun_priority_score
     || (a.severity === 'block' ? -1 : 1) - (b.severity === 'block' ? -1 : 1)
     || (a.revalidation_set_type === 'contract' ? -1 : 1) - (b.revalidation_set_type === 'contract' ? -1 : 1)
+    || (a.revalidation_set_type === 'shared_module' ? -1 : 1) - (b.revalidation_set_type === 'shared_module' ? -1 : 1)
     || b.invalidation_count - a.invalidation_count);
 }
 
-export function summarizePipelinePolicyState(status, changePolicy, boundaryValidations = []) {
+export function summarizeStaleCausalWaves(staleClusters = []) {
+  const grouped = new Map();
+  for (const cluster of staleClusters) {
+    if (!cluster.causal_group_id) continue;
+    if (!grouped.has(cluster.causal_group_id)) {
+      grouped.set(cluster.causal_group_id, {
+        causal_group_id: cluster.causal_group_id,
+        summary: cluster.causal_group_summary || cluster.title,
+        revalidation_set_type: cluster.revalidation_set_type,
+        source_task_ids: [...(cluster.source_task_ids || [])],
+        source_pipeline_ids: [...(cluster.source_pipeline_ids || [])],
+        related_affected_pipelines: new Set(cluster.related_affected_pipelines || []),
+        affected_pipeline_ids: new Set(),
+        cluster_count: 0,
+        invalidation_count: 0,
+        highest_rerun_priority_score: 0,
+      });
+    }
+    const entry = grouped.get(cluster.causal_group_id);
+    if (cluster.affected_pipeline_id) entry.affected_pipeline_ids.add(cluster.affected_pipeline_id);
+    for (const pipelineId of cluster.related_affected_pipelines || []) entry.related_affected_pipelines.add(pipelineId);
+    entry.cluster_count += 1;
+    entry.invalidation_count += cluster.invalidation_count || 0;
+    entry.highest_rerun_priority_score = Math.max(entry.highest_rerun_priority_score, cluster.rerun_priority_score || 0);
+  }
+
+  return [...grouped.values()]
+    .map((entry) => ({
+      ...entry,
+      affected_pipeline_ids: [...entry.affected_pipeline_ids],
+      related_affected_pipelines: [...entry.related_affected_pipelines],
+    }))
+    .sort((a, b) =>
+      b.highest_rerun_priority_score - a.highest_rerun_priority_score
+      || b.cluster_count - a.cluster_count
+      || b.invalidation_count - a.invalidation_count
+      || String(a.summary).localeCompare(String(b.summary)));
+}
+
+export function getPipelineStaleWaveContext(db, pipelineId) {
+  if (!pipelineId) {
+    return {
+      stale_clusters: [],
+      stale_causal_waves: [],
+      shared_wave_count: 0,
+      largest_wave_size: 0,
+      primary_wave: null,
+    };
+  }
+
+  const staleClusters = buildStaleClusters(listDependencyInvalidations(db), {});
+  const staleCausalWaves = summarizeStaleCausalWaves(staleClusters)
+    .filter((wave) => wave.affected_pipeline_ids.includes(pipelineId));
+
+  return {
+    stale_clusters: staleClusters.filter((cluster) => cluster.affected_pipeline_id === pipelineId),
+    stale_causal_waves: staleCausalWaves,
+    shared_wave_count: staleCausalWaves.length,
+    largest_wave_size: staleCausalWaves.reduce((max, wave) => Math.max(max, Number(wave.cluster_count || 0)), 0),
+    primary_wave: staleCausalWaves[0] || null,
+  };
+}
+
+export function summarizePipelinePolicyState(db, status, changePolicy, boundaryValidations = []) {
   const tasks = status.tasks || [];
   const implementationTasks = tasks.filter((task) => task.task_spec?.task_type === 'implementation');
   const completedTasks = tasks.filter((task) => task.status === 'done' && task.task_spec?.task_type);
@@ -396,10 +607,13 @@ export function summarizePipelinePolicyState(status, changePolicy, boundaryValid
     ...implementationTasks.flatMap((task) => task.task_spec?.validation_rules?.required_completed_task_types || []),
     ...activeRules.flatMap((rule) => rule.required_completed_task_types || []),
   ]);
-  const missingTaskTypes = uniq([
+  const rawMissingTaskTypes = uniq([
     ...boundaryValidations.flatMap((validation) => validation.missing_task_types || []),
     ...requiredTaskTypes.filter((taskType) => !completedTaskTypes.has(taskType)),
   ]);
+  const overrideState = buildPipelinePolicyOverrideState(db, status.pipeline_id, rawMissingTaskTypes);
+  const missingTaskTypes = rawMissingTaskTypes.filter((taskType) => !overrideState.active_task_types.includes(taskType));
+  const overriddenTaskTypes = rawMissingTaskTypes.filter((taskType) => overrideState.active_task_types.includes(taskType));
   const satisfiedTaskTypes = requiredTaskTypes.filter((taskType) => completedTaskTypes.has(taskType));
   const evidenceState = buildPipelinePolicyEvidence(status, requiredTaskTypes, {
     completedLeaseByTask,
@@ -409,6 +623,10 @@ export function summarizePipelinePolicyState(status, changePolicy, boundaryValid
   const requirementStatus = requiredTaskTypes.map((taskType) => ({
     task_type: taskType,
     satisfied: satisfiedTaskTypes.includes(taskType),
+    overridden: overriddenTaskTypes.includes(taskType),
+    override_ids: overrideState.active_overrides
+      .filter((entry) => (entry.task_types || []).includes(taskType))
+      .map((entry) => entry.id),
     evidence: evidenceByTaskType[taskType] || [],
   }));
   const rationale = uniq([
@@ -425,12 +643,16 @@ export function summarizePipelinePolicyState(status, changePolicy, boundaryValid
     active_rules: activeRules,
     required_task_types: requiredTaskTypes,
     satisfied_task_types: satisfiedTaskTypes,
+    raw_missing_task_types: rawMissingTaskTypes,
     missing_task_types: missingTaskTypes,
+    overridden_task_types: overriddenTaskTypes,
     requirement_status: requirementStatus,
     evidence_by_task_type: evidenceByTaskType,
     evidence_schema_version: 1,
     evidence_objects: evidenceState.evidence_objects,
     satisfaction_history: [],
+    overrides: overrideState.active_overrides,
+    override_history: overrideState.override_history,
     pipeline_id: status.pipeline_id,
     enforcement,
     rationale,
@@ -440,10 +662,15 @@ export function summarizePipelinePolicyState(status, changePolicy, boundaryValid
       ? 'No explicit governed-domain policy requirements are active for this pipeline.'
       : missingTaskTypes.length > 0
         ? `Governed domains ${governedDomains.join(', ')} still require ${missingTaskTypes.join(', ')} before landing.`
+        : overriddenTaskTypes.length > 0
+          ? `Governed domains ${governedDomains.join(', ')} are currently allowed to proceed with overrides for ${overriddenTaskTypes.join(', ')}.`
         : `Governed domains ${governedDomains.join(', ')} have satisfied their current policy requirements.`,
   };
 
-  policyState.satisfaction_history = buildPipelinePolicySatisfactionHistory(policyState);
+  policyState.satisfaction_history = [
+    ...buildPipelinePolicySatisfactionHistory(policyState),
+    ...overrideState.override_history,
+  ].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
   return policyState;
 }
 
@@ -459,11 +686,15 @@ export async function evaluatePipelinePolicyGate(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
   const aiGate = await runAiMergeGate(db, repoRoot);
   const changePolicy = loadChangePolicy(repoRoot);
-  const policyState = summarizePipelinePolicyState(status, changePolicy, aiGate.boundary_validations || []);
+  const policyState = summarizePipelinePolicyState(db, status, changePolicy, aiGate.boundary_validations || []);
   const blocked = policyState.active
     && policyState.enforcement === 'blocked'
     && policyState.missing_task_types.length > 0;
   const nextAction = blocked ? buildPipelinePolicyRemediationCommand(status, policyState) : null;
+  const overrideApplied = policyState.overridden_task_types.length > 0;
+  const overrideSummary = overrideApplied
+    ? `Policy override active for ${policyState.overridden_task_types.join(', ')} by ${policyState.overrides.map((entry) => entry.approved_by || 'unknown').join(', ')}.`
+    : null;
 
   return {
     ok: !blocked,
@@ -474,6 +705,8 @@ export async function evaluatePipelinePolicyGate(db, repoRoot, pipelineId) {
       : policyState.summary,
     next_action: nextAction,
     policy_state: policyState,
+    override_applied: overrideApplied,
+    override_summary: overrideSummary,
   };
 }
 
@@ -1071,8 +1304,12 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   }));
   const changedFiles = uniq(worktreeChanges.flatMap((entry) => entry.files));
   const subsystemTags = uniq(completedTasks.flatMap((task) => task.task_spec?.subsystem_tags || []));
-  const policyState = summarizePipelinePolicyState(status, changePolicy, aiGate.boundary_validations || []);
+  const policyState = summarizePipelinePolicyState(db, status, changePolicy, aiGate.boundary_validations || []);
+  const policyOverrideSummary = policyState.overridden_task_types.length > 0
+    ? `Landing currently relies on policy overrides for ${policyState.overridden_task_types.join(', ')}.`
+    : null;
   const staleClusters = buildStaleClusters(aiGate.dependency_invalidations || [], { pipelineId });
+  const staleCausalWaves = summarizeStaleCausalWaves(staleClusters);
   const trustAudit = [...policyState.satisfaction_history, ...buildPipelineTrustAudit(db, pipelineId)]
     .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
     .slice(0, 8);
@@ -1123,11 +1360,18 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
         `- Policy evidence: ${policyState.satisfied_task_types.map((taskType) => `${taskType}:${(policyState.evidence_by_task_type?.[taskType] || []).map((entry) => entry.task_id).join(',')}`).join(' | ') || 'none'}`,
         `- Policy evidence objects: ${policyState.evidence_objects.map((entry) => `${entry.evidence_id}:${entry.satisfied_by.agent || entry.satisfied_by.worktree || 'task_completion'}`).join(' | ') || 'none'}`,
         `- Policy missing: ${policyState.missing_task_types.join(', ') || 'none'}`,
+        `- Policy overrides: ${policyState.overrides.map((entry) => `${entry.id}:${(entry.task_types || []).join(',') || 'all'}:${entry.approved_by || 'unknown'}`).join(' | ') || 'none'}`,
+        ...(policyOverrideSummary ? [`- Policy override effect: ${policyOverrideSummary}`] : []),
       ]
       : []),
     ...(staleClusters.length > 0
       ? [
         `- Stale clusters: ${staleClusters.map((cluster) => `${cluster.affected_pipeline_id || cluster.affected_task_ids[0]}:${cluster.invalidation_count}`).join(' | ')}`,
+      ]
+      : []),
+    ...(staleCausalWaves.length > 0
+      ? [
+        `- Stale waves: ${staleCausalWaves.map((wave) => `${wave.summary}:${wave.affected_pipeline_ids.join(',') || 'unknown'}`).join(' | ')}`,
       ]
       : []),
     ...(trustAudit.length > 0
@@ -1182,9 +1426,11 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
         `- Required task types: ${policyState.required_task_types.join(', ') || 'none'}`,
         `- Satisfied task types: ${policyState.satisfied_task_types.join(', ') || 'none'}`,
         `- Missing task types: ${policyState.missing_task_types.join(', ') || 'none'}`,
+        `- Overridden task types: ${policyState.overridden_task_types.join(', ') || 'none'}`,
         ...policyState.requirement_status
           .filter((requirement) => requirement.evidence.length > 0)
           .map((requirement) => `- Evidence for ${requirement.task_type}: ${requirement.evidence.map((entry) => entry.artifact_path ? `${entry.task_id} (${entry.artifact_path}, by ${entry.satisfied_by?.agent || entry.satisfied_by?.worktree || 'task_completion'})` : `${entry.task_id} (by ${entry.satisfied_by?.agent || entry.satisfied_by?.worktree || 'task_completion'})`).join(', ')}`),
+        ...policyState.overrides.slice(0, 5).map((entry) => `- Override ${entry.id}: ${(entry.task_types || []).join(', ') || 'all requirements'} by ${entry.approved_by || 'unknown'} (${entry.reason})`),
         ...policyState.satisfaction_history.slice(0, 5).map((entry) => `- Satisfaction history: ${entry.summary}`),
         ...policyState.rationale.slice(0, 5).map((item) => `- ${item}`),
         '',
@@ -1194,6 +1440,13 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
       ? [
         '## Stale Clusters',
         ...staleClusters.map((cluster) => `- ${cluster.title}: ${cluster.detail} -> ${cluster.next_action}`),
+        '',
+      ]
+      : []),
+    ...(staleCausalWaves.length > 0
+      ? [
+        '## Stale Waves',
+        ...staleCausalWaves.map((wave) => `- ${wave.summary}: affects ${wave.affected_pipeline_ids.join(', ') || 'unknown'} -> ${wave.cluster_count} cluster(s), ${wave.invalidation_count} invalidation(s)`),
         '',
       ]
       : []),
@@ -1239,7 +1492,9 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
       changed_files: changedFiles,
       subsystem_tags: subsystemTags,
       policy_state: policyState,
+      policy_override_summary: policyOverrideSummary,
       stale_clusters: staleClusters,
+      stale_causal_waves: staleCausalWaves,
       trust_audit: trustAudit,
     },
     counts: status.counts,
@@ -1254,6 +1509,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     },
     policy_state: policyState,
     stale_clusters: staleClusters,
+    stale_causal_waves: staleCausalWaves,
     trust_audit: trustAudit,
     worktree_changes: worktreeChanges,
     markdown,
@@ -1264,8 +1520,12 @@ export async function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
   const changePolicy = loadChangePolicy(repoRoot);
   const aiGate = await runAiMergeGate(db, repoRoot);
-  const policyState = summarizePipelinePolicyState(status, changePolicy, aiGate.boundary_validations || []);
+  const policyState = summarizePipelinePolicyState(db, status, changePolicy, aiGate.boundary_validations || []);
+  const policyOverrideSummary = policyState.overridden_task_types.length > 0
+    ? `Landing currently relies on policy overrides for ${policyState.overridden_task_types.join(', ')}.`
+    : null;
   const staleClusters = buildStaleClusters(listDependencyInvalidations(db, { pipelineId }), { pipelineId });
+  const staleCausalWaves = summarizeStaleCausalWaves(staleClusters);
   const trustAudit = [...policyState.satisfaction_history, ...buildPipelineTrustAudit(db, pipelineId)]
     .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
     .slice(0, 8);
@@ -1315,6 +1575,7 @@ export async function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
       : (readyToQueue ? `switchman queue add --pipeline ${pipelineId}` : nextAction)),
     last_error_code: currentQueueItem?.last_error_code || null,
     last_error_summary: currentQueueItem?.last_error_summary || null,
+    policy_override_summary: policyOverrideSummary,
   };
   const recoveryState = landing.last_recovery
     ? {
@@ -1370,6 +1631,13 @@ export async function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
         '',
       ]
       : []),
+    ...(staleCausalWaves.length > 0
+      ? [
+        '## Stale Waves',
+        ...staleCausalWaves.map((wave) => `- ${wave.summary}: affects ${wave.affected_pipeline_ids.join(', ') || 'unknown'} -> ${wave.cluster_count} cluster(s), ${wave.invalidation_count} invalidation(s)`),
+        '',
+      ]
+      : []),
     ...(trustAudit.length > 0
       ? [
         '## Policy & Stale Audit',
@@ -1385,9 +1653,12 @@ export async function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
         `- Enforcement: ${policyState.enforcement}`,
         `- Required task types: ${policyState.required_task_types.join(', ') || 'none'}`,
         `- Missing task types: ${policyState.missing_task_types.join(', ') || 'none'}`,
+        `- Overridden task types: ${policyState.overridden_task_types.join(', ') || 'none'}`,
         ...policyState.requirement_status
           .filter((requirement) => requirement.evidence.length > 0)
           .map((requirement) => `- Evidence for ${requirement.task_type}: ${requirement.evidence.map((entry) => `${entry.task_id} by ${entry.satisfied_by?.agent || entry.satisfied_by?.worktree || 'task_completion'}`).join(', ')}`),
+        ...policyState.overrides.slice(0, 5).map((entry) => `- Override ${entry.id}: ${(entry.task_types || []).join(', ') || 'all requirements'} by ${entry.approved_by || 'unknown'} (${entry.reason})`),
+        ...(policyOverrideSummary ? [`- Override effect: ${policyOverrideSummary}`] : []),
         '',
       ]
       : []),
@@ -1398,6 +1669,7 @@ export async function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
     `- Target branch: ${queueState.target_branch}`,
     ...(queueState.merged_commit ? [`- Merged commit: ${queueState.merged_commit}`] : []),
     ...(queueState.last_error_summary ? [`- Queue error: ${queueState.last_error_summary}`] : []),
+    ...(queueState.policy_override_summary ? [`- Policy override: ${queueState.policy_override_summary}`] : []),
     '',
     `## Next Action`,
     `- ${queueState.next_action || nextAction}`,
@@ -1412,8 +1684,10 @@ export async function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
     landing,
     recovery_state: recoveryState,
     stale_clusters: staleClusters,
+    stale_causal_waves: staleCausalWaves,
     trust_audit: trustAudit,
     queue_state: queueState,
+    policy_override_summary: policyOverrideSummary,
     landing_error: landingError,
     next_action: queueState.next_action || nextAction,
     markdown,
