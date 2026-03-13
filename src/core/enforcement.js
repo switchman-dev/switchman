@@ -6,6 +6,7 @@ import {
   getActiveFileClaims,
   getCompletedFileClaims,
   getLease,
+  listTasks,
   getTaskSpec,
   getWorktree,
   getWorktreeSnapshotState,
@@ -178,6 +179,17 @@ function resolveLeasePathOwnership(db, lease, filePath, activeClaims, activeLeas
   }
 
   return { ok: false, reason_code: 'path_not_claimed', claim: null, ownership_type: null };
+}
+
+function completedScopedTaskOwnsPath(db, completedTasks, filePath) {
+  for (const task of completedTasks) {
+    const taskSpec = getTaskSpec(db, task.id);
+    const allowedPaths = Array.isArray(taskSpec?.allowed_paths) ? taskSpec.allowed_paths : [];
+    if (allowedPaths.length > 0 && matchesPathPatterns(filePath, allowedPaths)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function classifyObservedPath(db, repoRoot, worktree, filePath, options = {}) {
@@ -716,6 +728,9 @@ export function evaluateWorktreeCompliance(db, repoRoot, worktree, options = {})
   const activeLeases = options.activeLeases || listLeases(db, 'active');
   const activeClaims = options.activeClaims || getActiveFileClaims(db);
   const completedClaims = options.completedClaims || getCompletedFileClaims(db, worktree.name);
+  const completedTasks = options.completedTasks
+    || listTasks(db)
+      .filter((task) => task.status === 'done' && task.worktree === worktree.name);
 
   const changedFiles = getWorktreeChangedFiles(worktree.path, repoRoot);
   const activeLease = activeLeases.find((lease) => lease.worktree === worktree.name) || null;
@@ -728,7 +743,7 @@ export function evaluateWorktreeCompliance(db, repoRoot, worktree, options = {})
   for (const file of changedFiles) {
     const completedClaim = completedClaimsByPath.get(file);
     if (!activeLease) {
-      if (completedClaim) {
+      if (completedClaim || completedScopedTaskOwnsPath(db, completedTasks, file)) {
         continue;
       }
       violations.push({ file, reason_code: 'no_active_lease' });

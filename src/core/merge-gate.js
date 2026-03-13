@@ -189,15 +189,17 @@ function summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations, d
       summary: `AI merge gate blocked: ${blockedPairs.length} risky pair(s), ${blockedValidations.length} boundary validation issue(s), and ${blockedInvalidations.length} stale dependency issue(s) need resolution.`,
     };
   }
-  if (warnedPairs.length > 0 || riskyWorktrees.length > 0 || warnedValidations.length > 0 || warnedInvalidations.length > 0) {
+  if (warnedPairs.length > 0 || warnedValidations.length > 0 || warnedInvalidations.length > 0) {
     return {
       status: 'warn',
-      summary: `AI merge gate warns: ${warnedPairs.length} pair(s), ${riskyWorktrees.length} worktree(s), ${warnedValidations.length} boundary validation issue(s), or ${warnedInvalidations.length} stale dependency issue(s) need review.`,
+      summary: `AI merge gate warns: ${warnedPairs.length} pair(s), ${warnedValidations.length} boundary validation issue(s), or ${warnedInvalidations.length} stale dependency issue(s) need review.`,
     };
   }
   return {
     status: 'pass',
-    summary: 'AI merge gate passed: no elevated semantic merge risks detected.',
+    summary: riskyWorktrees.length > 0
+      ? `AI merge gate passed: no cross-worktree merge risks detected. ${riskyWorktrees.length} worktree(s) still have local risk signals worth reviewing if you are about to merge them.`
+      : 'AI merge gate passed: no elevated semantic merge risks detected.',
   };
 }
 
@@ -233,11 +235,15 @@ function evaluateDependencyInvalidations(db) {
           ? `contract:${(details.contract_names || []).join('|') || 'unknown'}`
         : state.reason_type === 'semantic_object_overlap'
           ? `object:${(details.object_names || []).join('|') || 'unknown'}`
+        : state.reason_type === 'shared_module_drift'
+          ? `module:${(details.module_paths || []).join('|') || 'unknown'}`
         : `${state.source_scope_pattern} ↔ ${state.affected_scope_pattern}`;
       const summary = state.reason_type === 'semantic_contract_drift'
         ? `${details.source_task_title || state.source_task_id} changed shared contract ${(details.contract_names || []).join(', ') || 'unknown'}`
         : state.reason_type === 'semantic_object_overlap'
           ? `${details.source_task_title || state.source_task_id} changed shared exported object ${(details.object_names || []).join(', ') || 'unknown'}`
+          : state.reason_type === 'shared_module_drift'
+            ? `${details.source_task_title || state.source_task_id} changed shared module ${(details.module_paths || []).join(', ') || 'unknown'} used by ${(details.dependent_files || []).join(', ') || state.affected_task_id}`
           : `${affectedTask?.title || state.affected_task_id} is stale because ${details?.source_task_title || state.source_task_id} changed shared ${staleArea}`;
       return {
         source_lease_id: state.source_lease_id,

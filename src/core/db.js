@@ -2624,7 +2624,7 @@ export function getStaleLeases(db, staleAfterMinutes = DEFAULT_STALE_LEASE_MINUT
     FROM leases l
     JOIN tasks t ON l.task_id = t.id
     WHERE l.status='active'
-      AND l.heartbeat_at < datetime('now', ?)
+      AND l.heartbeat_at <= datetime('now', ?)
     ORDER BY l.heartbeat_at ASC
   `).all(`-${staleAfterMinutes} minutes`);
 }

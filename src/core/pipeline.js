@@ -1164,49 +1164,80 @@ function runPipelineIteration(
         retryBackoffMs,
         timeoutMs,
       });
-      const beforeHead = getHeadRevision(assignment.worktree_path);
-      const result = spawnSync(command, args, {
-        cwd: assignment.worktree_path,
-        env: buildLaunchEnv(
-          repoRoot,
-          { id: assignment.task_id, title: assignment.title, task_spec: assignment.task_spec },
-          { id: assignment.lease_id },
-          { name: assignment.worktree, path: assignment.worktree_path },
-        ),
-        encoding: 'utf8',
-        timeout: executionPolicy.timeout_ms > 0 ? executionPolicy.timeout_ms : undefined,
-      });
-      const afterHead = getHeadRevision(assignment.worktree_path);
-
-      const timedOut = result.error?.code === 'ETIMEDOUT';
-      const commandOk = !result.error && result.status === 0;
-      let evaluation = commandOk
-        ? evaluateTaskOutcome(db, repoRoot, { leaseId: assignment.lease_id })
-        : null;
-      if (commandOk && evaluation?.reason_code === 'no_changes_detected' && beforeHead && afterHead && beforeHead !== afterHead) {
-        evaluation = {
-          status: 'accepted',
-          reason_code: null,
-          changed_files: [],
-          claimed_files: [],
-          findings: ['task created a new commit with no remaining uncommitted diff'],
-        };
-      }
-      const ok = commandOk && evaluation?.status === 'accepted';
+      let result = { status: null, stdout: '', stderr: '', error: null };
+      let timedOut = false;
+      let evaluation = null;
+      let ok = false;
+      let reasonCode = 'agent_command_failed';
       let retry = {
         retried: false,
         retry_attempt: getTaskRetryCount(db, assignment.task_id),
         retries_remaining: Math.max(0, executionPolicy.max_retries - getTaskRetryCount(db, assignment.task_id)),
         retry_delay_ms: 0,
       };
+
+      try {
+        const beforeHead = getHeadRevision(assignment.worktree_path);
+        result = spawnSync(command, args, {
+          cwd: assignment.worktree_path,
+          env: buildLaunchEnv(
+            repoRoot,
+            { id: assignment.task_id, title: assignment.title, task_spec: assignment.task_spec },
+            { id: assignment.lease_id },
+            { name: assignment.worktree, path: assignment.worktree_path },
+          ),
+          encoding: 'utf8',
+          timeout: executionPolicy.timeout_ms > 0 ? executionPolicy.timeout_ms : undefined,
+        });
+        const afterHead = getHeadRevision(assignment.worktree_path);
+
+        timedOut = result.error?.code === 'ETIMEDOUT';
+        const commandOk = !result.error && result.status === 0;
+        evaluation = commandOk
+          ? evaluateTaskOutcome(db, repoRoot, { leaseId: assignment.lease_id })
+          : null;
+        if (commandOk && evaluation?.reason_code === 'no_changes_detected' && beforeHead && afterHead && beforeHead !== afterHead) {
+          evaluation = {
+            status: 'accepted',
+            reason_code: null,
+            changed_files: [],
+            claimed_files: [],
+            findings: ['task created a new commit with no remaining uncommitted diff'],
+          };
+        }
+        ok = commandOk && evaluation?.status === 'accepted';
+        reasonCode = timedOut
+          ? 'task_execution_timeout'
+          : ok
+            ? null
+            : 'agent_command_failed';
+      } catch (err) {
+        result = {
+          status: null,
+          stdout: result.stdout || '',
+          stderr: `${result.stderr || ''}${result.stderr ? '\n' : ''}${err.message}`,
+          error: err,
+        };
+        timedOut = false;
+        evaluation = {
+          status: 'rejected',
+          reason_code: 'pipeline_execution_internal_error',
+          findings: [err.message],
+        };
+        ok = false;
+        reasonCode = 'pipeline_execution_internal_error';
+      }
+
       if (ok) {
         completeLeaseTask(db, assignment.lease_id);
       } else {
-        const failureReason = !commandOk
-          ? (timedOut
-            ? `agent command timed out after ${executionPolicy.timeout_ms}ms`
-            : (result.error?.message || `agent command exited with status ${result.status}`))
-          : `${evaluation.reason_code}: ${evaluation.findings.join('; ')}`;
+        const failureReason = result.error && !timedOut && result.status === null
+          ? `${reasonCode}: ${result.error.message}`
+          : result.error || result.status !== 0
+            ? (timedOut
+              ? `agent command timed out after ${executionPolicy.timeout_ms}ms`
+              : (result.error?.message || `agent command exited with status ${result.status}`))
+            : `${evaluation.reason_code}: ${evaluation.findings.join('; ')}`;
         failLeaseTask(db, assignment.lease_id, failureReason);
         retry = scheduleTaskRetry(db, {
           pipelineId,
@@ -1236,7 +1267,7 @@ function runPipelineIteration(
       logAuditEvent(db, {
         eventType: 'pipeline_task_executed',
         status: ok ? 'allowed' : 'denied',
-        reasonCode: ok ? null : (timedOut ? 'task_execution_timeout' : 'agent_command_failed'),
+        reasonCode,
         worktree: assignment.worktree,
         taskId: assignment.task_id,
         leaseId: assignment.lease_id,

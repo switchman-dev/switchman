@@ -3465,6 +3465,31 @@ test('Lease reap CLI uses the configured stale policy by default', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 54m: stale lease reap at 0 minutes reaps every equally stale active lease in one call', () => {
+  const repoDir = join(tmpdir(), `sw-reap-zero-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: 'agent1', path: repoDir, branch: 'feature/a' });
+  registerWorktree(db, { name: 'agent2', path: repoDir, branch: 'feature/b' });
+  const taskA = createTask(db, { title: 'A', priority: 5 });
+  const taskB = createTask(db, { title: 'B', priority: 4 });
+  assignTask(db, taskA, 'agent1');
+  assignTask(db, taskB, 'agent2');
+
+  const expired = reapStaleLeases(db, 0);
+  assert(expired.length === 2, 'One reap call expires every stale lease at the 0-minute boundary');
+  assert(getTask(db, taskA).status === 'pending', 'First stale task returns to pending');
+  assert(getTask(db, taskB).status === 'pending', 'Second stale task returns to pending');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Status auto-reaps stale leases when policy enables it', () => {
   const repoDir = join(tmpdir(), `sw-lease-policy-status-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -3785,6 +3810,34 @@ test('Fix 8c: active task-scoped changes remain governed for compliance checks',
   const compliance = evaluateWorktreeCompliance(enforceDb, repoDir, { name: 'main', path: repoDir, branch: 'main' });
   assert(compliance.compliance_state === 'managed', 'In-scope task-owned changes remain managed without an explicit file claim');
   assert(compliance.unclaimed_changed_files.length === 0, 'In-scope task-owned changes are not reported as unclaimed');
+  enforceDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 8ca: completed task-scoped changes remain observed after clean completion', () => {
+  const repoDir = join(tmpdir(), `sw-enforce-completed-scope-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const enforceDb = initDb(repoDir);
+  registerWorktree(enforceDb, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(enforceDb, { title: 'Implement: completed scoped governed change' });
+  assignTask(enforceDb, taskId, 'main');
+  upsertTaskSpec(enforceDb, taskId, {
+    task_type: 'implementation',
+    allowed_paths: ['src/scoped/**'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  execSync('mkdir -p src/scoped && printf "ok\\n" > src/scoped/completed.js', { cwd: repoDir, shell: '/bin/sh' });
+  completeTask(enforceDb, taskId);
+
+  const compliance = evaluateWorktreeCompliance(enforceDb, repoDir, { name: 'main', path: repoDir, branch: 'main' });
+  assert(compliance.compliance_state === 'observed', 'Completed in-scope task-owned changes remain observed instead of non-compliant');
+  assert(compliance.unclaimed_changed_files.length === 0, 'Completed in-scope task-owned changes are not reported as unclaimed');
   enforceDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -5315,6 +5368,36 @@ test('Fix 26: AI merge gate passes isolated worktree changes', () => {
   assert(result.pairs.every((pair) => pair.status === 'pass'), 'All pair analyses pass for isolated changes');
   execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
   execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 26a: AI merge gate stays calm when only one worktree has local risk signals', () => {
+  const repoDir = join(tmpdir(), `sw-ai-gate-single-risk-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const featureA = join(tmpdir(), `sw-ai-gate-single-risk-a-${Date.now()}`);
+  execSync(`git worktree add -b feature-auth-risk "${featureA}"`, { cwd: repoDir });
+  execSync('mkdir -p src/auth && printf "session\\n" > src/auth/session.js', { cwd: featureA, shell: '/bin/sh' });
+
+  const gateDb = initDb(repoDir);
+  registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(gateDb, { name: featureA.split('/').pop(), path: featureA, branch: 'feature-auth-risk' });
+  const taskA = createTask(gateDb, { title: 'Auth work' });
+  assignTask(gateDb, taskA, featureA.split('/').pop());
+  claimFiles(gateDb, taskA, featureA.split('/').pop(), ['src/auth/session.js']);
+  gateDb.close();
+  const result = JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ai', '--json'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(result.status === 'pass', 'AI merge gate does not warn just because one worktree has local risk signals');
+  assert(result.summary.includes('no cross-worktree merge risks detected'), 'AI merge gate explains that the repo is clear of cross-worktree merge risk');
+  execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
 });
 
