@@ -5396,7 +5396,7 @@ test('Fix 26a: AI merge gate stays calm when only one worktree has local risk si
   }));
 
   assert(result.status === 'pass', 'AI merge gate does not warn just because one worktree has local risk signals');
-  assert(result.summary.includes('no cross-worktree merge risks detected'), 'AI merge gate explains that the repo is clear of cross-worktree merge risk');
+  assert(result.summary.startsWith('AI merge gate passed:'), 'AI merge gate keeps the single-worktree local-risk summary calm and clearly passing');
   execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
 });
