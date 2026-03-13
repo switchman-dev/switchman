@@ -3230,6 +3230,83 @@ test('Fix 25db0: explain stale can summarize a whole stale pipeline cluster', ()
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 25db1: explain history and audit change show a pipeline timeline with exact next steps', () => {
+  const repoDir = join(tmpdir(), `sw-explain-history-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const historyDb = initDb(repoDir);
+  registerWorktree(historyDb, { name: 'main', path: repoDir, branch: 'main' });
+  const pipeline = startPipeline(historyDb, {
+    title: 'Coordinate auth rollout',
+    description: 'Ship the auth change with a visible landing trail',
+    pipelineId: 'pipe-history',
+    priority: 5,
+  });
+  const firstTaskId = pipeline.tasks[0].id;
+  assignTask(historyDb, firstTaskId, 'main');
+  completeLeaseTask(historyDb, getActiveLeaseForTask(historyDb, firstTaskId).id);
+
+  const queueItem = enqueueMergeItem(historyDb, {
+    sourceType: 'pipeline',
+    sourceRef: 'pipe-history',
+    sourcePipelineId: 'pipe-history',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(historyDb, queueItem.id, {
+    status: 'blocked',
+    lastErrorCode: 'policy_requirements_incomplete',
+    lastErrorSummary: 'Policy blocked landing for governed domains auth because tests is still required.',
+    nextAction: 'switchman pipeline review pipe-history',
+  });
+  historyDb.close();
+
+  const explainText = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'history',
+    'pipe-history',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const explainJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'history',
+    'pipe-history',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const auditJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'audit',
+    'change',
+    'pipe-history',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(explainText.includes('History for pipeline pipe-history'), 'Explain history prints the pipeline header');
+  assert(explainText.includes('Timeline'), 'Explain history prints a timeline section');
+  assert(explainText.includes('switchman pipeline review pipe-history'), 'Explain history points at the exact recovery command');
+  assert(explainJson.events.some((event) => event.label === 'Pipeline created'), 'Explain history JSON includes the pipeline-created event');
+  assert(explainJson.events.some((event) => event.queue_item_id === queueItem.id && event.status === 'blocked'), 'Explain history JSON includes blocked queue state changes');
+  assert(explainJson.current.queue_items.some((item) => item.id === queueItem.id && item.status === 'blocked'), 'Explain history JSON includes the current queue state');
+  assert(explainJson.next_action === 'switchman pipeline review pipe-history', 'Explain history JSON surfaces the exact next command');
+  assert(auditJson.pipeline_id === 'pipe-history', 'Audit change reuses the same pipeline history report');
+  assert(auditJson.events.length === explainJson.events.length, 'Audit change JSON includes the same event timeline');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 25db: task retry CLI resets stale completed work back to pending', () => {
   const repoDir = join(tmpdir(), `sw-task-retry-cli-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -4324,10 +4401,71 @@ test('Fix 28d0: pipeline bundle carries stale cluster state into PR and landing 
 
   assert(summaryJson.stale_clusters.some((cluster) => cluster.affected_pipeline_id === 'pipe-bundle-stale'), 'PR summary JSON includes grouped stale cluster state');
   assert(summaryJson.pr_artifact.stale_clusters.some((cluster) => cluster.affected_pipeline_id === 'pipe-bundle-stale'), 'PR artifact carries stale cluster state for reviewers');
+  assert(summaryJson.trust_audit.some((entry) => entry.category === 'stale'), 'PR summary JSON includes stale-wave trust audit entries');
   assert(summaryMarkdown.includes('## Stale Clusters'), 'PR summary markdown includes a stale clusters section');
+  assert(summaryMarkdown.includes('## Policy & Stale Audit'), 'PR summary markdown includes a trust audit section');
   assert(landingJson.stale_clusters.some((cluster) => cluster.affected_pipeline_id === 'pipe-bundle-stale'), 'Landing summary JSON includes grouped stale clusters');
+  assert(landingJson.trust_audit.some((entry) => entry.category === 'stale'), 'Landing summary JSON includes stale-wave trust audit entries');
   assert(landingMarkdown.includes('## Stale Clusters'), 'Landing summary markdown includes a stale clusters section');
+  assert(landingMarkdown.includes('## Policy & Stale Audit'), 'Landing summary markdown includes a trust audit section');
   assert(landingJson.next_action === 'switchman task retry-stale --pipeline pipe-bundle-stale', 'Landing summary points stale pipelines at the exact bulk retry command');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28d0a: pipeline bundle carries policy audit entries into PR and landing artifacts', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-bundle-policy-audit-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  writeChangePolicy(repoDir, {
+    domain_rules: {
+      auth: {
+        required_completed_task_types: ['tests', 'governance', 'docs'],
+        enforcement: 'blocked',
+        rationale: ['auth changes need visible audit depth'],
+      },
+    },
+  });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const pipeline = startPipeline(db, {
+    title: 'Harden auth API permissions',
+    description: 'Implement stricter auth checks for the API',
+    pipelineId: 'pipe-bundle-policy-audit',
+    priority: 5,
+  });
+  const implementationTask = pipeline.tasks.find((task) => task.task_spec.task_type === 'implementation');
+  assignTask(db, implementationTask.id, 'main');
+  const lease = getActiveLeaseForTask(db, implementationTask.id);
+  execSync('mkdir -p src/auth && printf "new\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
+  evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
+  db.close();
+
+  const outputDir = join(repoDir, 'artifacts', 'pipe-bundle-policy-audit');
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'bundle',
+    'pipe-bundle-policy-audit',
+    outputDir,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const summaryJson = JSON.parse(readFileSync(result.files.summary_json, 'utf8'));
+  const summaryMarkdown = readFileSync(result.files.summary_markdown, 'utf8');
+  const landingJson = JSON.parse(readFileSync(result.files.landing_summary_json, 'utf8'));
+
+  assert(summaryJson.trust_audit.some((entry) => entry.category === 'policy' && entry.summary.includes('Policy validation')), 'PR summary JSON includes policy trust audit entries');
+  assert(summaryJson.pr_artifact.trust_audit.some((entry) => entry.category === 'policy'), 'PR artifact carries policy trust audit entries');
+  assert(summaryMarkdown.includes('## Policy & Stale Audit'), 'PR summary markdown includes the trust audit section for policy changes');
+  assert(landingJson.trust_audit.some((entry) => entry.category === 'policy'), 'Landing summary JSON includes policy trust audit entries');
 
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -4375,6 +4513,7 @@ test('Fix 28d1: pipeline bundle writes GitHub Actions landing summary and output
   assert(stepSummary.includes('- Title: '), 'Pipeline bundle step summary includes a check-friendly title');
   assert(stepSummary.includes('- Summary: '), 'Pipeline bundle step summary includes a one-line check summary');
   assert(stepSummary.includes('## Stale Clusters'), 'Pipeline bundle step summary includes stale cluster context for PR checks');
+  assert(stepSummary.includes('## Policy & Stale Audit'), 'Pipeline bundle step summary includes the trust audit section');
   assert(stepSummary.includes('## Queue State'), 'Pipeline bundle step summary includes queue state for PR-facing checks');
   assert(output.includes('switchman_pipeline_id=pipe-bundle-github'), 'Pipeline bundle writes the pipeline ID to GitHub outputs');
   assert(output.includes('switchman_landing_branch='), 'Pipeline bundle writes the landing branch to GitHub outputs');
@@ -4385,6 +4524,8 @@ test('Fix 28d1: pipeline bundle writes GitHub Actions landing summary and output
   assert(output.includes('switchman_queue_status='), 'Pipeline bundle writes queue status to GitHub outputs');
   assert(output.includes('switchman_queue_target_branch='), 'Pipeline bundle writes queue target branch to GitHub outputs');
   assert(output.includes('switchman_stale_cluster_count='), 'Pipeline bundle writes stale cluster count to GitHub outputs');
+  assert(output.includes('switchman_trust_audit_count='), 'Pipeline bundle writes trust audit count to GitHub outputs');
+  assert(output.includes('switchman_trust_audit_summary='), 'Pipeline bundle writes trust audit summary to GitHub outputs');
   rmSync(repoDir, { recursive: true, force: true });
 });
 

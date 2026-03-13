@@ -54,6 +54,127 @@ function getPipelineMetadata(db, pipelineId) {
   return null;
 }
 
+function parseAuditDetails(details) {
+  try {
+    return JSON.parse(details || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function pipelineOwnsAuditEvent(event, pipelineId) {
+  if (event.task_id?.startsWith(`${pipelineId}-`)) return true;
+  const details = parseAuditDetails(event.details);
+  if (details.pipeline_id === pipelineId) return true;
+  if (details.source_pipeline_id === pipelineId) return true;
+  if (Array.isArray(details.task_ids) && details.task_ids.some((taskId) => String(taskId).startsWith(`${pipelineId}-`))) {
+    return true;
+  }
+  return false;
+}
+
+function buildPipelineTrustAudit(db, pipelineId, { limit = 8 } = {}) {
+  const interestingEventTypes = new Set([
+    'boundary_validation_state',
+    'dependency_invalidations_updated',
+    'pipeline_followups_created',
+    'task_retried',
+    'pipeline_task_retry_scheduled',
+  ]);
+
+  const events = listAuditEvents(db, { limit: 2000 })
+    .filter((event) => interestingEventTypes.has(event.event_type))
+    .filter((event) => pipelineOwnsAuditEvent(event, pipelineId))
+    .slice(0, limit);
+
+  const mappedEvents = events.map((event) => {
+    const details = parseAuditDetails(event.details);
+
+    switch (event.event_type) {
+      case 'boundary_validation_state': {
+        const missing = details.missing_task_types || [];
+        const summary = details.status === 'satisfied'
+          ? 'Policy validation requirements are currently satisfied.'
+          : missing.length > 0
+            ? `Policy validation is waiting on ${missing.join(', ')}.`
+            : `Policy validation state changed to ${details.status || 'pending'}.`;
+        return {
+          category: 'policy',
+          created_at: event.created_at,
+          event_type: event.event_type,
+          status: event.status,
+          reason_code: event.reason_code || null,
+          summary,
+          missing_task_types: missing,
+          next_action: missing.length > 0 ? `switchman pipeline review ${pipelineId}` : `switchman pipeline status ${pipelineId}`,
+        };
+      }
+      case 'dependency_invalidations_updated':
+        return {
+          category: 'stale',
+          created_at: event.created_at,
+          event_type: event.event_type,
+          status: event.status,
+          reason_code: event.reason_code || null,
+          summary: `A shared change marked ${details.stale_count || 0} dependent task${details.stale_count === 1 ? '' : 's'} stale.`,
+          affected_task_ids: details.affected_task_ids || [],
+          next_action: `switchman explain stale --pipeline ${pipelineId}`,
+        };
+      case 'pipeline_followups_created':
+        return {
+          category: 'remediation',
+          created_at: event.created_at,
+          event_type: event.event_type,
+          status: event.status,
+          reason_code: event.reason_code || null,
+          summary: details.created_count > 0
+            ? `Created ${details.created_count} follow-up task${details.created_count === 1 ? '' : 's'} to satisfy validation or policy work.`
+            : 'No new follow-up tasks were needed after review.',
+          created_count: details.created_count || 0,
+          next_action: details.created_count > 0 ? `switchman pipeline status ${pipelineId}` : `switchman pipeline status ${pipelineId}`,
+        };
+      case 'task_retried':
+      case 'pipeline_task_retry_scheduled':
+        return {
+          category: 'remediation',
+          created_at: event.created_at,
+          event_type: event.event_type,
+          status: event.status,
+          reason_code: event.reason_code || null,
+          summary: `Scheduled revalidation for ${event.task_id || 'a pipeline task'}.`,
+          task_id: event.task_id || null,
+          next_action: `switchman pipeline status ${pipelineId}`,
+        };
+      default:
+        return {
+          category: 'trust',
+          created_at: event.created_at,
+          event_type: event.event_type,
+          status: event.status,
+          reason_code: event.reason_code || null,
+          summary: event.event_type,
+          next_action: `switchman pipeline status ${pipelineId}`,
+        };
+    }
+  });
+
+  const staleClusterEntries = buildStaleClusters(listDependencyInvalidations(db, { pipelineId }), { pipelineId })
+    .map((cluster) => ({
+      category: 'stale',
+      created_at: cluster.invalidations[0]?.created_at || null,
+      event_type: 'stale_cluster_active',
+      status: cluster.severity === 'block' ? 'denied' : 'warn',
+      reason_code: 'dependent_work_stale',
+      summary: `${cluster.title}.`,
+      affected_task_ids: cluster.affected_task_ids,
+      next_action: cluster.next_action,
+    }));
+
+  return [...mappedEvents, ...staleClusterEntries]
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+    .slice(0, limit);
+}
+
 function withTaskSpec(db, task) {
   return {
     ...task,
@@ -800,6 +921,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   const subsystemTags = uniq(completedTasks.flatMap((task) => task.task_spec?.subsystem_tags || []));
   const policyState = summarizePipelinePolicyState(status, changePolicy, aiGate.boundary_validations || []);
   const staleClusters = buildStaleClusters(aiGate.dependency_invalidations || [], { pipelineId });
+  const trustAudit = buildPipelineTrustAudit(db, pipelineId);
   const riskNotes = [];
   if (!ciGateOk) riskNotes.push('Repo gate is blocked by conflicts, unmanaged changes, or stale worktrees.');
   if (aiGate.status !== 'pass') riskNotes.push(aiGate.summary);
@@ -851,6 +973,11 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     ...(staleClusters.length > 0
       ? [
         `- Stale clusters: ${staleClusters.map((cluster) => `${cluster.affected_pipeline_id || cluster.affected_task_ids[0]}:${cluster.invalidation_count}`).join(' | ')}`,
+      ]
+      : []),
+    ...(trustAudit.length > 0
+      ? [
+        `- Trust audit: ${trustAudit.slice(0, 3).map((entry) => `${entry.category}:${entry.summary}`).join(' | ')}`,
       ]
       : []),
     '',
@@ -914,6 +1041,13 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
         '',
       ]
       : []),
+    ...(trustAudit.length > 0
+      ? [
+        '## Policy & Stale Audit',
+        ...trustAudit.map((entry) => `- ${entry.created_at}: [${entry.category}] ${entry.summary} -> ${entry.next_action}`),
+        '',
+      ]
+      : []),
     '## Provenance',
     ...provenance.map((entry) => `- ${entry.task_id}: ${entry.title} (${entry.task_type || 'unknown'}, ${entry.worktree || 'unassigned'}, lease ${entry.lease_id || 'none'})`),
     ...(provenance.length === 0 ? ['- No completed task provenance yet'] : []),
@@ -950,6 +1084,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
       subsystem_tags: subsystemTags,
       policy_state: policyState,
       stale_clusters: staleClusters,
+      trust_audit: trustAudit,
     },
     counts: status.counts,
     ci_gate: {
@@ -963,6 +1098,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     },
     policy_state: policyState,
     stale_clusters: staleClusters,
+    trust_audit: trustAudit,
     worktree_changes: worktreeChanges,
     markdown,
   };
@@ -971,6 +1107,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
 export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
   const staleClusters = buildStaleClusters(listDependencyInvalidations(db, { pipelineId }), { pipelineId });
+  const trustAudit = buildPipelineTrustAudit(db, pipelineId);
   let landing;
   let landingError = null;
   try {
@@ -1072,6 +1209,13 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
         '',
       ]
       : []),
+    ...(trustAudit.length > 0
+      ? [
+        '## Policy & Stale Audit',
+        ...trustAudit.map((entry) => `- ${entry.created_at}: [${entry.category}] ${entry.summary} -> ${entry.next_action}`),
+        '',
+      ]
+      : []),
     '',
     '## Queue State',
     `- Status: ${queueState.status}`,
@@ -1092,6 +1236,7 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
     landing,
     recovery_state: recoveryState,
     stale_clusters: staleClusters,
+    trust_audit: trustAudit,
     queue_state: queueState,
     landing_error: landingError,
     next_action: queueState.next_action || nextAction,

@@ -34,7 +34,7 @@ import {
   registerWorktree, listWorktrees,
   enqueueMergeItem, getMergeQueueItem, listMergeQueue, listMergeQueueEvents, removeMergeQueueItem, retryMergeQueueItem,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts, retryTask,
-  verifyAuditTrail,
+  listAuditEvents, verifyAuditTrail,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcpConfig } from '../core/mcp.js';
@@ -625,6 +625,291 @@ function buildStalePipelineExplainReport(db, pipelineId) {
     next_action: staleClusters.length > 0
       ? `switchman task retry-stale --pipeline ${pipelineId}`
       : null,
+  };
+}
+
+function parseEventDetails(details) {
+  try {
+    return JSON.parse(details || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function pipelineOwnsAuditEvent(event, pipelineId) {
+  if (event.task_id?.startsWith(`${pipelineId}-`)) return true;
+  const details = parseEventDetails(event.details);
+  if (details.pipeline_id === pipelineId) return true;
+  if (details.source_pipeline_id === pipelineId) return true;
+  if (Array.isArray(details.task_ids) && details.task_ids.some((taskId) => String(taskId).startsWith(`${pipelineId}-`))) {
+    return true;
+  }
+  return false;
+}
+
+function fallbackEventLabel(eventType) {
+  return String(eventType || 'event')
+    .split('_')
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function summarizePipelineAuditHistoryEvent(event, pipelineId) {
+  const details = parseEventDetails(event.details);
+  const defaultNextAction = `switchman pipeline status ${pipelineId}`;
+
+  switch (event.event_type) {
+    case 'pipeline_created':
+      return {
+        label: 'Pipeline created',
+        summary: `Created pipeline "${details.title || pipelineId}" with ${(details.task_ids || []).length} planned task${(details.task_ids || []).length === 1 ? '' : 's'}.`,
+        next_action: defaultNextAction,
+      };
+    case 'task_completed':
+      return {
+        label: 'Task completed',
+        summary: `Completed ${event.task_id}.`,
+        next_action: defaultNextAction,
+      };
+    case 'task_failed':
+      return {
+        label: 'Task failed',
+        summary: `Failed ${event.task_id}${event.reason_code ? ` because ${humanizeReasonCode(event.reason_code)}` : ''}.`,
+        next_action: defaultNextAction,
+      };
+    case 'task_retried':
+    case 'pipeline_task_retry_scheduled':
+      return {
+        label: 'Task retry scheduled',
+        summary: `Scheduled a retry for ${event.task_id}${details.retry_attempt ? ` (attempt ${details.retry_attempt})` : ''}.`,
+        next_action: defaultNextAction,
+      };
+    case 'dependency_invalidations_updated':
+      return {
+        label: 'Stale work detected',
+        summary: `Marked stale work after ${details.source_task_title || details.source_task_id || 'an upstream task'} changed a shared boundary.`,
+        next_action: details.affected_pipeline_id
+          ? `switchman explain stale --pipeline ${details.affected_pipeline_id}`
+          : defaultNextAction,
+      };
+    case 'boundary_validation_state':
+      return {
+        label: 'Boundary validation updated',
+        summary: details.summary || 'Updated boundary validation state for the pipeline.',
+        next_action: defaultNextAction,
+      };
+    case 'pipeline_followups_created':
+      return {
+        label: 'Follow-up work created',
+        summary: `Created ${(details.created_task_ids || []).length} follow-up task${(details.created_task_ids || []).length === 1 ? '' : 's'} for review or validation.`,
+        next_action: `switchman pipeline review ${pipelineId}`,
+      };
+    case 'pipeline_pr_summary':
+      return {
+        label: 'PR summary built',
+        summary: 'Built the reviewer-facing pipeline summary.',
+        next_action: `switchman pipeline sync-pr ${pipelineId} --pr-from-env`,
+      };
+    case 'pipeline_pr_bundle_exported':
+      return {
+        label: 'PR bundle exported',
+        summary: 'Exported PR and landing artifacts for CI or review.',
+        next_action: `switchman pipeline sync-pr ${pipelineId} --pr-from-env`,
+      };
+    case 'pipeline_pr_commented':
+      return {
+        label: 'PR comment updated',
+        summary: `Updated PR #${details.pr_number || 'unknown'} with the latest pipeline status.`,
+        next_action: defaultNextAction,
+      };
+    case 'pipeline_pr_synced':
+      return {
+        label: 'PR sync completed',
+        summary: `Synced PR #${details.pr_number || 'unknown'} with bundle artifacts, comment, and CI outputs.`,
+        next_action: defaultNextAction,
+      };
+    case 'pipeline_pr_published':
+      return {
+        label: 'PR published',
+        summary: `Published pipeline PR${details.pr_number ? ` #${details.pr_number}` : ''}.`,
+        next_action: defaultNextAction,
+      };
+    case 'pipeline_landing_branch_materialized':
+      return {
+        label: event.status === 'allowed' ? 'Landing branch assembled' : 'Landing branch failed',
+        summary: event.status === 'allowed'
+          ? `Materialized synthetic landing branch ${details.branch || 'unknown'} from ${(details.component_branches || []).length} component branch${(details.component_branches || []).length === 1 ? '' : 'es'}.`
+          : `Failed to materialize the landing branch${details.failed_branch ? ` while merging ${details.failed_branch}` : ''}.`,
+        next_action: details.next_action || `switchman explain landing ${pipelineId}`,
+      };
+    case 'pipeline_landing_recovery_prepared':
+      return {
+        label: 'Landing recovery prepared',
+        summary: `Prepared a recovery worktree${details.recovery_path ? ` at ${details.recovery_path}` : ''} for the landing branch.`,
+        next_action: details.inspect_command || `switchman pipeline land ${pipelineId} --recover`,
+      };
+    case 'pipeline_landing_recovery_resumed':
+      return {
+        label: 'Landing recovery resumed',
+        summary: 'Recorded a manually resolved landing branch and marked it ready to queue again.',
+        next_action: details.resume_command || `switchman queue add --pipeline ${pipelineId}`,
+      };
+    case 'pipeline_landing_recovery_cleared':
+      return {
+        label: 'Landing recovery cleaned up',
+        summary: `Cleared the recorded landing recovery worktree${details.recovery_path ? ` at ${details.recovery_path}` : ''}.`,
+        next_action: defaultNextAction,
+      };
+    default:
+      return {
+        label: fallbackEventLabel(event.event_type),
+        summary: details.summary || fallbackEventLabel(event.event_type),
+        next_action: defaultNextAction,
+      };
+  }
+}
+
+function summarizePipelineQueueHistoryEvent(item, event) {
+  const details = parseEventDetails(event.details);
+
+  switch (event.event_type) {
+    case 'merge_queue_enqueued':
+      return {
+        label: 'Queued for landing',
+        summary: `Queued ${item.id} to land ${item.source_ref} onto ${item.target_branch}.`,
+        next_action: 'switchman queue status',
+      };
+    case 'merge_queue_started':
+      return {
+        label: 'Queue processing started',
+        summary: `Started validating queue item ${item.id}.`,
+        next_action: 'switchman queue status',
+      };
+    case 'merge_queue_retried':
+      return {
+        label: 'Queue item retried',
+        summary: `Moved ${item.id} back into the landing queue for another attempt.`,
+        next_action: 'switchman queue status',
+      };
+    case 'merge_queue_state_changed':
+      return {
+        label: `Queue ${event.status || 'updated'}`,
+        summary: details.last_error_summary
+          || (event.status === 'merged'
+            ? `Merged ${item.id}${details.merged_commit ? ` at ${String(details.merged_commit).slice(0, 12)}` : ''}.`
+            : `Updated ${item.id} to ${event.status || 'unknown'}.`),
+        next_action: details.next_action || item.next_action || `switchman explain queue ${item.id}`,
+      };
+    default:
+      return {
+        label: fallbackEventLabel(event.event_type),
+        summary: fallbackEventLabel(event.event_type),
+        next_action: item.next_action || `switchman explain queue ${item.id}`,
+      };
+  }
+}
+
+function buildPipelineHistoryReport(db, repoRoot, pipelineId) {
+  const status = getPipelineStatus(db, pipelineId);
+  let landing;
+  try {
+    landing = getPipelineLandingExplainReport(db, repoRoot, pipelineId);
+  } catch (err) {
+    landing = {
+      pipeline_id: pipelineId,
+      landing: {
+        branch: null,
+        strategy: 'unresolved',
+        synthetic: false,
+        stale: false,
+        stale_reasons: [],
+        last_failure: {
+          reason_code: 'landing_not_ready',
+          summary: String(err.message || 'Landing branch is not ready yet.'),
+        },
+        last_recovery: null,
+      },
+      next_action: `switchman pipeline status ${pipelineId}`,
+    };
+  }
+  const staleClusters = buildStaleClusters(listDependencyInvalidations(db, { pipelineId }))
+    .filter((cluster) => cluster.affected_pipeline_id === pipelineId);
+  const queueItems = listMergeQueue(db)
+    .filter((item) => item.source_pipeline_id === pipelineId)
+    .map((item) => ({
+      ...item,
+      recent_events: listMergeQueueEvents(db, item.id, { limit: 20 }),
+    }));
+  const auditEvents = listAuditEvents(db, { limit: 2000 })
+    .filter((event) => pipelineOwnsAuditEvent(event, pipelineId));
+
+  const events = [
+    ...auditEvents.map((event) => {
+      const described = summarizePipelineAuditHistoryEvent(event, pipelineId);
+      return {
+        source: 'audit',
+        id: `audit:${event.id}`,
+        created_at: event.created_at,
+        event_type: event.event_type,
+        status: event.status,
+        reason_code: event.reason_code || null,
+        task_id: event.task_id || null,
+        ...described,
+      };
+    }),
+    ...queueItems.flatMap((item) => item.recent_events.map((event) => {
+      const described = summarizePipelineQueueHistoryEvent(item, event);
+      return {
+        source: 'queue',
+        id: `queue:${item.id}:${event.id}`,
+        created_at: event.created_at,
+        event_type: event.event_type,
+        status: event.status || item.status,
+        reason_code: null,
+        task_id: null,
+        queue_item_id: item.id,
+        ...described,
+      };
+    })),
+  ].sort((a, b) => {
+    const timeCompare = String(a.created_at || '').localeCompare(String(b.created_at || ''));
+    if (timeCompare !== 0) return timeCompare;
+    return a.id.localeCompare(b.id);
+  });
+
+  const blockedQueueItem = queueItems.find((item) => item.status === 'blocked');
+  const nextAction = staleClusters[0]?.command
+    || blockedQueueItem?.next_action
+    || landing.next_action
+    || `switchman pipeline status ${pipelineId}`;
+
+  return {
+    pipeline_id: pipelineId,
+    title: status.title,
+    description: status.description,
+    counts: status.counts,
+    current: {
+      stale_clusters: staleClusters,
+      queue_items: queueItems.map((item) => ({
+        id: item.id,
+        status: item.status,
+        target_branch: item.target_branch,
+        last_error_code: item.last_error_code || null,
+        last_error_summary: item.last_error_summary || null,
+        next_action: item.next_action || null,
+      })),
+      landing: {
+        branch: landing.landing.branch,
+        strategy: landing.landing.strategy,
+        synthetic: landing.landing.synthetic,
+        stale: landing.landing.stale,
+        stale_reasons: landing.landing.stale_reasons,
+        last_failure: landing.landing.last_failure,
+        last_recovery: landing.landing.last_recovery,
+      },
+    },
+    events,
+    next_action: nextAction,
   };
 }
 
@@ -2499,6 +2784,7 @@ explainCmd.addHelpText('after', `
 Examples:
   switchman explain queue mq-123
   switchman explain claim src/auth/login.js
+  switchman explain history pipe-123
 `);
 
 explainCmd
@@ -2655,6 +2941,60 @@ explainCmd
     } catch (err) {
       db.close();
       printErrorWithNext(err.message, opts.pipeline ? 'switchman doctor' : 'switchman doctor');
+      process.exitCode = 1;
+    }
+  });
+
+explainCmd
+  .command('history <pipelineId>')
+  .description('Explain the recent change timeline for one pipeline')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const report = buildPipelineHistoryReport(db, repoRoot, pipelineId);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold(`History for pipeline ${report.pipeline_id}`));
+      console.log(`  ${chalk.dim('title:')} ${report.title}`);
+      console.log(`  ${chalk.dim('tasks:')} pending ${report.counts.pending} • in progress ${report.counts.in_progress} • done ${report.counts.done} • failed ${report.counts.failed}`);
+      if (report.current.queue_items.length > 0) {
+        const queueSummary = report.current.queue_items
+          .map((item) => `${item.id} ${item.status}`)
+          .join(', ');
+        console.log(`  ${chalk.dim('queue:')} ${queueSummary}`);
+      }
+      if (report.current.stale_clusters.length > 0) {
+        console.log(`  ${chalk.red('stale:')} ${report.current.stale_clusters[0].title}`);
+      }
+      if (report.current.landing.last_failure) {
+        console.log(`  ${chalk.red('landing:')} ${humanizeReasonCode(report.current.landing.last_failure.reason_code || 'landing_branch_materialization_failed')}`);
+      } else if (report.current.landing.stale) {
+        console.log(`  ${chalk.yellow('landing:')} synthetic landing branch is stale`);
+      } else {
+        console.log(`  ${chalk.dim('landing:')} ${report.current.landing.branch} (${report.current.landing.strategy})`);
+      }
+      console.log(`  ${chalk.yellow('next:')} ${report.next_action}`);
+
+      console.log(chalk.bold('\nTimeline'));
+      for (const event of report.events.slice(-20)) {
+        const status = event.status ? ` ${statusBadge(event.status).trim()}` : '';
+        console.log(`  ${chalk.dim(event.created_at)} ${chalk.cyan(event.label)}${status}`);
+        console.log(`    ${event.summary}`);
+        if (event.next_action) {
+          console.log(`    ${chalk.dim(`next: ${event.next_action}`)}`);
+        }
+      }
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, `switchman pipeline status ${pipelineId}`);
       process.exitCode = 1;
     }
   });
@@ -4213,6 +4553,39 @@ Examples:
 `);
 
 const auditCmd = program.command('audit').description('Inspect and verify the tamper-evident audit trail');
+
+auditCmd
+  .command('change <pipelineId>')
+  .description('Show a signed, operator-friendly history for one pipeline')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, options) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const report = buildPipelineHistoryReport(db, repoRoot, pipelineId);
+      db.close();
+
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold(`Audit history for pipeline ${report.pipeline_id}`));
+      console.log(`  ${chalk.dim('title:')} ${report.title}`);
+      console.log(`  ${chalk.dim('events:')} ${report.events.length}`);
+      console.log(`  ${chalk.yellow('next:')} ${report.next_action}`);
+      for (const event of report.events.slice(-20)) {
+        const status = event.status ? ` ${statusBadge(event.status).trim()}` : '';
+        console.log(`  ${chalk.dim(event.created_at)} ${chalk.cyan(event.label)}${status}`);
+        console.log(`    ${event.summary}`);
+      }
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, `switchman pipeline status ${pipelineId}`);
+      process.exitCode = 1;
+    }
+  });
 
 auditCmd
   .command('verify')

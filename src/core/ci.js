@@ -182,6 +182,11 @@ export function formatPipelineLandingMarkdown(result) {
       ? result.stale_clusters.map((cluster) => `- ${cluster.title}: ${cluster.detail} -> ${cluster.next_action}`)
       : ['- None']),
     '',
+    '## Policy & Stale Audit',
+    ...(result.trust_audit?.length
+      ? result.trust_audit.map((entry) => `- ${entry.created_at}: [${entry.category}] ${entry.summary} -> ${entry.next_action}`)
+      : ['- No recent policy or stale-wave audit entries']),
+    '',
     '## Queue State',
     `- Status: ${result.queue_state?.status || 'not_queued'}`,
     ...(result.queue_state?.item_id ? [`- Item: ${result.queue_state.item_id}`] : []),
@@ -215,6 +220,8 @@ export function writeGitHubPipelineLandingStatus({ result, stepSummaryPath = nul
       `switchman_queue_merged_commit=${result.queue_state?.merged_commit || ''}`,
       `switchman_stale_cluster_count=${result.stale_clusters?.length || 0}`,
       `switchman_stale_cluster_summary=${JSON.stringify((result.stale_clusters || []).map((cluster) => `${cluster.affected_pipeline_id || cluster.affected_task_ids[0]}:${cluster.invalidation_count}`).join(' | '))}`,
+      `switchman_trust_audit_count=${result.trust_audit?.length || 0}`,
+      `switchman_trust_audit_summary=${JSON.stringify((result.trust_audit || []).slice(0, 3).map((entry) => `${entry.category}:${entry.summary}`).join(' | '))}`,
       `switchman_landing_next_action=${JSON.stringify(result.next_action)}`,
       `switchman_check_name=${JSON.stringify('Switchman Pipeline Landing')}`,
       `switchman_check_status=${checkInfo.status}`,
