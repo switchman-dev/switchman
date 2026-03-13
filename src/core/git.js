@@ -4,7 +4,7 @@
  */
 
 import { execFileSync, execSync, spawnSync } from 'child_process';
-import { existsSync, realpathSync, rmSync } from 'fs';
+import { existsSync, realpathSync, rmSync, statSync } from 'fs';
 import { join, relative, resolve, basename } from 'path';
 import { tmpdir } from 'os';
 import { filterIgnoredPaths } from './ignore.js';
@@ -340,30 +340,65 @@ export function gitMergeBranchInto(repoRoot, baseBranch, topicBranch) {
   }
 }
 
+export function gitAssessBranchFreshness(repoRoot, baseBranch, topicBranch) {
+  const baseCommit = gitRevParse(repoRoot, baseBranch);
+  const topicCommit = gitRevParse(repoRoot, topicBranch);
+  if (!baseCommit || !topicCommit) {
+    return {
+      state: 'unknown',
+      base_commit: baseCommit || null,
+      topic_commit: topicCommit || null,
+      merge_base: null,
+    };
+  }
+
+  try {
+    const mergeBase = execFileSync('git', ['merge-base', baseBranch, topicBranch], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    return {
+      state: mergeBase === baseCommit ? 'fresh' : 'behind',
+      base_commit: baseCommit,
+      topic_commit: topicCommit,
+      merge_base: mergeBase,
+    };
+  } catch {
+    return {
+      state: 'unknown',
+      base_commit: baseCommit,
+      topic_commit: topicCommit,
+      merge_base: null,
+    };
+  }
+}
+
 export function gitMaterializeIntegrationBranch(repoRoot, {
   branch,
   baseBranch = 'main',
   mergeBranches = [],
+  tempWorktreePath = null,
 } = {}) {
   const uniqueBranches = [...new Set(mergeBranches.filter(Boolean))].filter((candidate) => candidate !== branch);
-  const tempWorktreePath = join(tmpdir(), `switchman-landing-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const resolvedTempWorktreePath = tempWorktreePath || join(tmpdir(), `switchman-landing-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
 
   try {
-    execFileSync('git', ['worktree', 'add', '--detach', tempWorktreePath, baseBranch], {
+    execFileSync('git', ['worktree', 'add', '--detach', resolvedTempWorktreePath, baseBranch], {
       cwd: repoRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     execFileSync('git', ['checkout', '-B', branch, baseBranch], {
-      cwd: tempWorktreePath,
+      cwd: resolvedTempWorktreePath,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     for (const mergeBranch of uniqueBranches) {
       execFileSync('git', ['merge', '--no-ff', '--no-edit', mergeBranch], {
-        cwd: tempWorktreePath,
+        cwd: resolvedTempWorktreePath,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -373,30 +408,219 @@ export function gitMaterializeIntegrationBranch(repoRoot, {
       branch,
       base_branch: baseBranch,
       merged_branches: uniqueBranches,
-      head_commit: gitRevParse(tempWorktreePath, 'HEAD'),
+      head_commit: gitRevParse(resolvedTempWorktreePath, 'HEAD'),
+      temp_worktree_path: resolvedTempWorktreePath,
     };
   } catch (err) {
+    const stderr = String(err?.stderr || '');
+    const stdout = String(err?.stdout || '');
+    const combinedOutput = `${stdout}${stderr}`.trim();
+    const message = String(err?.message || combinedOutput || 'Failed to materialize integration branch.');
+    const currentMergeBranch = uniqueBranches.find((candidate) =>
+      message.includes(candidate) || combinedOutput.includes(candidate),
+    ) || null;
+    let reasonCode = 'landing_branch_materialization_failed';
+    if (/CONFLICT|Automatic merge failed|Merge conflict/i.test(message) || /CONFLICT|Automatic merge failed/i.test(combinedOutput)) {
+      reasonCode = 'landing_branch_merge_conflict';
+    } else if (/not something we can merge|unknown revision|bad revision|not a valid object name/i.test(message) || /not something we can merge|unknown revision|bad revision|not a valid object name/i.test(combinedOutput)) {
+      reasonCode = 'landing_branch_missing_component';
+    } else if (message.includes(baseBranch) && /not something we can merge|unknown revision|bad revision|not a valid object name/i.test(message)) {
+      reasonCode = 'landing_branch_missing_base';
+    }
+    const conflictingFiles = reasonCode === 'landing_branch_merge_conflict'
+      ? execFileSync('git', ['diff', '--name-only', '--diff-filter=U'], {
+        cwd: resolvedTempWorktreePath,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim().split('\n').filter(Boolean)
+      : [];
     try {
       execFileSync('git', ['merge', '--abort'], {
-        cwd: tempWorktreePath,
+        cwd: resolvedTempWorktreePath,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch {
       // No active merge to abort.
     }
-    throw err;
+    const landingError = new Error(message);
+    landingError.code = reasonCode;
+    landingError.details = {
+      branch,
+      base_branch: baseBranch,
+      merge_branches: uniqueBranches,
+      failed_branch: currentMergeBranch,
+      conflicting_files: conflictingFiles,
+      output: combinedOutput.slice(0, 1000),
+      temp_worktree_path: resolvedTempWorktreePath,
+    };
+    throw landingError;
   } finally {
     try {
-      execFileSync('git', ['worktree', 'remove', tempWorktreePath, '--force'], {
+      execFileSync('git', ['worktree', 'remove', resolvedTempWorktreePath, '--force'], {
         cwd: repoRoot,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch {
-      rmSync(tempWorktreePath, { recursive: true, force: true });
+      rmSync(resolvedTempWorktreePath, { recursive: true, force: true });
     }
   }
+}
+
+export function gitPrepareIntegrationRecoveryWorktree(repoRoot, {
+  branch,
+  baseBranch = 'main',
+  mergeBranches = [],
+  recoveryPath,
+} = {}) {
+  const uniqueBranches = [...new Set(mergeBranches.filter(Boolean))].filter((candidate) => candidate !== branch);
+  if (!recoveryPath) {
+    throw new Error('Recovery path is required.');
+  }
+  if (existsSync(recoveryPath)) {
+    throw new Error(`Recovery path already exists: ${recoveryPath}`);
+  }
+
+  execFileSync('git', ['worktree', 'add', '--detach', recoveryPath, baseBranch], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  try {
+    execFileSync('git', ['checkout', '-B', branch, baseBranch], {
+      cwd: recoveryPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    for (const mergeBranch of uniqueBranches) {
+      try {
+        execFileSync('git', ['merge', '--no-ff', '--no-edit', mergeBranch], {
+          cwd: recoveryPath,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        const conflictingFiles = execFileSync('git', ['diff', '--name-only', '--diff-filter=U'], {
+          cwd: recoveryPath,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }).trim().split('\n').filter(Boolean);
+        return {
+          ok: false,
+          branch,
+          base_branch: baseBranch,
+          recovery_path: recoveryPath,
+          merged_branches: uniqueBranches,
+          failed_branch: mergeBranch,
+          conflicting_files: conflictingFiles,
+          output: `${String(err.stdout || '')}${String(err.stderr || '')}`.trim().slice(0, 1000),
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      branch,
+      base_branch: baseBranch,
+      recovery_path: recoveryPath,
+      merged_branches: uniqueBranches,
+      head_commit: gitRevParse(recoveryPath, 'HEAD'),
+      conflicting_files: [],
+      failed_branch: null,
+      output: '',
+    };
+  } catch (err) {
+    try {
+      execFileSync('git', ['worktree', 'remove', recoveryPath, '--force'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      rmSync(recoveryPath, { recursive: true, force: true });
+    }
+    throw err;
+  }
+}
+
+export function gitRemoveWorktree(repoRoot, worktreePath) {
+  execFileSync('git', ['worktree', 'remove', worktreePath, '--force'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+export function gitPruneWorktrees(repoRoot) {
+  execFileSync('git', ['worktree', 'prune'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function isSwitchmanTempLandingWorktreePath(worktreePath) {
+  const resolvedPath = normalizeFsPath(worktreePath || '');
+  const tempRoot = normalizeFsPath(tmpdir());
+  return resolvedPath.startsWith(`${tempRoot}/`) && basename(resolvedPath).startsWith('switchman-landing-');
+}
+
+export function cleanupCrashedLandingTempWorktrees(
+  repoRoot,
+  {
+    olderThanMs = 15 * 60 * 1000,
+    now = Date.now(),
+  } = {},
+) {
+  const actions = [];
+  const beforePrune = listGitWorktrees(repoRoot)
+    .filter((worktree) => isSwitchmanTempLandingWorktreePath(worktree.path));
+  const missingBeforePrune = beforePrune.filter((worktree) => !existsSync(worktree.path));
+
+  gitPruneWorktrees(repoRoot);
+
+  const afterPrune = listGitWorktrees(repoRoot)
+    .filter((worktree) => isSwitchmanTempLandingWorktreePath(worktree.path));
+  const remainingPaths = new Set(afterPrune.map((worktree) => worktree.path));
+
+  for (const worktree of missingBeforePrune) {
+    if (!remainingPaths.has(worktree.path)) {
+      actions.push({
+        kind: 'stale_temp_worktree_pruned',
+        path: worktree.path,
+        branch: worktree.branch || null,
+      });
+    }
+  }
+
+  for (const worktree of afterPrune) {
+    if (!existsSync(worktree.path)) continue;
+
+    let ageMs = 0;
+    try {
+      ageMs = Math.max(0, now - statSync(worktree.path).mtimeMs);
+    } catch {
+      continue;
+    }
+
+    if (ageMs < olderThanMs) continue;
+
+    gitRemoveWorktree(repoRoot, worktree.path);
+    actions.push({
+      kind: 'stale_temp_worktree_removed',
+      path: worktree.path,
+      branch: worktree.branch || null,
+      age_ms: ageMs,
+    });
+  }
+
+  return {
+    repaired: actions.length > 0,
+    actions,
+  };
 }
 
 /**

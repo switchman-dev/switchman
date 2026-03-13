@@ -67,6 +67,9 @@ Plain-English note:
 ### `switchman pipeline comment`
 - posts or updates the landing summary on a PR
 - can read the PR number from GitHub Actions with `--pr-from-env`
+### `switchman pipeline sync-pr`
+- bundles pipeline artifacts, updates the PR comment, and writes GitHub outputs together
+- useful as the single CI handoff command for pipeline reviews
 ### `switchman pipeline publish`
 
 ## MCP and CI
@@ -76,4 +79,6 @@ Plain-English note:
 ### `switchman gate install-ci`
 - installs a GitHub Actions workflow with a named Switchman PR check
 - keeps the Switchman summary visible before the workflow fails the check
+### `switchman policy init-change`
+### `switchman policy show-change`
 ### `switchman audit verify`

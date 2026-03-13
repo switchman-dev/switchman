@@ -24,15 +24,17 @@ import { tmpdir } from 'os';
 import { dirname, join, posix } from 'path';
 import { execSync, spawn } from 'child_process';
 
-import { findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.js';
+import { cleanupCrashedLandingTempWorktrees, findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.js';
 import { matchesPathPatterns } from '../core/ignore.js';
 import {
   initDb, openDb,
   DEFAULT_STALE_LEASE_MINUTES,
   createTask, startTaskLease, completeTask, failTask, getBoundaryValidationState, getTaskSpec, listTasks, getTask, getNextPendingTask,
   listDependencyInvalidations, listLeases, listScopeReservations, heartbeatLease, getStaleLeases, reapStaleLeases,
-  registerWorktree, listWorktrees,
-  enqueueMergeItem, getMergeQueueItem, listMergeQueue, listMergeQueueEvents, removeMergeQueueItem, retryMergeQueueItem,
+  registerWorktree, listWorktrees, updateWorktreeStatus,
+  enqueueMergeItem, escalateMergeQueueItem, getMergeQueueItem, listMergeQueue, listMergeQueueEvents, removeMergeQueueItem, retryMergeQueueItem,
+  markMergeQueueState,
+  finishOperationJournalEntry, listOperationJournal, listTempResources, updateTempResource,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts, retryTask,
   listAuditEvents, verifyAuditTrail,
 } from '../core/db.js';
@@ -41,7 +43,7 @@ import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcp
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
-import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, evaluatePipelinePolicyGate, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, resumePipelineLandingRecovery, runPipeline, startPipeline, summarizePipelinePolicyState, syncPipelinePr } from '../core/pipeline.js';
+import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, evaluatePipelinePolicyGate, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, inferPipelineIdFromBranch, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, repairPipelineState, resumePipelineLandingRecovery, runPipeline, startPipeline, summarizePipelinePolicyState, syncPipelinePr } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus, writeGitHubPipelineLandingStatus } from '../core/ci.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, resolveQueueSource, runMergeQueue } from '../core/queue.js';
@@ -96,6 +98,13 @@ function resolvePrNumberFromEnv(env = process.env) {
   }
 
   return null;
+}
+
+function resolveBranchFromEnv(env = process.env) {
+  return env.SWITCHMAN_BRANCH
+    || env.GITHUB_HEAD_REF
+    || env.GITHUB_REF_NAME
+    || null;
 }
 
 function retryStaleTasks(db, { pipelineId = null, reason = 'bulk stale retry' } = {}) {
@@ -467,7 +476,16 @@ function buildQueueExplainReport(db, repoRoot, itemId) {
 
 function inferQueueExplainNextAction(item, resolved, resolutionError) {
   if (item.status === 'blocked' && item.next_action) return item.next_action;
+  if (item.status === 'blocked' && item.last_error_code === 'source_missing') {
+    return `Recreate the source branch, then run \`switchman queue retry ${item.id}\`.`;
+  }
   if (resolutionError) return 'Fix the source resolution issue, then re-run `switchman explain queue <itemId>` or queue a branch/worktree explicitly.';
+  if (item.status === 'retrying' && item.backoff_until) {
+    return item.next_action || `Wait until ${item.backoff_until}, or run \`switchman queue retry ${item.id}\` to retry sooner.`;
+  }
+  if (item.status === 'escalated') {
+    return item.next_action || `Run \`switchman explain queue ${item.id}\` to review the landing risk, then \`switchman queue retry ${item.id}\` when it is ready again.`;
+  }
   if (item.status === 'queued' || item.status === 'retrying') return 'Run `switchman queue run` to continue landing queued work.';
   if (item.status === 'merged') return 'No action needed.';
   if (resolved?.pipeline_id) return `Run \`switchman pipeline status ${resolved.pipeline_id}\` to inspect the pipeline state.`;
@@ -526,10 +544,19 @@ function buildStaleTaskExplainReport(db, taskId) {
     invalidations: invalidations.map((item) => ({
       ...item,
       details: item.details || {},
+      revalidation_set: item.details?.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
       stale_area: item.reason_type === 'subsystem_overlap'
         ? `subsystem:${item.subsystem_tag}`
+        : item.reason_type === 'semantic_contract_drift'
+          ? `contract:${(item.details?.contract_names || []).join('|') || 'unknown'}`
+        : item.reason_type === 'semantic_object_overlap'
+          ? `object:${(item.details?.object_names || []).join('|') || 'unknown'}`
         : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
-      summary: `${item.details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
+      summary: item.reason_type === 'semantic_contract_drift'
+        ? `${item.details?.source_task_title || item.source_task_id} changed shared contract ${(item.details?.contract_names || []).join(', ') || 'unknown'}`
+        : item.reason_type === 'semantic_object_overlap'
+          ? `${item.details?.source_task_title || item.source_task_id} changed shared exported object ${(item.details?.object_names || []).join(', ') || 'unknown'}`
+          : `${item.details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
     })),
     next_action: invalidations.length > 0
       ? `switchman task retry ${taskId}`
@@ -541,11 +568,21 @@ function normalizeDependencyInvalidation(item) {
   const details = item.details || {};
   return {
     ...item,
+    severity: item.severity || details.severity || (item.reason_type === 'semantic_contract_drift' ? 'blocked' : item.reason_type === 'semantic_object_overlap' ? 'warn' : 'warn'),
     details,
+    revalidation_set: details.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
     stale_area: item.reason_type === 'subsystem_overlap'
       ? `subsystem:${item.subsystem_tag}`
+      : item.reason_type === 'semantic_contract_drift'
+        ? `contract:${(details.contract_names || []).join('|') || 'unknown'}`
+      : item.reason_type === 'semantic_object_overlap'
+        ? `object:${(details.object_names || []).join('|') || 'unknown'}`
       : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
-    summary: `${details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
+    summary: item.reason_type === 'semantic_contract_drift'
+      ? `${details?.source_task_title || item.source_task_id} changed shared contract ${(details.contract_names || []).join(', ') || 'unknown'}`
+      : item.reason_type === 'semantic_object_overlap'
+        ? `${details?.source_task_title || item.source_task_id} changed shared exported object ${(details.object_names || []).join(', ') || 'unknown'}`
+        : `${details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
   };
 }
 
@@ -565,8 +602,11 @@ function buildStaleClusters(invalidations = []) {
         source_worktrees: new Set(),
         affected_worktrees: new Set(),
         stale_areas: new Set(),
+        revalidation_sets: new Set(),
         invalidations: [],
         severity: 'warn',
+        highest_affected_priority: 0,
+        highest_source_priority: 0,
       });
     }
     const cluster = clusters.get(clusterKey);
@@ -577,7 +617,10 @@ function buildStaleClusters(invalidations = []) {
     if (invalidation.source_worktree) cluster.source_worktrees.add(invalidation.source_worktree);
     if (invalidation.affected_worktree) cluster.affected_worktrees.add(invalidation.affected_worktree);
     cluster.stale_areas.add(invalidation.stale_area);
+    if (invalidation.revalidation_set) cluster.revalidation_sets.add(invalidation.revalidation_set);
     if (invalidation.severity === 'blocked') cluster.severity = 'block';
+    cluster.highest_affected_priority = Math.max(cluster.highest_affected_priority, Number(invalidation.details?.affected_task_priority || 0));
+    cluster.highest_source_priority = Math.max(cluster.highest_source_priority, Number(invalidation.details?.source_task_priority || 0));
   }
 
   return [...clusters.values()]
@@ -597,21 +640,51 @@ function buildStaleClusters(invalidations = []) {
         source_worktrees: sourceWorktrees,
         affected_worktrees: affectedWorktrees,
         stale_areas: staleAreas,
+        revalidation_sets: [...cluster.revalidation_sets],
+        revalidation_set_type: cluster.revalidation_sets.has('contract')
+          ? 'contract'
+          : cluster.revalidation_sets.has('semantic_object')
+            ? 'semantic_object'
+            : cluster.revalidation_sets.has('subsystem')
+              ? 'subsystem'
+              : 'scope',
+        rerun_priority: cluster.severity === 'block'
+          ? (cluster.revalidation_sets.has('contract') || cluster.highest_affected_priority >= 8 ? 'urgent' : 'high')
+          : cluster.highest_affected_priority >= 8
+            ? 'high'
+            : cluster.highest_affected_priority >= 5
+              ? 'medium'
+              : 'low',
+        rerun_priority_score: (cluster.severity === 'block' ? 100 : 0)
+          + (cluster.revalidation_sets.has('contract') ? 30 : cluster.revalidation_sets.has('semantic_object') ? 15 : 0)
+          + (cluster.highest_affected_priority * 3)
+          + cluster.invalidations.length,
+        highest_affected_priority: cluster.highest_affected_priority,
+        highest_source_priority: cluster.highest_source_priority,
         severity: cluster.severity,
         invalidations: cluster.invalidations,
         title: cluster.affected_pipeline_id
-          ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale dependency invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
-          : `${affectedTaskIds[0]} has ${cluster.invalidations.length} stale dependency invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
+          ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
+          : `${affectedTaskIds[0]} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
         detail: `${sourceTaskTitles[0] || cluster.invalidations[0]?.source_task_id || 'unknown source'} -> ${affectedWorktrees.join(', ') || 'unknown target'} (${staleAreas.join(', ')})`,
-        next_step: cluster.affected_pipeline_id
-          ? 'retry the stale pipeline tasks together so the whole cluster can be revalidated before merge'
-          : 'retry the stale task so it can be revalidated before merge',
+        next_step: cluster.revalidation_sets.has('contract')
+          ? (cluster.affected_pipeline_id
+            ? 'retry the stale pipeline tasks together so the affected contract can be revalidated before merge'
+            : 'retry the stale task so the affected contract can be revalidated before merge')
+          : cluster.affected_pipeline_id
+            ? 'retry the stale pipeline tasks together so the whole cluster can be revalidated before merge'
+            : 'retry the stale task so it can be revalidated before merge',
         command: cluster.affected_pipeline_id
           ? `switchman task retry-stale --pipeline ${cluster.affected_pipeline_id}`
           : `switchman task retry ${affectedTaskIds[0]}`,
       };
     })
-    .sort((a, b) => b.invalidation_count - a.invalidation_count || String(a.affected_pipeline_id || a.affected_task_ids[0]).localeCompare(String(b.affected_pipeline_id || b.affected_task_ids[0])));
+    .sort((a, b) =>
+      b.rerun_priority_score - a.rerun_priority_score
+      || (a.severity === 'block' ? -1 : 1) - (b.severity === 'block' ? -1 : 1)
+      || (a.revalidation_set_type === 'contract' ? -1 : 1) - (b.revalidation_set_type === 'contract' ? -1 : 1)
+      || b.invalidation_count - a.invalidation_count
+      || String(a.affected_pipeline_id || a.affected_task_ids[0]).localeCompare(String(b.affected_pipeline_id || b.affected_task_ids[0])));
 }
 
 function buildStalePipelineExplainReport(db, pipelineId) {
@@ -910,6 +983,406 @@ function buildPipelineHistoryReport(db, repoRoot, pipelineId) {
     },
     events,
     next_action: nextAction,
+  };
+}
+
+function collectKnownPipelineIds(db) {
+  return [...new Set(
+    listTasks(db)
+      .map((task) => getTaskSpec(db, task.id)?.pipeline_id || null)
+      .filter(Boolean),
+  )].sort();
+}
+
+function reconcileWorktreeState(db, repoRoot) {
+  const actions = [];
+  const dbWorktrees = listWorktrees(db);
+  const gitWorktrees = listGitWorktrees(repoRoot);
+
+  const dbByPath = new Map(dbWorktrees.map((worktree) => [worktree.path, worktree]));
+  const dbByName = new Map(dbWorktrees.map((worktree) => [worktree.name, worktree]));
+  const gitByPath = new Map(gitWorktrees.map((worktree) => [worktree.path, worktree]));
+
+  for (const gitWorktree of gitWorktrees) {
+    const dbMatch = dbByPath.get(gitWorktree.path) || dbByName.get(gitWorktree.name) || null;
+    if (!dbMatch) {
+      registerWorktree(db, {
+        name: gitWorktree.name,
+        path: gitWorktree.path,
+        branch: gitWorktree.branch || 'unknown',
+        agent: null,
+      });
+      actions.push({
+        kind: 'git_worktree_registered',
+        worktree: gitWorktree.name,
+        path: gitWorktree.path,
+        branch: gitWorktree.branch || 'unknown',
+      });
+      continue;
+    }
+
+    if (dbMatch.path !== gitWorktree.path || dbMatch.branch !== (gitWorktree.branch || dbMatch.branch) || dbMatch.status === 'missing') {
+      registerWorktree(db, {
+        name: dbMatch.name,
+        path: gitWorktree.path,
+        branch: gitWorktree.branch || dbMatch.branch || 'unknown',
+        agent: dbMatch.agent,
+      });
+      actions.push({
+        kind: 'db_worktree_reconciled',
+        worktree: dbMatch.name,
+        path: gitWorktree.path,
+        branch: gitWorktree.branch || dbMatch.branch || 'unknown',
+      });
+    }
+  }
+
+  for (const dbWorktree of dbWorktrees) {
+    if (!gitByPath.has(dbWorktree.path) && dbWorktree.status !== 'missing') {
+      updateWorktreeStatus(db, dbWorktree.name, 'missing');
+      actions.push({
+        kind: 'db_worktree_marked_missing',
+        worktree: dbWorktree.name,
+        path: dbWorktree.path,
+        branch: dbWorktree.branch,
+      });
+    }
+  }
+
+  return actions;
+}
+
+function reconcileTrackedTempResources(db, repoRoot) {
+  const actions = [];
+  const warnings = [];
+  const gitWorktrees = listGitWorktrees(repoRoot);
+  const gitPaths = new Set(gitWorktrees.map((worktree) => worktree.path));
+  const resources = listTempResources(db, { limit: 500 }).filter((resource) => resource.status !== 'released');
+
+  for (const resource of resources) {
+    const exists = existsSync(resource.path);
+    const trackedByGit = gitPaths.has(resource.path);
+
+    if (resource.resource_type === 'landing_temp_worktree') {
+      if (!exists && !trackedByGit) {
+        updateTempResource(db, resource.id, {
+          status: 'abandoned',
+          details: JSON.stringify({
+            repaired_by: 'switchman repair',
+            reason: 'temp_worktree_missing_after_interruption',
+            path: resource.path,
+          }),
+        });
+        actions.push({
+          kind: 'temp_resource_reconciled',
+          resource_id: resource.id,
+          resource_type: resource.resource_type,
+          path: resource.path,
+          status: 'abandoned',
+        });
+      }
+      continue;
+    }
+
+    if (resource.resource_type === 'landing_recovery_worktree') {
+      if (!exists && !trackedByGit) {
+        updateTempResource(db, resource.id, {
+          status: 'abandoned',
+          details: JSON.stringify({
+            repaired_by: 'switchman repair',
+            reason: 'recovery_worktree_missing',
+            path: resource.path,
+          }),
+        });
+        actions.push({
+          kind: 'temp_resource_reconciled',
+          resource_id: resource.id,
+          resource_type: resource.resource_type,
+          path: resource.path,
+          status: 'abandoned',
+        });
+      } else if (exists && !trackedByGit) {
+        warnings.push({
+          kind: 'temp_resource_manual_review',
+          resource_id: resource.id,
+          resource_type: resource.resource_type,
+          path: resource.path,
+          status: resource.status,
+          next_action: `Inspect ${resource.path} and either re-register it or clean it up with switchman pipeline land ${resource.scope_id} --cleanup ${JSON.stringify(resource.path)}`,
+        });
+      }
+    }
+  }
+
+  return { actions, warnings };
+}
+
+function summarizeRepairReport(actions = [], warnings = [], notes = []) {
+  return {
+    auto_fixed: actions,
+    manual_review: warnings,
+    skipped: [],
+    notes,
+    counts: {
+      auto_fixed: actions.length,
+      manual_review: warnings.length,
+      skipped: 0,
+    },
+  };
+}
+
+function renderRepairLine(action) {
+  if (action.kind === 'git_worktree_registered') {
+    return `${chalk.dim('registered git worktree:')} ${action.worktree} ${action.path}`;
+  }
+  if (action.kind === 'db_worktree_reconciled') {
+    return `${chalk.dim('reconciled db worktree:')} ${action.worktree} ${action.path}`;
+  }
+  if (action.kind === 'db_worktree_marked_missing') {
+    return `${chalk.dim('marked missing db worktree:')} ${action.worktree} ${action.path}`;
+  }
+  if (action.kind === 'queue_item_blocked_missing_worktree') {
+    return `${chalk.dim('blocked queue item with missing worktree:')} ${action.queue_item_id} ${action.worktree}`;
+  }
+  if (action.kind === 'stale_temp_worktree_removed') {
+    return `${chalk.dim('removed stale temp landing worktree:')} ${action.path}`;
+  }
+  if (action.kind === 'stale_temp_worktree_pruned') {
+    return `${chalk.dim('pruned stale temp landing metadata:')} ${action.path}`;
+  }
+  if (action.kind === 'journal_operation_repaired') {
+    return `${chalk.dim('closed interrupted operation:')} ${action.operation_type} ${action.scope_type}:${action.scope_id}`;
+  }
+  if (action.kind === 'queue_item_reset') {
+    return `${chalk.dim('queue reset:')} ${action.queue_item_id} ${action.previous_status} -> ${action.status}`;
+  }
+  if (action.kind === 'pipeline_repaired') {
+    return `${chalk.dim('pipeline repair:')} ${action.pipeline_id}`;
+  }
+  if (action.kind === 'temp_resource_reconciled') {
+    return `${chalk.dim('reconciled tracked temp resource:')} ${action.resource_type} ${action.path} -> ${action.status}`;
+  }
+  return `${chalk.dim(action.kind + ':')} ${JSON.stringify(action)}`;
+}
+
+function renderRepairWarningLine(warning) {
+  if (warning.kind === 'temp_resource_manual_review') {
+    return `${chalk.yellow('manual review:')} ${warning.resource_type} ${warning.path}`;
+  }
+  return `${chalk.yellow('manual review:')} ${warning.kind}`;
+}
+
+function printRepairSummary(report, {
+  repairedHeading,
+  noRepairHeading,
+  limit = null,
+} = {}) {
+  const autoFixed = report.summary?.auto_fixed || report.actions || [];
+  const manualReview = report.summary?.manual_review || report.warnings || [];
+  const skipped = report.summary?.skipped || [];
+  const limitedAutoFixed = limit == null ? autoFixed : autoFixed.slice(0, limit);
+  const limitedManualReview = limit == null ? manualReview : manualReview.slice(0, limit);
+  const limitedSkipped = limit == null ? skipped : skipped.slice(0, limit);
+
+  console.log(report.repaired ? repairedHeading : noRepairHeading);
+  for (const note of report.notes || []) {
+    console.log(`  ${chalk.dim(note)}`);
+  }
+
+  console.log(`  ${chalk.green('auto-fixed:')} ${autoFixed.length}`);
+  for (const action of limitedAutoFixed) {
+    console.log(`    ${renderRepairLine(action)}`);
+  }
+  console.log(`  ${chalk.yellow('manual review:')} ${manualReview.length}`);
+  for (const warning of limitedManualReview) {
+    console.log(`    ${renderRepairWarningLine(warning)}`);
+  }
+  console.log(`  ${chalk.dim('skipped:')} ${skipped.length}`);
+  for (const item of limitedSkipped) {
+    console.log(`    ${chalk.dim(JSON.stringify(item))}`);
+  }
+}
+
+function repairRepoState(db, repoRoot) {
+  const actions = [];
+  const warnings = [];
+  const notes = [];
+  const repairedQueueItems = new Set();
+  for (const action of reconcileWorktreeState(db, repoRoot)) {
+    actions.push(action);
+  }
+  const tempLandingCleanup = cleanupCrashedLandingTempWorktrees(repoRoot);
+  for (const action of tempLandingCleanup.actions) {
+    actions.push(action);
+  }
+  const tempResourceReconciliation = reconcileTrackedTempResources(db, repoRoot);
+  for (const action of tempResourceReconciliation.actions) {
+    actions.push(action);
+  }
+  for (const warning of tempResourceReconciliation.warnings) {
+    warnings.push(warning);
+  }
+  const queueItems = listMergeQueue(db);
+  const runningQueueOperations = listOperationJournal(db, { scopeType: 'queue_item', status: 'running', limit: 200 });
+
+  for (const operation of runningQueueOperations) {
+    const item = getMergeQueueItem(db, operation.scope_id);
+    if (!item) {
+      finishOperationJournalEntry(db, operation.id, {
+        status: 'repaired',
+        details: JSON.stringify({
+          repaired_by: 'switchman repair',
+          summary: 'Queue item no longer exists; interrupted journal entry was cleared.',
+        }),
+      });
+      actions.push({
+        kind: 'journal_operation_repaired',
+        operation_id: operation.id,
+        operation_type: operation.operation_type,
+        scope_type: operation.scope_type,
+        scope_id: operation.scope_id,
+      });
+      continue;
+    }
+
+    if (['validating', 'rebasing', 'merging'].includes(item.status)) {
+      const repaired = markMergeQueueState(db, item.id, {
+        status: 'retrying',
+        lastErrorCode: 'interrupted_queue_run',
+        lastErrorSummary: `Queue item ${item.id} was interrupted during ${operation.operation_type} and has been reset to retrying.`,
+        nextAction: 'Run `switchman queue run` to resume landing.',
+      });
+      finishOperationJournalEntry(db, operation.id, {
+        status: 'repaired',
+        details: JSON.stringify({
+          repaired_by: 'switchman repair',
+          queue_item_id: item.id,
+          previous_status: item.status,
+          status: repaired.status,
+        }),
+      });
+      repairedQueueItems.add(item.id);
+      actions.push({
+        kind: 'queue_item_reset',
+        queue_item_id: repaired.id,
+        previous_status: item.status,
+        status: repaired.status,
+        next_action: repaired.next_action,
+      });
+      actions.push({
+        kind: 'journal_operation_repaired',
+        operation_id: operation.id,
+        operation_type: operation.operation_type,
+        scope_type: operation.scope_type,
+        scope_id: operation.scope_id,
+      });
+      continue;
+    }
+
+    if (!['running', 'queued', 'retrying'].includes(item.status)) {
+      finishOperationJournalEntry(db, operation.id, {
+        status: 'repaired',
+        details: JSON.stringify({
+          repaired_by: 'switchman repair',
+          queue_item_id: item.id,
+          summary: `Queue item is already ${item.status}; stale running journal entry was cleared.`,
+        }),
+      });
+      actions.push({
+        kind: 'journal_operation_repaired',
+        operation_id: operation.id,
+        operation_type: operation.operation_type,
+        scope_type: operation.scope_type,
+        scope_id: operation.scope_id,
+      });
+    }
+  }
+
+  const interruptedQueueItems = queueItems.filter((item) => ['validating', 'rebasing', 'merging'].includes(item.status) && !repairedQueueItems.has(item.id));
+
+  for (const item of interruptedQueueItems) {
+    const repaired = markMergeQueueState(db, item.id, {
+      status: 'retrying',
+      lastErrorCode: 'interrupted_queue_run',
+      lastErrorSummary: `Queue item ${item.id} was left in ${item.status} and has been reset to retrying.`,
+      nextAction: 'Run `switchman queue run` to resume landing.',
+    });
+    actions.push({
+      kind: 'queue_item_reset',
+      queue_item_id: repaired.id,
+      previous_status: item.status,
+      status: repaired.status,
+      next_action: repaired.next_action,
+      });
+  }
+
+  const reconciledWorktrees = new Map(listWorktrees(db).map((worktree) => [worktree.name, worktree]));
+  for (const item of queueItems.filter((entry) => ['queued', 'retrying'].includes(entry.status) && entry.source_type === 'worktree')) {
+    const worktree = reconciledWorktrees.get(item.source_worktree || item.source_ref) || null;
+    if (!worktree || worktree.status === 'missing') {
+      const blocked = markMergeQueueState(db, item.id, {
+        status: 'blocked',
+        lastErrorCode: 'source_worktree_missing',
+        lastErrorSummary: `Queued worktree ${item.source_worktree || item.source_ref} is no longer available.`,
+        nextAction: `Restore or re-register ${item.source_worktree || item.source_ref}, then run \`switchman queue retry ${item.id}\`.`,
+      });
+      actions.push({
+        kind: 'queue_item_blocked_missing_worktree',
+        queue_item_id: blocked.id,
+        worktree: item.source_worktree || item.source_ref,
+        next_action: blocked.next_action,
+      });
+    }
+  }
+
+  const pipelineIds = [...new Set([
+    ...collectKnownPipelineIds(db),
+    ...queueItems.map((item) => item.source_pipeline_id).filter(Boolean),
+  ])];
+  const runningPipelineOperations = listOperationJournal(db, { scopeType: 'pipeline', status: 'running', limit: 200 });
+
+  for (const pipelineId of pipelineIds) {
+    const repaired = repairPipelineState(db, repoRoot, pipelineId);
+    if (!repaired.repaired) continue;
+    actions.push({
+      kind: 'pipeline_repaired',
+      pipeline_id: pipelineId,
+      actions: repaired.actions,
+      next_action: repaired.next_action,
+    });
+
+    for (const operation of runningPipelineOperations.filter((entry) => entry.scope_id === pipelineId)) {
+      finishOperationJournalEntry(db, operation.id, {
+        status: 'repaired',
+        details: JSON.stringify({
+          repaired_by: 'switchman repair',
+          pipeline_id: pipelineId,
+          repair_actions: repaired.actions.map((action) => action.kind),
+        }),
+      });
+      actions.push({
+        kind: 'journal_operation_repaired',
+        operation_id: operation.id,
+        operation_type: operation.operation_type,
+        scope_type: operation.scope_type,
+        scope_id: operation.scope_id,
+      });
+    }
+  }
+
+  if (actions.length === 0) {
+    notes.push('No safe repair action was needed.');
+  }
+
+  const summary = summarizeRepairReport(actions, warnings, notes);
+
+  return {
+    repaired: actions.length > 0,
+    actions,
+    warnings,
+    summary,
+    notes,
+    next_action: warnings[0]?.next_action || (interruptedQueueItems.length > 0 ? 'switchman queue run' : 'switchman status'),
   };
 }
 
@@ -1668,8 +2141,14 @@ function renderUnifiedStatusReport(report) {
   const queueLines = report.queue.items.length > 0
     ? [
       ...(report.queue.summary.next
-        ? [`${chalk.dim('next:')} ${report.queue.summary.next.id} ${report.queue.summary.next.source_type}:${report.queue.summary.next.source_ref} ${chalk.dim(`retries:${report.queue.summary.next.retry_count}/${report.queue.summary.next.max_retries}`)}`]
+        ? [
+          `${chalk.dim('next:')} ${report.queue.summary.next.id} ${report.queue.summary.next.source_type}:${report.queue.summary.next.source_ref} ${chalk.dim(`retries:${report.queue.summary.next.retry_count}/${report.queue.summary.next.max_retries}`)}${report.queue.summary.next.queue_assessment?.goal_priority ? ` ${chalk.dim(`priority:${report.queue.summary.next.queue_assessment.goal_priority}`)}` : ''}${report.queue.summary.next.queue_assessment?.integration_risk && report.queue.summary.next.queue_assessment.integration_risk !== 'normal' ? ` ${chalk.dim(`risk:${report.queue.summary.next.queue_assessment.integration_risk}`)}` : ''}`,
+          ...(report.queue.summary.next.recommendation?.summary ? [`  ${chalk.dim('decision:')} ${report.queue.summary.next.recommendation.summary}`] : []),
+        ]
         : []),
+      ...report.queue.summary.held_back
+        .slice(0, 2)
+        .map((item) => `  ${chalk.dim(item.recommendation?.action === 'escalate' ? 'escalate:' : 'hold:')} ${item.id} ${item.source_type}:${item.source_ref} ${chalk.dim(item.recommendation?.summary || item.queue_assessment?.reason || '')}`),
       ...report.queue.items
         .filter((entry) => ['blocked', 'retrying', 'merging'].includes(entry.status))
         .slice(0, 4)
@@ -1687,6 +2166,7 @@ function renderUnifiedStatusReport(report) {
       const lines = [`${renderChip(cluster.severity === 'block' ? 'STALE' : 'WATCH', cluster.affected_pipeline_id || cluster.affected_task_ids[0], cluster.severity === 'block' ? chalk.red : chalk.yellow)} ${cluster.title}`];
       lines.push(`  ${chalk.dim(cluster.detail)}`);
       lines.push(`  ${chalk.dim('areas:')} ${cluster.stale_areas.join(', ')}`);
+      lines.push(`  ${chalk.dim('rerun priority:')} ${cluster.rerun_priority} ${chalk.dim(`score:${cluster.rerun_priority_score}`)}${cluster.highest_affected_priority ? ` ${chalk.dim(`affected-priority:${cluster.highest_affected_priority}`)}` : ''}`);
       lines.push(`  ${chalk.yellow('next:')} ${cluster.next_step}`);
       lines.push(`  ${chalk.cyan('run:')} ${cluster.command}`);
       return lines;
@@ -2526,7 +3006,9 @@ queueCmd
     for (const item of items) {
       const retryInfo = chalk.dim(`retries:${item.retry_count}/${item.max_retries}`);
       const attemptInfo = item.last_attempt_at ? ` ${chalk.dim(`last-attempt:${item.last_attempt_at}`)}` : '';
-      console.log(`  ${statusBadge(item.status)} ${item.id} ${item.source_type}:${item.source_ref} ${chalk.dim(`→ ${item.target_branch}`)} ${retryInfo}${attemptInfo}`);
+      const backoffInfo = item.backoff_until ? ` ${chalk.dim(`backoff-until:${item.backoff_until}`)}` : '';
+      const escalationInfo = item.escalated_at ? ` ${chalk.dim(`escalated:${item.escalated_at}`)}` : '';
+      console.log(`  ${statusBadge(item.status)} ${item.id} ${item.source_type}:${item.source_ref} ${chalk.dim(`→ ${item.target_branch}`)} ${retryInfo}${attemptInfo}${backoffInfo}${escalationInfo}`);
       if (item.last_error_summary) {
         console.log(`    ${chalk.red('why:')} ${item.last_error_summary}`);
       }
@@ -2557,7 +3039,7 @@ What it helps you answer:
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
     const items = listMergeQueue(db);
-    const summary = buildQueueStatusSummary(items);
+    const summary = buildQueueStatusSummary(items, { db, repoRoot });
     const recentEvents = items.slice(0, 5).flatMap((item) =>
       listMergeQueueEvents(db, item.id, { limit: 3 }).map((event) => ({ ...event, queue_item_id: item.id })),
     ).sort((a, b) => b.id - a.id).slice(0, 8);
@@ -2568,7 +3050,11 @@ What it helps you answer:
       return;
     }
 
-    const queueHealth = summary.counts.blocked > 0 ? 'block' : summary.counts.retrying > 0 ? 'warn' : 'healthy';
+    const queueHealth = summary.counts.blocked > 0
+      ? 'block'
+      : summary.counts.retrying > 0 || summary.counts.held > 0 || summary.counts.escalated > 0
+        ? 'warn'
+        : 'healthy';
     const queueHealthColor = colorForHealth(queueHealth);
     const focus = summary.blocked[0] || summary.retrying[0] || summary.next || null;
     const focusLine = focus
@@ -2582,6 +3068,8 @@ What it helps you answer:
     console.log(renderSignalStrip([
       renderChip('queued', summary.counts.queued, summary.counts.queued > 0 ? chalk.yellow : chalk.green),
       renderChip('retrying', summary.counts.retrying, summary.counts.retrying > 0 ? chalk.yellow : chalk.green),
+      renderChip('held', summary.counts.held, summary.counts.held > 0 ? chalk.yellow : chalk.green),
+      renderChip('escalated', summary.counts.escalated, summary.counts.escalated > 0 ? chalk.red : chalk.green),
       renderChip('blocked', summary.counts.blocked, summary.counts.blocked > 0 ? chalk.red : chalk.green),
       renderChip('merging', summary.counts.merging, summary.counts.merging > 0 ? chalk.blue : chalk.green),
       renderChip('merged', summary.counts.merged, summary.counts.merged > 0 ? chalk.green : chalk.white),
@@ -2596,10 +3084,22 @@ What it helps you answer:
 
     const queueFocusLines = summary.next
       ? [
-        `${renderChip('NEXT', summary.next.id, chalk.green)} ${summary.next.source_type}:${summary.next.source_ref} ${chalk.dim(`retries:${summary.next.retry_count}/${summary.next.max_retries}`)}`,
-        `  ${chalk.yellow('run:')} switchman queue run`,
+        `${renderChip(summary.next.recommendation?.action === 'retry' ? 'RETRY' : summary.next.recommendation?.action === 'escalate' ? 'ESCALATE' : 'NEXT', summary.next.id, summary.next.recommendation?.action === 'retry' ? chalk.yellow : summary.next.recommendation?.action === 'escalate' ? chalk.red : chalk.green)} ${summary.next.source_type}:${summary.next.source_ref} ${chalk.dim(`retries:${summary.next.retry_count}/${summary.next.max_retries}`)}${summary.next.queue_assessment?.goal_priority ? ` ${chalk.dim(`priority:${summary.next.queue_assessment.goal_priority}`)}` : ''}${summary.next.queue_assessment?.integration_risk && summary.next.queue_assessment.integration_risk !== 'normal' ? ` ${chalk.dim(`risk:${summary.next.queue_assessment.integration_risk}`)}` : ''}${summary.next.queue_assessment?.freshness ? ` ${chalk.dim(`freshness:${summary.next.queue_assessment.freshness}`)}` : ''}${summary.next.queue_assessment?.stale_invalidation_count ? ` ${chalk.dim(`stale:${summary.next.queue_assessment.stale_invalidation_count}`)}` : ''}`,
+        ...(summary.next.queue_assessment?.reason ? [`  ${chalk.dim('why next:')} ${summary.next.queue_assessment.reason}`] : []),
+        ...(summary.next.recommendation?.summary ? [`  ${chalk.dim('decision:')} ${summary.next.recommendation.summary}`] : []),
+        `  ${chalk.yellow('run:')} ${summary.next.recommendation?.command || 'switchman queue run'}`,
       ]
       : [chalk.dim('No queued landing work right now.')];
+
+    const queueHeldBackLines = summary.held_back.length > 0
+      ? summary.held_back.flatMap((item) => {
+        const lines = [`${renderChip(item.recommendation?.action === 'escalate' ? 'ESCALATE' : 'HOLD', item.id, item.recommendation?.action === 'escalate' ? chalk.red : chalk.yellow)} ${item.source_type}:${item.source_ref}${item.queue_assessment?.goal_priority ? ` ${chalk.dim(`priority:${item.queue_assessment.goal_priority}`)}` : ''} ${chalk.dim(`freshness:${item.queue_assessment?.freshness || 'unknown'}`)}${item.queue_assessment?.integration_risk && item.queue_assessment.integration_risk !== 'normal' ? ` ${chalk.dim(`risk:${item.queue_assessment.integration_risk}`)}` : ''}${item.queue_assessment?.stale_invalidation_count ? ` ${chalk.dim(`stale:${item.queue_assessment.stale_invalidation_count}`)}` : ''}`];
+        if (item.queue_assessment?.reason) lines.push(`  ${chalk.dim('why later:')} ${item.queue_assessment.reason}`);
+        if (item.recommendation?.summary) lines.push(`  ${chalk.dim('decision:')} ${item.recommendation.summary}`);
+        if (item.queue_assessment?.next_action) lines.push(`  ${chalk.yellow('next:')} ${item.queue_assessment.next_action}`);
+        return lines;
+      })
+      : [chalk.green('Nothing significant is being held back.')];
 
     const queueBlockedLines = summary.blocked.length > 0
       ? summary.blocked.slice(0, 4).flatMap((item) => {
@@ -2610,13 +3110,14 @@ What it helps you answer:
       })
       : [chalk.green('Nothing blocked.')];
 
-    const queueWatchLines = items.filter((item) => ['retrying', 'merging', 'rebasing', 'validating'].includes(item.status)).length > 0
+    const queueWatchLines = items.filter((item) => ['retrying', 'held', 'escalated', 'merging', 'rebasing', 'validating'].includes(item.status)).length > 0
       ? items
-        .filter((item) => ['retrying', 'merging', 'rebasing', 'validating'].includes(item.status))
+        .filter((item) => ['retrying', 'held', 'escalated', 'merging', 'rebasing', 'validating'].includes(item.status))
         .slice(0, 4)
         .flatMap((item) => {
-          const lines = [`${renderChip(item.status.toUpperCase(), item.id, item.status === 'retrying' ? chalk.yellow : chalk.blue)} ${item.source_type}:${item.source_ref}`];
+          const lines = [`${renderChip(item.status.toUpperCase(), item.id, item.status === 'retrying' || item.status === 'held' ? chalk.yellow : item.status === 'escalated' ? chalk.red : chalk.blue)} ${item.source_type}:${item.source_ref}`];
           if (item.last_error_summary) lines.push(`  ${chalk.dim(item.last_error_summary)}`);
+          if (item.next_action) lines.push(`  ${chalk.yellow('next:')} ${item.next_action}`);
           return lines;
         })
       : [chalk.green('No in-flight queue items right now.')];
@@ -2630,6 +3131,7 @@ What it helps you answer:
     console.log('');
     for (const block of [
       renderPanel('Landing focus', queueFocusLines, chalk.green),
+      renderPanel('Held back', queueHeldBackLines, summary.held_back.length > 0 ? chalk.yellow : chalk.green),
       renderPanel('Blocked', queueBlockedLines, summary.counts.blocked > 0 ? chalk.red : chalk.green),
       renderPanel('In flight', queueWatchLines, queueWatchLines[0] === 'No in-flight queue items right now.' ? chalk.green : chalk.blue),
       renderPanel('Next commands', queueCommandLines, chalk.cyan),
@@ -2684,6 +3186,7 @@ Examples:
 
         aggregate.processed.push(...result.processed);
         aggregate.summary = result.summary;
+        aggregate.deferred = result.deferred || aggregate.deferred || null;
         aggregate.cycles += 1;
 
         if (!watch) break;
@@ -2699,7 +3202,19 @@ Examples:
       }
 
       if (aggregate.processed.length === 0) {
-        console.log(chalk.dim('No queued merge items.'));
+        const deferredFocus = aggregate.deferred || aggregate.summary?.next || null;
+        if (deferredFocus?.recommendation?.action) {
+          console.log(chalk.yellow('No landing candidate is ready to run right now.'));
+          console.log(`  ${chalk.dim('focus:')} ${deferredFocus.id} ${deferredFocus.source_type}:${deferredFocus.source_ref}`);
+          if (deferredFocus.recommendation?.summary) {
+            console.log(`  ${chalk.dim('decision:')} ${deferredFocus.recommendation.summary}`);
+          }
+          if (deferredFocus.recommendation?.command) {
+            console.log(`  ${chalk.yellow('next:')} ${deferredFocus.recommendation.command}`);
+          }
+        } else {
+          console.log(chalk.dim('No queued merge items.'));
+        }
         await maybeCaptureTelemetry('queue_used', {
           watch,
           cycles: aggregate.cycles,
@@ -2757,6 +3272,40 @@ queueCmd
     }
 
     console.log(`${chalk.green('✓')} Queue item ${chalk.cyan(item.id)} reset to retrying`);
+  });
+
+queueCmd
+  .command('escalate <itemId>')
+  .description('Mark a queue item as needing explicit operator review before landing')
+  .option('--reason <text>', 'Why this item is being escalated')
+  .option('--json', 'Output raw JSON')
+  .action((itemId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+    const item = escalateMergeQueueItem(db, itemId, {
+      summary: opts.reason || null,
+      nextAction: `Run \`switchman explain queue ${itemId}\` to review the landing risk, then \`switchman queue retry ${itemId}\` when it is ready again.`,
+    });
+    db.close();
+
+    if (!item) {
+      printErrorWithNext(`Queue item ${itemId} cannot be escalated.`, 'switchman queue status');
+      process.exitCode = 1;
+      return;
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(item, null, 2));
+      return;
+    }
+
+    console.log(`${chalk.yellow('!')} Queue item ${chalk.cyan(item.id)} marked escalated for operator review`);
+    if (item.last_error_summary) {
+      console.log(`  ${chalk.red('why:')} ${item.last_error_summary}`);
+    }
+    if (item.next_action) {
+      console.log(`  ${chalk.yellow('next:')} ${item.next_action}`);
+    }
   });
 
 queueCmd
@@ -3372,9 +3921,12 @@ pipelineCmd
           return;
         }
 
-        console.log(`${chalk.green('✓')} Recovery worktree ready for ${chalk.cyan(result.pipeline_id)}`);
+        console.log(`${chalk.green('✓')} ${result.reused_existing ? 'Recovery worktree already ready for' : 'Recovery worktree ready for'} ${chalk.cyan(result.pipeline_id)}`);
         console.log(`  ${chalk.dim('branch:')} ${chalk.cyan(result.branch)}`);
         console.log(`  ${chalk.dim('path:')} ${result.recovery_path}`);
+        if (result.reused_existing) {
+          console.log(`  ${chalk.dim('state:')} reusing existing recovery worktree`);
+        }
         console.log(`  ${chalk.dim('blocked by:')} ${result.failed_branch}`);
         if (result.conflicting_files.length > 0) {
           console.log(`  ${chalk.dim('conflicts:')} ${result.conflicting_files.join(', ')}`);
@@ -3415,10 +3967,15 @@ pipelineCmd
           return;
         }
 
-        console.log(`${chalk.green('✓')} Landing recovery resumed for ${chalk.cyan(result.pipeline_id)}`);
+        console.log(`${chalk.green('✓')} ${result.already_resumed ? 'Landing recovery already resumed for' : 'Landing recovery resumed for'} ${chalk.cyan(result.pipeline_id)}`);
         console.log(`  ${chalk.dim('branch:')} ${chalk.cyan(result.branch)}`);
         console.log(`  ${chalk.dim('head:')} ${result.head_commit}`);
-        console.log(`  ${chalk.dim('recovery path:')} ${result.recovery_path}`);
+        if (result.recovery_path) {
+          console.log(`  ${chalk.dim('recovery path:')} ${result.recovery_path}`);
+        }
+        if (result.already_resumed) {
+          console.log(`  ${chalk.dim('state:')} already aligned and ready to queue`);
+        }
         console.log(`  ${chalk.yellow('next:')} ${result.resume_command}`);
         return;
       }
@@ -3538,10 +4095,12 @@ pipelineCmd
   });
 
 pipelineCmd
-  .command('sync-pr <pipelineId> [outputDir]')
+  .command('sync-pr [pipelineId] [outputDir]')
   .description('Build PR artifacts, emit GitHub outputs, and update the PR comment in one command')
   .option('--pr <number>', 'Pull request number to comment on')
   .option('--pr-from-env', 'Read the pull request number from GitHub Actions environment variables')
+  .option('--pipeline-from-env', 'Infer the pipeline id from the current GitHub branch context')
+  .option('--skip-missing-pipeline', 'Exit successfully when no matching pipeline can be inferred')
   .option('--gh-command <command>', 'Executable to use for GitHub CLI', 'gh')
   .option('--github', 'Write GitHub Actions step summary/output when GITHUB_* env vars are present')
   .option('--github-step-summary <path>', 'Path to write GitHub Actions step summary markdown')
@@ -3551,14 +4110,42 @@ pipelineCmd
   .action(async (pipelineId, outputDir, opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
+    const branchFromEnv = opts.pipelineFromEnv ? resolveBranchFromEnv() : null;
+    const resolvedPipelineId = pipelineId || (branchFromEnv ? inferPipelineIdFromBranch(db, branchFromEnv) : null);
     const prNumber = opts.pr || (opts.prFromEnv ? resolvePrNumberFromEnv() : null);
 
     try {
+      if (!resolvedPipelineId) {
+        if (!opts.skipMissingPipeline) {
+          throw new Error(opts.pipelineFromEnv
+            ? `Could not infer a pipeline from branch ${branchFromEnv || 'unknown'}. Pass a pipeline id explicitly or use a branch that maps to one Switchman pipeline.`
+            : 'A pipeline id is required. Pass one explicitly or use `--pipeline-from-env`.');
+        }
+        const skipped = {
+          skipped: true,
+          reason: 'no_pipeline_inferred',
+          branch: branchFromEnv,
+          next_action: 'Run `switchman pipeline status <pipelineId>` locally to confirm the pipeline id, then rerun sync-pr with that id.',
+        };
+        db.close();
+        if (opts.json) {
+          console.log(JSON.stringify(skipped, null, 2));
+          return;
+        }
+        console.log(`${chalk.green('✓')} No pipeline sync needed`);
+        if (branchFromEnv) {
+          console.log(`  ${chalk.dim('branch:')} ${branchFromEnv}`);
+        }
+        console.log(`  ${chalk.dim('reason:')} no matching Switchman pipeline was inferred`);
+        console.log(`  ${chalk.yellow('next:')} ${skipped.next_action}`);
+        return;
+      }
+
       if (opts.comment !== false && !prNumber) {
         throw new Error('A pull request number is required for comment sync. Pass `--pr <number>`, `--pr-from-env`, or `--no-comment`.');
       }
 
-      const result = await syncPipelinePr(db, repoRoot, pipelineId, {
+      const result = await syncPipelinePr(db, repoRoot, resolvedPipelineId, {
         prNumber: opts.comment === false ? null : prNumber,
         ghCommand: opts.ghCommand,
         outputDir: outputDir || null,
@@ -3637,6 +4224,53 @@ pipelineCmd
     } catch (err) {
       db.close();
       console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+pipelineCmd
+  .command('repair <pipelineId>')
+  .description('Safely repair interrupted landing state for one pipeline')
+  .option('--base <branch>', 'Base branch for landing repair checks', 'main')
+  .option('--branch <branch>', 'Custom landing branch name')
+  .option('--json', 'Output raw JSON')
+  .action((pipelineId, opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = repairPipelineState(db, repoRoot, pipelineId, {
+        baseBranch: opts.base,
+        landingBranch: opts.branch || null,
+      });
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      if (!result.repaired) {
+        console.log(`${chalk.green('✓')} No repair action needed for ${chalk.cyan(result.pipeline_id)}`);
+        for (const note of result.notes) {
+          console.log(`  ${chalk.dim(note)}`);
+        }
+        console.log(`  ${chalk.yellow('next:')} ${result.next_action}`);
+        return;
+      }
+
+      console.log(`${chalk.green('✓')} Repaired ${chalk.cyan(result.pipeline_id)}`);
+      for (const action of result.actions) {
+        if (action.kind === 'recovery_state_cleared') {
+          console.log(`  ${chalk.dim('cleared recovery record:')} ${action.recovery_path}`);
+        } else if (action.kind === 'landing_branch_refreshed') {
+          console.log(`  ${chalk.dim('refreshed landing branch:')} ${action.branch}${action.head_commit ? ` ${chalk.dim(action.head_commit.slice(0, 12))}` : ''}`);
+        }
+      }
+      console.log(`  ${chalk.yellow('next:')} ${result.next_action}`);
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, `switchman pipeline status ${pipelineId}`);
       process.exitCode = 1;
     }
   });
@@ -4427,8 +5061,47 @@ Use this first when the repo feels stuck.
   });
 
 program
+  .command('repair')
+  .description('Repair safe interrupted queue and pipeline state across the repo')
+  .option('--json', 'Output raw JSON')
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const result = repairRepoState(db, repoRoot);
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      if (!result.repaired) {
+        printRepairSummary(result, {
+          repairedHeading: `${chalk.green('✓')} Repaired safe interrupted repo state`,
+          noRepairHeading: `${chalk.green('✓')} No repo repair action needed`,
+        });
+        console.log(`  ${chalk.yellow('next:')} ${result.next_action}`);
+        return;
+      }
+
+      printRepairSummary(result, {
+        repairedHeading: `${chalk.green('✓')} Repaired safe interrupted repo state`,
+        noRepairHeading: `${chalk.green('✓')} No repo repair action needed`,
+      });
+      console.log(`  ${chalk.yellow('next:')} ${result.next_action}`);
+    } catch (err) {
+      db.close();
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+program
   .command('doctor')
   .description('Show one operator-focused health view: what is running, what is blocked, and what to do next')
+  .option('--repair', 'Repair safe interrupted queue and pipeline state before reporting health')
   .option('--json', 'Output raw JSON')
   .addHelpText('after', `
 Plain English:
@@ -4441,6 +5114,7 @@ Examples:
   .action(async (opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
+    const repairResult = opts.repair ? repairRepoState(db, repoRoot) : null;
     const tasks = listTasks(db);
     const activeLeases = listLeases(db, 'active');
     const staleLeases = getStaleLeases(db);
@@ -4458,8 +5132,17 @@ Examples:
     db.close();
 
     if (opts.json) {
-      console.log(JSON.stringify(report, null, 2));
+      console.log(JSON.stringify(opts.repair ? { ...report, repair: repairResult } : report, null, 2));
       return;
+    }
+
+    if (opts.repair) {
+      printRepairSummary(repairResult, {
+        repairedHeading: `${chalk.green('✓')} Repaired safe interrupted repo state before running doctor`,
+        noRepairHeading: `${chalk.green('✓')} No repo repair action needed before doctor`,
+        limit: 6,
+      });
+      console.log('');
     }
 
     const doctorColor = colorForHealth(report.health);
@@ -4517,6 +5200,7 @@ Examples:
         const lines = [`${cluster.severity === 'block' ? renderChip('STALE', cluster.affected_pipeline_id || cluster.affected_task_ids[0], chalk.red) : renderChip('WATCH', cluster.affected_pipeline_id || cluster.affected_task_ids[0], chalk.yellow)} ${cluster.title}`];
         lines.push(`  ${chalk.dim(cluster.detail)}`);
         lines.push(`  ${chalk.dim('areas:')} ${cluster.stale_areas.join(', ')}`);
+        lines.push(`  ${chalk.dim('rerun priority:')} ${cluster.rerun_priority} ${chalk.dim(`score:${cluster.rerun_priority_score}`)}${cluster.highest_affected_priority ? ` ${chalk.dim(`affected-priority:${cluster.highest_affected_priority}`)}` : ''}`);
         lines.push(`  ${chalk.yellow('next:')} ${cluster.next_step}`);
         lines.push(`  ${chalk.cyan('run:')} ${cluster.command}`);
         return lines;

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { basename, join } from 'path';
 
-import { completeLeaseTask, createTask, failLeaseTask, getTaskSpec, listAuditEvents, listBoundaryValidationStates, listDependencyInvalidations, listLeases, listMergeQueue, listTasks, listWorktrees, logAuditEvent, retryTask, startTaskLease, upsertTaskSpec } from './db.js';
+import { completeLeaseTask, createTask, createTempResource, failLeaseTask, finishOperationJournalEntry, getTaskSpec, listAuditEvents, listBoundaryValidationStates, listDependencyInvalidations, listLeases, listMergeQueue, listTasks, listTempResources, listWorktrees, logAuditEvent, retryTask, startOperationJournalEntry, startTaskLease, updateTempResource, upsertTaskSpec } from './db.js';
 import { scanAllWorktrees } from './detector.js';
 import { runAiMergeGate } from './merge-gate.js';
 import { evaluateTaskOutcome } from './outcome.js';
@@ -37,6 +37,10 @@ function parseDependencies(description) {
     .split(',')
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function stringifyResourceDetails(details) {
+  return JSON.stringify(details);
 }
 
 function getPipelineMetadata(db, pipelineId) {
@@ -175,6 +179,69 @@ function buildPipelineTrustAudit(db, pipelineId, { limit = 8 } = {}) {
     .slice(0, limit);
 }
 
+function buildPipelinePolicyEvidence(status, requiredTaskTypes = [], { completedLeaseByTask = new Map(), completionAuditByTask = new Map() } = {}) {
+  const completedTasks = (status.tasks || []).filter((task) => task.status === 'done' && task.task_spec?.task_type);
+  const pipelineId = status.pipeline_id;
+  const evidenceObjects = [];
+  const evidenceByTaskType = {};
+
+  for (const taskType of requiredTaskTypes) {
+    evidenceByTaskType[taskType] = completedTasks
+      .filter((task) => task.task_spec?.task_type === taskType)
+      .map((task) => {
+        const lease = completedLeaseByTask.get(task.id) || null;
+        const auditEvent = completionAuditByTask.get(task.id) || null;
+        const evidence = {
+          evidence_id: `policy-evidence:${pipelineId}:${taskType}:${task.id}`,
+          schema_version: 1,
+          requirement_key: `completed_task_type:${taskType}`,
+          requirement_type: 'completed_task_type',
+          pipeline_id: pipelineId,
+          task_id: task.id,
+          title: task.title,
+          task_type: task.task_spec?.task_type || null,
+          worktree: task.worktree || task.suggested_worktree || null,
+          artifact_path: task.task_spec?.primary_output_path || null,
+          subsystem_tags: task.task_spec?.subsystem_tags || [],
+          satisfied_at: task.completed_at || auditEvent?.created_at || null,
+          satisfied_by: {
+            actor_type: lease?.agent ? 'agent' : 'task_completion',
+            agent: lease?.agent || null,
+            worktree: lease?.worktree || task.worktree || task.suggested_worktree || null,
+            lease_id: lease?.id || null,
+            audit_event_id: auditEvent?.id || null,
+            audit_event_type: auditEvent?.event_type || null,
+          },
+        };
+        evidenceObjects.push(evidence);
+        return evidence;
+      });
+  }
+
+  return {
+    evidence_by_task_type: evidenceByTaskType,
+    evidence_objects: evidenceObjects,
+  };
+}
+
+function buildPipelinePolicySatisfactionHistory(policyState) {
+  return (policyState.evidence_objects || [])
+    .map((evidence) => ({
+      category: 'policy',
+      created_at: evidence.satisfied_at || null,
+      event_type: 'policy_requirement_satisfied',
+      status: 'allowed',
+      reason_code: null,
+      summary: `Policy requirement ${evidence.requirement_key} is satisfied by ${evidence.task_id}.`,
+      requirement_key: evidence.requirement_key,
+      evidence_id: evidence.evidence_id,
+      task_id: evidence.task_id,
+      satisfied_by: evidence.satisfied_by,
+      next_action: `switchman pipeline status ${policyState.pipeline_id || '<pipelineId>'}`,
+    }))
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+}
+
 function withTaskSpec(db, task) {
   return {
     ...task,
@@ -196,13 +263,25 @@ function rankEnforcement(level = 'none') {
 
 function normalizeDependencyInvalidation(item) {
   const details = item.details || {};
+  const objectNames = Array.isArray(details.object_names) ? details.object_names : [];
+  const contractNames = Array.isArray(details.contract_names) ? details.contract_names : [];
   return {
     ...item,
+    severity: item.severity || details.severity || (item.reason_type === 'semantic_contract_drift' ? 'blocked' : item.reason_type === 'semantic_object_overlap' ? 'warn' : 'warn'),
     details,
+    revalidation_set: details.revalidation_set || (item.reason_type === 'semantic_contract_drift' ? 'contract' : item.reason_type === 'semantic_object_overlap' ? 'semantic_object' : item.reason_type === 'subsystem_overlap' ? 'subsystem' : 'scope'),
     stale_area: item.reason_type === 'subsystem_overlap'
       ? `subsystem:${item.subsystem_tag}`
+      : item.reason_type === 'semantic_contract_drift'
+        ? `contract:${contractNames.join('|') || 'unknown'}`
+      : item.reason_type === 'semantic_object_overlap'
+        ? `object:${objectNames.join('|') || 'unknown'}`
       : `${item.source_scope_pattern} ↔ ${item.affected_scope_pattern}`,
-    summary: `${details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
+    summary: item.reason_type === 'semantic_contract_drift'
+      ? `${details?.source_task_title || item.source_task_id} changed shared contract ${contractNames.join(', ') || 'unknown'}`
+      : item.reason_type === 'semantic_object_overlap'
+      ? `${details?.source_task_title || item.source_task_id} changed shared exported object ${objectNames.join(', ') || 'unknown'}`
+      : `${details?.source_task_title || item.source_task_id} changed shared ${item.reason_type === 'subsystem_overlap' ? `subsystem:${item.subsystem_tag}` : 'scope'}`,
   };
 }
 
@@ -221,8 +300,11 @@ function buildStaleClusters(invalidations = [], { pipelineId = null } = {}) {
         source_task_titles: new Set(),
         source_worktrees: new Set(),
         stale_areas: new Set(),
+        revalidation_sets: new Set(),
         invalidations: [],
         severity: 'warn',
+        highest_affected_priority: 0,
+        highest_source_priority: 0,
       });
     }
     const cluster = clusters.get(clusterKey);
@@ -231,7 +313,10 @@ function buildStaleClusters(invalidations = [], { pipelineId = null } = {}) {
     if (invalidation.details?.source_task_title) cluster.source_task_titles.add(invalidation.details.source_task_title);
     if (invalidation.source_worktree) cluster.source_worktrees.add(invalidation.source_worktree);
     cluster.stale_areas.add(invalidation.stale_area);
+    if (invalidation.revalidation_set) cluster.revalidation_sets.add(invalidation.revalidation_set);
     if (invalidation.severity === 'blocked') cluster.severity = 'block';
+    cluster.highest_affected_priority = Math.max(cluster.highest_affected_priority, Number(invalidation.details?.affected_task_priority || 0));
+    cluster.highest_source_priority = Math.max(cluster.highest_source_priority, Number(invalidation.details?.source_task_priority || 0));
   }
 
   return [...clusters.values()].map((cluster) => ({
@@ -242,22 +327,61 @@ function buildStaleClusters(invalidations = [], { pipelineId = null } = {}) {
     source_task_titles: [...cluster.source_task_titles],
     source_worktrees: [...cluster.source_worktrees],
     stale_areas: [...cluster.stale_areas],
+    revalidation_sets: [...cluster.revalidation_sets],
+    revalidation_set_type: cluster.revalidation_sets.has('contract')
+      ? 'contract'
+      : cluster.revalidation_sets.has('semantic_object')
+        ? 'semantic_object'
+        : cluster.revalidation_sets.has('subsystem')
+          ? 'subsystem'
+          : 'scope',
+    rerun_priority: cluster.severity === 'block'
+      ? (cluster.revalidation_sets.has('contract') || cluster.highest_affected_priority >= 8 ? 'urgent' : 'high')
+      : cluster.highest_affected_priority >= 8
+        ? 'high'
+        : cluster.highest_affected_priority >= 5
+          ? 'medium'
+          : 'low',
+    rerun_priority_score: (cluster.severity === 'block' ? 100 : 0)
+      + (cluster.revalidation_sets.has('contract') ? 30 : cluster.revalidation_sets.has('semantic_object') ? 15 : 0)
+      + (cluster.highest_affected_priority * 3)
+      + cluster.invalidations.length,
+    highest_affected_priority: cluster.highest_affected_priority,
+    highest_source_priority: cluster.highest_source_priority,
     severity: cluster.severity,
     invalidations: cluster.invalidations,
     title: cluster.affected_pipeline_id
-      ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale dependency invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
-      : `${[...cluster.affected_task_ids][0]} has ${cluster.invalidations.length} stale dependency invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
+      ? `Pipeline ${cluster.affected_pipeline_id} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`
+      : `${[...cluster.affected_task_ids][0]} has ${cluster.invalidations.length} stale ${cluster.revalidation_sets.has('contract') ? 'contract' : cluster.revalidation_sets.has('semantic_object') ? 'semantic-object' : 'dependency'} invalidation${cluster.invalidations.length === 1 ? '' : 's'}`,
     detail: `${[...cluster.source_task_titles][0] || cluster.invalidations[0]?.source_task_id || 'unknown source'} (${[...cluster.stale_areas].join(', ')})`,
     next_action: cluster.affected_pipeline_id
       ? `switchman task retry-stale --pipeline ${cluster.affected_pipeline_id}`
       : `switchman task retry ${[...cluster.affected_task_ids][0]}`,
-  })).sort((a, b) => b.invalidation_count - a.invalidation_count);
+  })).sort((a, b) =>
+    b.rerun_priority_score - a.rerun_priority_score
+    || (a.severity === 'block' ? -1 : 1) - (b.severity === 'block' ? -1 : 1)
+    || (a.revalidation_set_type === 'contract' ? -1 : 1) - (b.revalidation_set_type === 'contract' ? -1 : 1)
+    || b.invalidation_count - a.invalidation_count);
 }
 
 export function summarizePipelinePolicyState(status, changePolicy, boundaryValidations = []) {
   const tasks = status.tasks || [];
   const implementationTasks = tasks.filter((task) => task.task_spec?.task_type === 'implementation');
   const completedTasks = tasks.filter((task) => task.status === 'done' && task.task_spec?.task_type);
+  const completedLeaseByTask = new Map();
+  for (const lease of status.leases || []) {
+    if (lease.status !== 'completed') continue;
+    if (!completedLeaseByTask.has(lease.task_id)) {
+      completedLeaseByTask.set(lease.task_id, lease);
+    }
+  }
+  const completionAuditByTask = new Map();
+  for (const event of status.audit_events || []) {
+    if (event.event_type !== 'task_completed' || !event.task_id) continue;
+    if (!completionAuditByTask.has(event.task_id)) {
+      completionAuditByTask.set(event.task_id, event);
+    }
+  }
   const completedTaskTypes = new Set(completedTasks.map((task) => task.task_spec?.task_type).filter(Boolean));
   const governedDomains = uniq(
     implementationTasks
@@ -277,21 +401,11 @@ export function summarizePipelinePolicyState(status, changePolicy, boundaryValid
     ...requiredTaskTypes.filter((taskType) => !completedTaskTypes.has(taskType)),
   ]);
   const satisfiedTaskTypes = requiredTaskTypes.filter((taskType) => completedTaskTypes.has(taskType));
-  const evidenceByTaskType = Object.fromEntries(
-    requiredTaskTypes.map((taskType) => [
-      taskType,
-      completedTasks
-        .filter((task) => task.task_spec?.task_type === taskType)
-        .map((task) => ({
-          task_id: task.id,
-          title: task.title,
-          task_type: task.task_spec?.task_type || null,
-          worktree: task.worktree || task.suggested_worktree || null,
-          artifact_path: task.task_spec?.primary_output_path || null,
-          subsystem_tags: task.task_spec?.subsystem_tags || [],
-        })),
-    ]),
-  );
+  const evidenceState = buildPipelinePolicyEvidence(status, requiredTaskTypes, {
+    completedLeaseByTask,
+    completionAuditByTask,
+  });
+  const evidenceByTaskType = evidenceState.evidence_by_task_type;
   const requirementStatus = requiredTaskTypes.map((taskType) => ({
     task_type: taskType,
     satisfied: satisfiedTaskTypes.includes(taskType),
@@ -305,7 +419,7 @@ export function summarizePipelinePolicyState(status, changePolicy, boundaryValid
   const enforcement = [...implementationTasks.map((task) => task.task_spec?.validation_rules?.enforcement || 'none'), ...activeRules.map((rule) => rule.enforcement || 'none')]
     .reduce((highest, current) => rankEnforcement(current) > rankEnforcement(highest) ? current : highest, 'none');
 
-  return {
+  const policyState = {
     active: governedDomains.length > 0 || boundaryValidations.length > 0,
     domains: governedDomains,
     active_rules: activeRules,
@@ -314,6 +428,10 @@ export function summarizePipelinePolicyState(status, changePolicy, boundaryValid
     missing_task_types: missingTaskTypes,
     requirement_status: requirementStatus,
     evidence_by_task_type: evidenceByTaskType,
+    evidence_schema_version: 1,
+    evidence_objects: evidenceState.evidence_objects,
+    satisfaction_history: [],
+    pipeline_id: status.pipeline_id,
     enforcement,
     rationale,
     blocked_validations: boundaryValidations.filter((validation) => validation.severity === 'blocked').length,
@@ -324,6 +442,9 @@ export function summarizePipelinePolicyState(status, changePolicy, boundaryValid
         ? `Governed domains ${governedDomains.join(', ')} still require ${missingTaskTypes.join(', ')} before landing.`
         : `Governed domains ${governedDomains.join(', ')} have satisfied their current policy requirements.`,
   };
+
+  policyState.satisfaction_history = buildPipelinePolicySatisfactionHistory(policyState);
+  return policyState;
 }
 
 function buildPipelinePolicyRemediationCommand(status, policyState) {
@@ -440,6 +561,8 @@ export function getPipelineStatus(db, pipelineId) {
     description: metadata?.description || null,
     priority: metadata?.priority || tasks[0].priority,
     counts,
+    leases: listLeases(db),
+    audit_events: listAuditEvents(db, { limit: 2000 }).filter((event) => pipelineOwnsAuditEvent(event, pipelineId)),
     tasks: tasks.map((task) => {
       const dependencies = parseDependencies(task.description);
       const blockedBy = dependencies.filter((dependencyId) =>
@@ -461,6 +584,35 @@ export function getPipelineStatus(db, pipelineId) {
       };
     }),
   };
+}
+
+export function inferPipelineIdFromBranch(db, branch) {
+  const normalizedBranch = String(branch || '').trim();
+  if (!normalizedBranch) return null;
+
+  const landingPrefix = 'switchman/pipeline-landing/';
+  if (normalizedBranch.startsWith(landingPrefix)) {
+    return normalizedBranch.slice(landingPrefix.length) || null;
+  }
+
+  const worktreesByName = new Map(listWorktrees(db).map((worktree) => [worktree.name, worktree]));
+  const matchingPipelines = new Set();
+
+  for (const task of listTasks(db)) {
+    const taskSpec = getTaskSpec(db, task.id);
+    const pipelineId = taskSpec?.pipeline_id || null;
+    if (!pipelineId || !task.worktree) continue;
+    const worktree = worktreesByName.get(task.worktree);
+    if (worktree?.branch === normalizedBranch) {
+      matchingPipelines.add(pipelineId);
+    }
+  }
+
+  if (matchingPipelines.size === 1) {
+    return [...matchingPipelines][0];
+  }
+
+  return null;
 }
 
 function parseTaskFailure(description) {
@@ -921,7 +1073,9 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   const subsystemTags = uniq(completedTasks.flatMap((task) => task.task_spec?.subsystem_tags || []));
   const policyState = summarizePipelinePolicyState(status, changePolicy, aiGate.boundary_validations || []);
   const staleClusters = buildStaleClusters(aiGate.dependency_invalidations || [], { pipelineId });
-  const trustAudit = buildPipelineTrustAudit(db, pipelineId);
+  const trustAudit = [...policyState.satisfaction_history, ...buildPipelineTrustAudit(db, pipelineId)]
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+    .slice(0, 8);
   const riskNotes = [];
   if (!ciGateOk) riskNotes.push('Repo gate is blocked by conflicts, unmanaged changes, or stale worktrees.');
   if (aiGate.status !== 'pass') riskNotes.push(aiGate.summary);
@@ -967,6 +1121,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
         `- Policy enforcement: ${policyState.enforcement}`,
         `- Policy requirements: ${policyState.required_task_types.join(', ') || 'none'}`,
         `- Policy evidence: ${policyState.satisfied_task_types.map((taskType) => `${taskType}:${(policyState.evidence_by_task_type?.[taskType] || []).map((entry) => entry.task_id).join(',')}`).join(' | ') || 'none'}`,
+        `- Policy evidence objects: ${policyState.evidence_objects.map((entry) => `${entry.evidence_id}:${entry.satisfied_by.agent || entry.satisfied_by.worktree || 'task_completion'}`).join(' | ') || 'none'}`,
         `- Policy missing: ${policyState.missing_task_types.join(', ') || 'none'}`,
       ]
       : []),
@@ -1029,7 +1184,8 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
         `- Missing task types: ${policyState.missing_task_types.join(', ') || 'none'}`,
         ...policyState.requirement_status
           .filter((requirement) => requirement.evidence.length > 0)
-          .map((requirement) => `- Evidence for ${requirement.task_type}: ${requirement.evidence.map((entry) => entry.artifact_path ? `${entry.task_id} (${entry.artifact_path})` : entry.task_id).join(', ')}`),
+          .map((requirement) => `- Evidence for ${requirement.task_type}: ${requirement.evidence.map((entry) => entry.artifact_path ? `${entry.task_id} (${entry.artifact_path}, by ${entry.satisfied_by?.agent || entry.satisfied_by?.worktree || 'task_completion'})` : `${entry.task_id} (by ${entry.satisfied_by?.agent || entry.satisfied_by?.worktree || 'task_completion'})`).join(', ')}`),
+        ...policyState.satisfaction_history.slice(0, 5).map((entry) => `- Satisfaction history: ${entry.summary}`),
         ...policyState.rationale.slice(0, 5).map((item) => `- ${item}`),
         '',
       ]
@@ -1104,10 +1260,15 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
   };
 }
 
-export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
+export async function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
   const status = getPipelineStatus(db, pipelineId);
+  const changePolicy = loadChangePolicy(repoRoot);
+  const aiGate = await runAiMergeGate(db, repoRoot);
+  const policyState = summarizePipelinePolicyState(status, changePolicy, aiGate.boundary_validations || []);
   const staleClusters = buildStaleClusters(listDependencyInvalidations(db, { pipelineId }), { pipelineId });
-  const trustAudit = buildPipelineTrustAudit(db, pipelineId);
+  const trustAudit = [...policyState.satisfaction_history, ...buildPipelineTrustAudit(db, pipelineId)]
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+    .slice(0, 8);
   let landing;
   let landingError = null;
   try {
@@ -1217,6 +1378,20 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
       ]
       : []),
     '',
+    ...(policyState.active
+      ? [
+        '## Policy Record',
+        `- Domains: ${policyState.domains.join(', ')}`,
+        `- Enforcement: ${policyState.enforcement}`,
+        `- Required task types: ${policyState.required_task_types.join(', ') || 'none'}`,
+        `- Missing task types: ${policyState.missing_task_types.join(', ') || 'none'}`,
+        ...policyState.requirement_status
+          .filter((requirement) => requirement.evidence.length > 0)
+          .map((requirement) => `- Evidence for ${requirement.task_type}: ${requirement.evidence.map((entry) => `${entry.task_id} by ${entry.satisfied_by?.agent || entry.satisfied_by?.worktree || 'task_completion'}`).join(', ')}`),
+        '',
+      ]
+      : []),
+    '',
     '## Queue State',
     `- Status: ${queueState.status}`,
     ...(queueState.item_id ? [`- Item: ${queueState.item_id}`] : []),
@@ -1233,6 +1408,7 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
     title: status.title,
     ready_to_queue: readyToQueue,
     counts: status.counts,
+    policy_state: policyState,
     landing,
     recovery_state: recoveryState,
     stale_clusters: staleClusters,
@@ -1246,7 +1422,7 @@ export function buildPipelineLandingSummary(db, repoRoot, pipelineId) {
 
 export async function exportPipelinePrBundle(db, repoRoot, pipelineId, outputDir = null) {
   const summary = await buildPipelinePrSummary(db, repoRoot, pipelineId);
-  const landingSummary = buildPipelineLandingSummary(db, repoRoot, pipelineId);
+  const landingSummary = await buildPipelineLandingSummary(db, repoRoot, pipelineId);
   const bundleDir = outputDir || join(repoRoot, '.switchman', 'pipelines', pipelineId);
   mkdirSync(bundleDir, { recursive: true });
 
@@ -1423,22 +1599,49 @@ function getLatestLandingRecoveryCleared(db, pipelineId, branch) {
   })[0] || null;
 }
 
-function buildRecoveryState(repoRoot, recoveryRecord, latestResolved) {
+function buildRecoveryState(repoRoot, branch, recoveryRecord, latestResolved) {
   if (!recoveryRecord) return null;
   const recoveryPath = recoveryRecord.recovery_path || null;
   const pathExists = recoveryPath ? existsSync(recoveryPath) : false;
+  const gitWorktrees = listGitWorktrees(repoRoot);
   const normalizedRecoveryPath = recoveryPath
     ? (pathExists ? realpathSync(recoveryPath) : recoveryPath)
     : null;
   const tracked = recoveryPath
-    ? listGitWorktrees(repoRoot).some((worktree) => worktree.path === recoveryPath || worktree.path === normalizedRecoveryPath)
+    ? gitWorktrees.some((worktree) => worktree.path === recoveryPath || worktree.path === normalizedRecoveryPath)
     : false;
+  const branchWorktree = branch
+    ? gitWorktrees.find((worktree) => worktree.branch === branch) || null
+    : null;
   const resolved = Boolean(latestResolved && latestResolved.audit_id > recoveryRecord.audit_id);
+  let status;
+
+  if (resolved) {
+    if (tracked) {
+      status = 'resolved';
+    } else if (branchWorktree) {
+      status = 'resolved_moved';
+    } else if (pathExists) {
+      status = 'resolved_untracked';
+    } else {
+      status = 'resolved_missing';
+    }
+  } else if (tracked) {
+    status = 'active';
+  } else if (branchWorktree) {
+    status = 'moved';
+  } else if (pathExists) {
+    status = 'untracked';
+  } else {
+    status = 'missing';
+  }
+
   return {
     path: recoveryPath,
     exists: pathExists,
     tracked,
-    status: resolved ? (pathExists ? 'resolved' : 'resolved_missing') : (pathExists ? 'active' : 'missing'),
+    branch_worktree_path: branchWorktree?.path || null,
+    status,
   };
 }
 
@@ -1525,7 +1728,7 @@ export function getPipelineLandingBranchStatus(
     && (!latestRecoveryCleared || latestRecoveryPreparedCandidate.audit_id > latestRecoveryCleared.audit_id)
     ? latestRecoveryPreparedCandidate
     : null;
-  const recoveryState = buildRecoveryState(repoRoot, latestRecoveryPrepared, latestResolved);
+  const recoveryState = buildRecoveryState(repoRoot, resolvedLandingBranch, latestRecoveryPrepared, latestResolved);
   const latestEvent = latestResolved && (!latestMaterialized || latestResolved.audit_id > latestMaterialized.audit_id)
     ? latestResolved
     : latestMaterialized;
@@ -1739,14 +1942,66 @@ export function materializePipelineLandingBranch(
   }
 
   const resolvedLandingBranch = getPipelineLandingBranchName(pipelineId, landingBranch);
+  const tempWorktreePath = join(tmpdir(), `switchman-landing-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   let materialized;
+  const landingOperation = startOperationJournalEntry(db, {
+    scopeType: 'pipeline',
+    scopeId: pipelineId,
+    operationType: 'landing_materialize',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: resolvedLandingBranch,
+      base_branch: baseBranch,
+      component_branches: prioritizedBranches,
+      refresh: Boolean(refresh),
+    }),
+  });
+  const landingTempResource = createTempResource(db, {
+    scopeType: 'pipeline',
+    scopeId: pipelineId,
+    operationId: landingOperation.id,
+    resourceType: 'landing_temp_worktree',
+    path: tempWorktreePath,
+    branch: resolvedLandingBranch,
+    details: stringifyResourceDetails({
+      pipeline_id: pipelineId,
+      branch: resolvedLandingBranch,
+      base_branch: baseBranch,
+      component_branches: prioritizedBranches,
+      operation_type: 'landing_materialize',
+    }),
+  });
   try {
     materialized = gitMaterializeIntegrationBranch(repoRoot, {
       branch: resolvedLandingBranch,
       baseBranch,
       mergeBranches: prioritizedBranches,
+      tempWorktreePath,
+    });
+    finishOperationJournalEntry(db, landingOperation.id, {
+      status: 'completed',
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        branch: resolvedLandingBranch,
+        base_branch: baseBranch,
+        component_branches: prioritizedBranches,
+        head_commit: materialized.head_commit,
+        refresh: Boolean(refresh),
+      }),
     });
   } catch (err) {
+    finishOperationJournalEntry(db, landingOperation.id, {
+      status: 'failed',
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        branch: resolvedLandingBranch,
+        base_branch: baseBranch,
+        component_branches: prioritizedBranches,
+        reason_code: err?.code || 'landing_branch_materialization_failed',
+        failed_branch: err?.details?.failed_branch || null,
+        error: String(err?.message || err),
+      }),
+    });
     const reasonCode = err?.code || 'landing_branch_materialization_failed';
     const nextAction = reasonCode === 'landing_branch_merge_conflict'
       ? `open a recovery worktree with switchman pipeline land ${pipelineId} --recover`
@@ -1776,6 +2031,18 @@ export function materializePipelineLandingBranch(
     const wrapped = new Error(`${String(err.message || 'Landing branch materialization failed.')}\nnext: switchman explain landing ${pipelineId}`);
     wrapped.code = reasonCode;
     throw wrapped;
+  } finally {
+    updateTempResource(db, landingTempResource.id, {
+      status: existsSync(tempWorktreePath) ? 'active' : 'released',
+      details: stringifyResourceDetails({
+        pipeline_id: pipelineId,
+        branch: resolvedLandingBranch,
+        base_branch: baseBranch,
+        component_branches: prioritizedBranches,
+        operation_type: 'landing_materialize',
+        released_by: existsSync(tempWorktreePath) ? null : 'materialize_cleanup',
+      }),
+    });
   }
   const baseCommit = gitRevParse(repoRoot, baseBranch);
   const componentCommits = collectBranchHeadCommits(repoRoot, prioritizedBranches);
@@ -1860,9 +2127,39 @@ export function preparePipelineLandingRecovery(
     throw new Error(`Pipeline ${pipelineId} does not need a synthetic landing recovery worktree.`);
   }
   if (landing.last_failure?.reason_code !== 'landing_branch_merge_conflict') {
+    if (
+      !replaceExisting
+      && landing.last_recovery?.state?.status === 'active'
+      && landing.last_recovery?.recovery_path
+    ) {
+      return {
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        base_branch: baseBranch,
+        recovery_path: landing.last_recovery.recovery_path,
+        failed_branch: landing.last_recovery.failed_branch || null,
+        conflicting_files: landing.last_recovery.conflicting_files || [],
+        inspect_command: landing.last_recovery.inspect_command || `git -C ${JSON.stringify(landing.last_recovery.recovery_path)} status`,
+        resume_command: landing.last_recovery.resume_command || `switchman queue add --pipeline ${pipelineId}`,
+        reused_existing: true,
+      };
+    }
     throw new Error(`Pipeline ${pipelineId} does not have a merge-conflict landing failure to recover.`);
   }
   if (landing.last_recovery?.state?.status && !replaceExisting) {
+    if (landing.last_recovery.state.status === 'active' && landing.last_recovery.recovery_path) {
+      return {
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        base_branch: baseBranch,
+        recovery_path: landing.last_recovery.recovery_path,
+        failed_branch: landing.last_recovery.failed_branch || null,
+        conflicting_files: landing.last_recovery.conflicting_files || [],
+        inspect_command: landing.last_recovery.inspect_command || `git -C ${JSON.stringify(landing.last_recovery.recovery_path)} status`,
+        resume_command: landing.last_recovery.resume_command || `switchman queue add --pipeline ${pipelineId}`,
+        reused_existing: true,
+      };
+    }
     throw new Error(`Recovery worktree already exists for ${pipelineId} at ${landing.last_recovery.recovery_path}. Reuse it or rerun with \`switchman pipeline land ${pipelineId} --recover --replace-recovery\`.`);
   }
   if (landing.last_recovery?.state?.path && replaceExisting) {
@@ -1878,6 +2175,32 @@ export function preparePipelineLandingRecovery(
     tmpdir(),
     `${basename(repoRoot)}-landing-recover-${pipelineId}-${Date.now()}`,
   );
+  const recoveryPrepareOperation = startOperationJournalEntry(db, {
+    scopeType: 'pipeline',
+    scopeId: pipelineId,
+    operationType: 'landing_recovery_prepare',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      base_branch: baseBranch,
+      recovery_path: resolvedRecoveryPath,
+    }),
+  });
+  const recoveryResource = createTempResource(db, {
+    scopeType: 'pipeline',
+    scopeId: pipelineId,
+    operationId: recoveryPrepareOperation.id,
+    resourceType: 'landing_recovery_worktree',
+    path: resolvedRecoveryPath,
+    branch: landing.branch,
+    details: stringifyResourceDetails({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      base_branch: baseBranch,
+      operation_type: 'landing_recovery_prepare',
+      recovery_path: resolvedRecoveryPath,
+    }),
+  });
   const prepared = gitPrepareIntegrationRecoveryWorktree(repoRoot, {
     branch: landing.branch,
     baseBranch,
@@ -1885,6 +2208,33 @@ export function preparePipelineLandingRecovery(
     recoveryPath: resolvedRecoveryPath,
   });
   if (prepared.ok) {
+    try {
+      gitRemoveWorktree(repoRoot, resolvedRecoveryPath);
+    } catch {
+      // Best-effort cleanup; repair will reconcile any leftover tracked resource.
+    }
+    updateTempResource(db, recoveryResource.id, {
+      status: existsSync(resolvedRecoveryPath) ? 'active' : 'released',
+      details: stringifyResourceDetails({
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        base_branch: baseBranch,
+        operation_type: 'landing_recovery_prepare',
+        recovery_path: resolvedRecoveryPath,
+        released_by: existsSync(resolvedRecoveryPath) ? null : 'recovery_prepare_cleanup',
+        reason: 'conflict_already_resolved',
+      }),
+    });
+    finishOperationJournalEntry(db, recoveryPrepareOperation.id, {
+      status: 'failed',
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        base_branch: baseBranch,
+        recovery_path: resolvedRecoveryPath,
+        error: 'Recovery preparation no longer needed because the landing merge conflict is already resolved.',
+      }),
+    });
     throw new Error(`Pipeline ${pipelineId} no longer has an unresolved landing merge conflict to recover.`);
   }
 
@@ -1905,6 +2255,29 @@ export function preparePipelineLandingRecovery(
       resume_command: resumeCommand,
     }),
   });
+  finishOperationJournalEntry(db, recoveryPrepareOperation.id, {
+    status: 'completed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      base_branch: baseBranch,
+      recovery_path: prepared.recovery_path,
+      failed_branch: prepared.failed_branch,
+      conflicting_files: prepared.conflicting_files,
+    }),
+  });
+  updateTempResource(db, recoveryResource.id, {
+    status: 'active',
+    details: stringifyResourceDetails({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      base_branch: baseBranch,
+      operation_type: 'landing_recovery_prepare',
+      recovery_path: prepared.recovery_path,
+      failed_branch: prepared.failed_branch,
+      conflicting_files: prepared.conflicting_files,
+    }),
+  });
 
   return {
     pipeline_id: pipelineId,
@@ -1915,6 +2288,7 @@ export function preparePipelineLandingRecovery(
     conflicting_files: prepared.conflicting_files,
     inspect_command: inspectCommand,
     resume_command: resumeCommand,
+    reused_existing: false,
   };
 }
 
@@ -1938,12 +2312,42 @@ export function resumePipelineLandingRecovery(
   }
 
   const resolvedRecoveryPath = recoveryPath || landing.last_recovery?.recovery_path || null;
+  if (!landing.last_failure && landing.last_materialized && landing.branch_head_commit) {
+    return {
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      base_branch: baseBranch,
+      recovery_path: resolvedRecoveryPath,
+      head_commit: landing.branch_head_commit,
+      resume_command: `switchman queue add --pipeline ${pipelineId}`,
+      already_resumed: true,
+    };
+  }
   if (!resolvedRecoveryPath) {
     throw new Error(`No recovery worktree is recorded for ${pipelineId}. Run \`switchman pipeline land ${pipelineId} --recover\` first.`);
   }
+  const recoveryResumeOperation = startOperationJournalEntry(db, {
+    scopeType: 'pipeline',
+    scopeId: pipelineId,
+    operationType: 'landing_recovery_resume',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      recovery_path: resolvedRecoveryPath,
+    }),
+  });
 
   const currentBranch = getWorktreeBranch(resolvedRecoveryPath);
   if (currentBranch !== landing.branch) {
+    finishOperationJournalEntry(db, recoveryResumeOperation.id, {
+      status: 'failed',
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        recovery_path: resolvedRecoveryPath,
+        error: `Recovery worktree is on ${currentBranch || 'no branch'}.`,
+      }),
+    });
     throw new Error(`Recovery worktree must be on ${landing.branch}, but is on ${currentBranch || 'no branch'}.`);
   }
 
@@ -1952,16 +2356,43 @@ export function resumePipelineLandingRecovery(
     encoding: 'utf8',
   });
   if (statusResult.status !== 0) {
+    finishOperationJournalEntry(db, recoveryResumeOperation.id, {
+      status: 'failed',
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        recovery_path: resolvedRecoveryPath,
+        error: `Could not inspect recovery worktree ${resolvedRecoveryPath}.`,
+      }),
+    });
     throw new Error(`Could not inspect recovery worktree ${resolvedRecoveryPath}.`);
   }
   const pendingChanges = String(statusResult.stdout || '').trim();
   if (pendingChanges) {
+    finishOperationJournalEntry(db, recoveryResumeOperation.id, {
+      status: 'failed',
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        recovery_path: resolvedRecoveryPath,
+        error: 'Recovery worktree still has unresolved or uncommitted changes.',
+      }),
+    });
     throw new Error(`Recovery worktree ${resolvedRecoveryPath} still has unresolved or uncommitted changes. Commit the resolved landing branch first.`);
   }
 
   const recoveredHead = gitRevParse(resolvedRecoveryPath, 'HEAD');
   const branchHead = gitRevParse(repoRoot, landing.branch);
   if (!recoveredHead || !branchHead || recoveredHead !== branchHead) {
+    finishOperationJournalEntry(db, recoveryResumeOperation.id, {
+      status: 'failed',
+      details: JSON.stringify({
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        recovery_path: resolvedRecoveryPath,
+        error: 'Recovery worktree head is not aligned with the landing branch head.',
+      }),
+    });
     throw new Error(`Recovery worktree ${resolvedRecoveryPath} is not aligned with ${landing.branch}. Push or commit the resolved landing branch there first.`);
   }
 
@@ -1981,6 +2412,34 @@ export function resumePipelineLandingRecovery(
       resume_command: `switchman queue add --pipeline ${pipelineId}`,
     }),
   });
+  finishOperationJournalEntry(db, recoveryResumeOperation.id, {
+    status: 'completed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      recovery_path: resolvedRecoveryPath,
+      head_commit: branchHead,
+    }),
+  });
+  const activeRecoveryResources = listTempResources(db, {
+    scopeType: 'pipeline',
+    scopeId: pipelineId,
+    resourceType: 'landing_recovery_worktree',
+    status: 'active',
+    limit: 20,
+  }).filter((resource) => resource.path === resolvedRecoveryPath);
+  for (const resource of activeRecoveryResources) {
+    updateTempResource(db, resource.id, {
+      status: 'resolved',
+      details: stringifyResourceDetails({
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        operation_type: 'landing_recovery_resume',
+        recovery_path: resolvedRecoveryPath,
+        head_commit: branchHead,
+      }),
+    });
+  }
 
   return {
     pipeline_id: pipelineId,
@@ -1989,6 +2448,7 @@ export function resumePipelineLandingRecovery(
     recovery_path: resolvedRecoveryPath,
     head_commit: branchHead,
     resume_command: `switchman queue add --pipeline ${pipelineId}`,
+    already_resumed: false,
   };
 }
 
@@ -2012,6 +2472,17 @@ export function cleanupPipelineLandingRecovery(
   if (!targetPath) {
     throw new Error(`No recovery worktree is recorded for ${pipelineId}.`);
   }
+  const recoveryCleanupOperation = startOperationJournalEntry(db, {
+    scopeType: 'pipeline',
+    scopeId: pipelineId,
+    operationType: 'landing_recovery_cleanup',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      recovery_path: targetPath,
+      reason,
+    }),
+  });
 
   const exists = existsSync(targetPath);
   const normalizedTargetPath = exists ? realpathSync(targetPath) : targetPath;
@@ -2020,6 +2491,31 @@ export function cleanupPipelineLandingRecovery(
   );
   if (tracked && exists) {
     gitRemoveWorktree(repoRoot, targetPath);
+  }
+  const trackedRecoveryResources = listTempResources(db, {
+    scopeType: 'pipeline',
+    scopeId: pipelineId,
+    resourceType: 'landing_recovery_worktree',
+    limit: 20,
+  }).filter((resource) => resource.path === targetPath && resource.status !== 'released');
+  for (const resource of trackedRecoveryResources) {
+    const nextStatus = resource.status === 'abandoned' && !existsSync(targetPath)
+      ? 'abandoned'
+      : existsSync(targetPath)
+        ? 'active'
+        : 'released';
+    updateTempResource(db, resource.id, {
+      status: nextStatus,
+      details: stringifyResourceDetails({
+        pipeline_id: pipelineId,
+        branch: landing.branch,
+        operation_type: 'landing_recovery_cleanup',
+        recovery_path: targetPath,
+        removed: tracked && exists,
+        reason,
+        prior_status: resource.status,
+      }),
+    });
   }
 
   logAuditEvent(db, {
@@ -2034,6 +2530,16 @@ export function cleanupPipelineLandingRecovery(
       reason,
     }),
   });
+  finishOperationJournalEntry(db, recoveryCleanupOperation.id, {
+    status: 'completed',
+    details: JSON.stringify({
+      pipeline_id: pipelineId,
+      branch: landing.branch,
+      recovery_path: targetPath,
+      removed: tracked && exists,
+      reason,
+    }),
+  });
 
   return {
     pipeline_id: pipelineId,
@@ -2043,6 +2549,104 @@ export function cleanupPipelineLandingRecovery(
     tracked,
     removed: tracked && exists,
     reason,
+  };
+}
+
+export function repairPipelineState(
+  db,
+  repoRoot,
+  pipelineId,
+  {
+    baseBranch = 'main',
+    landingBranch = null,
+  } = {},
+) {
+  const actions = [];
+  let notes = [];
+  let landing;
+
+  try {
+    landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+      baseBranch,
+      landingBranch,
+      requireCompleted: false,
+    });
+  } catch (err) {
+    return {
+      pipeline_id: pipelineId,
+      repaired: false,
+      actions,
+      notes: [String(err.message || 'Pipeline repair found no landing state to repair.')],
+      next_action: `switchman pipeline status ${pipelineId}`,
+    };
+  }
+
+  const recoveryStatus = landing.last_recovery?.state?.status || null;
+  if (['missing', 'resolved_missing', 'untracked', 'resolved_untracked', 'moved', 'resolved_moved'].includes(recoveryStatus) && landing.last_recovery?.recovery_path) {
+    const cleared = cleanupPipelineLandingRecovery(db, repoRoot, pipelineId, {
+      baseBranch,
+      landingBranch,
+      recoveryPath: landing.last_recovery.recovery_path,
+      reason: `repair_${recoveryStatus}_recovery`,
+    });
+    actions.push({
+      kind: 'recovery_state_cleared',
+      recovery_path: cleared.recovery_path,
+      removed: cleared.removed,
+      recovery_status: recoveryStatus,
+      branch_worktree_path: landing.last_recovery?.state?.branch_worktree_path || null,
+    });
+    landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+      baseBranch,
+      landingBranch,
+      requireCompleted: false,
+    });
+  }
+
+  const needsLandingRefresh = landing.synthetic
+    && !landing.last_failure
+    && (
+      landing.stale
+      || (landing.branch_exists && !landing.last_materialized)
+    );
+
+  if (needsLandingRefresh) {
+    const refreshed = materializePipelineLandingBranch(db, repoRoot, pipelineId, {
+      baseBranch,
+      landingBranch,
+      requireCompleted: false,
+      refresh: true,
+    });
+    actions.push({
+      kind: landing.last_materialized ? 'landing_branch_refreshed' : 'landing_branch_reconciled',
+      branch: refreshed.branch,
+      head_commit: refreshed.head_commit || null,
+    });
+    landing = getPipelineLandingBranchStatus(db, repoRoot, pipelineId, {
+      baseBranch,
+      landingBranch,
+      requireCompleted: false,
+    });
+  }
+
+  if (actions.length === 0) {
+    notes = ['No repair action was needed.'];
+  }
+
+  const nextAction = landing.last_failure?.next_action
+    || (landing.synthetic
+      ? `switchman queue add --pipeline ${pipelineId}`
+      : landing.branch
+        ? `switchman queue add ${landing.branch}`
+        : `switchman pipeline status ${pipelineId}`);
+
+  return {
+    pipeline_id: pipelineId,
+    repaired: actions.length > 0,
+    actions,
+    notes,
+    landing,
+    next_action: nextAction,
   };
 }
 

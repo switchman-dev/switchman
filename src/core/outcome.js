@@ -183,7 +183,7 @@ export function evaluateTaskOutcome(db, repoRoot, { taskId = null, leaseId = nul
   };
 
   if (execution.leaseId) {
-    touchBoundaryValidationState(db, execution.leaseId, 'task_outcome_accepted');
+    touchBoundaryValidationState(db, execution.leaseId, 'task_outcome_accepted', { changed_files: changedFiles });
   }
 
   return result;

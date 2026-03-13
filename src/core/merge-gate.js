@@ -225,10 +225,20 @@ function evaluateDependencyInvalidations(db) {
   return listDependencyInvalidations(db, { status: 'stale' })
     .map((state) => {
       const affectedTask = getTask(db, state.affected_task_id);
-      const severity = affectedTask?.status === 'done' ? 'blocked' : 'warn';
+      const details = state.details || {};
+      const severity = details.severity || (affectedTask?.status === 'done' ? 'blocked' : 'warn');
       const staleArea = state.reason_type === 'subsystem_overlap'
         ? `subsystem:${state.subsystem_tag}`
+        : state.reason_type === 'semantic_contract_drift'
+          ? `contract:${(details.contract_names || []).join('|') || 'unknown'}`
+        : state.reason_type === 'semantic_object_overlap'
+          ? `object:${(details.object_names || []).join('|') || 'unknown'}`
         : `${state.source_scope_pattern} ↔ ${state.affected_scope_pattern}`;
+      const summary = state.reason_type === 'semantic_contract_drift'
+        ? `${details.source_task_title || state.source_task_id} changed shared contract ${(details.contract_names || []).join(', ') || 'unknown'}`
+        : state.reason_type === 'semantic_object_overlap'
+          ? `${details.source_task_title || state.source_task_id} changed shared exported object ${(details.object_names || []).join(', ') || 'unknown'}`
+          : `${affectedTask?.title || state.affected_task_id} is stale because ${details?.source_task_title || state.source_task_id} changed shared ${staleArea}`;
       return {
         source_lease_id: state.source_lease_id,
         source_task_id: state.source_task_id,
@@ -243,9 +253,10 @@ function evaluateDependencyInvalidations(db) {
         subsystem_tag: state.subsystem_tag,
         source_scope_pattern: state.source_scope_pattern,
         affected_scope_pattern: state.affected_scope_pattern,
-        summary: `${affectedTask?.title || state.affected_task_id} is stale because ${state.details?.source_task_title || state.source_task_id} changed shared ${staleArea}`,
+        summary,
         stale_area: staleArea,
         created_at: state.created_at,
+        details,
       };
     });
 }

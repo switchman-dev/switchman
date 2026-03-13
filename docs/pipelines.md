@@ -114,3 +114,17 @@ In GitHub Actions you can let Switchman resolve the PR number from `GITHUB_EVENT
 ```bash
 switchman pipeline comment pipe-123 --pr-from-env --update-existing
 ```
+
+If you want one command to refresh the bundle, update the PR comment, and emit GitHub step summary/output data together:
+
+```bash
+switchman pipeline sync-pr pipe-123 --pr-from-env --github
+```
+
+If you want GitHub Actions to infer the pipeline from the current pull request branch instead, Switchman now supports:
+
+```bash
+switchman pipeline sync-pr --pipeline-from-env --skip-missing-pipeline --pr-from-env --github
+```
+
+That lets a hosted workflow refresh PR state automatically on every PR update without hard-coding a pipeline id. When the branch does not map to a single Switchman pipeline, the command exits cleanly in skip mode instead of failing the workflow.

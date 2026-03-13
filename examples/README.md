@@ -27,6 +27,14 @@ examples/
 
 This is the fastest way to understand Switchman as a new user.
 
+If you just want the shortest proof run, start with:
+
+```bash
+switchman demo
+```
+
+Use the `examples/` scripts when you want a longer walkthrough you can customize or record.
+
 Make sure Switchman is installed globally first:
 ```bash
 npm install -g .   # from the switchman repo root

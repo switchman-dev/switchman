@@ -5,12 +5,16 @@
 
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { join, posix, resolve } from 'path';
+import { matchesPathPatterns } from './ignore.js';
+import { buildSemanticIndexForPath } from './semantic.js';
 
 const SWITCHMAN_DIR = '.switchman';
 const DB_FILE = 'switchman.db';
 const AUDIT_KEY_FILE = 'audit.key';
+const MIGRATION_STATE_FILE = 'migration-state.json';
+const CURRENT_SCHEMA_VERSION = 4;
 
 // How long (ms) a writer will wait for a lock before giving up.
 // 5 seconds is generous for a CLI tool with 3-10 concurrent agents.
@@ -88,6 +92,39 @@ function getTableColumns(db, tableName) {
   return db.prepare(`PRAGMA table_info(${tableName})`).all().map((column) => column.name);
 }
 
+function getSchemaVersion(db) {
+  return Number(db.prepare('PRAGMA user_version').get()?.user_version || 0);
+}
+
+function setSchemaVersion(db, version) {
+  db.exec(`PRAGMA user_version=${Number(version) || 0}`);
+}
+
+function getMigrationStatePath(repoRoot) {
+  return join(getSwitchmanDir(repoRoot), MIGRATION_STATE_FILE);
+}
+
+function readMigrationState(repoRoot) {
+  const path = getMigrationStatePath(repoRoot);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    throw new Error(`Switchman migration state is unreadable at ${path}. Remove or repair it before reopening the database.`);
+  }
+}
+
+function writeMigrationState(repoRoot, state) {
+  writeFileSync(getMigrationStatePath(repoRoot), `${JSON.stringify(state, null, 2)}\n`);
+}
+
+function clearMigrationState(repoRoot) {
+  const path = getMigrationStatePath(repoRoot);
+  if (existsSync(path)) {
+    rmSync(path, { force: true });
+  }
+}
+
 function getAuditSecret(repoRoot) {
   const keyPath = join(getSwitchmanDir(repoRoot), AUDIT_KEY_FILE);
   if (!existsSync(keyPath)) {
@@ -136,7 +173,7 @@ function signAuditEntry(secret, entryHash) {
   return createHmac('sha256', secret).update(entryHash).digest('hex');
 }
 
-function ensureSchema(db) {
+function applySchemaVersion1(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
       id           TEXT PRIMARY KEY,
@@ -308,6 +345,8 @@ function ensureSchema(db) {
       created_at         TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
       last_attempt_at    TEXT,
+      backoff_until      TEXT,
+      escalated_at       TEXT,
       started_at         TEXT,
       finished_at        TEXT
     );
@@ -392,9 +431,133 @@ function ensureSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_merge_queue_pipeline_id ON merge_queue(source_pipeline_id);
     CREATE INDEX IF NOT EXISTS idx_merge_queue_events_item ON merge_queue_events(queue_item_id);
   `);
+}
+
+function applySchemaVersion2(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS operation_journal (
+      id             TEXT PRIMARY KEY,
+      scope_type     TEXT NOT NULL,
+      scope_id       TEXT NOT NULL,
+      operation_type TEXT NOT NULL,
+      status         TEXT NOT NULL DEFAULT 'running',
+      details        TEXT,
+      started_at     TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at    TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_operation_journal_scope
+      ON operation_journal(scope_type, scope_id, started_at);
+    CREATE INDEX IF NOT EXISTS idx_operation_journal_status
+      ON operation_journal(status, started_at);
+  `);
 
   migrateLegacyAuditLog(db);
   migrateLegacyActiveTasks(db);
+}
+
+function applySchemaVersion3(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS temp_resources (
+      id            TEXT PRIMARY KEY,
+      scope_type    TEXT NOT NULL,
+      scope_id      TEXT NOT NULL,
+      operation_id  TEXT,
+      resource_type TEXT NOT NULL,
+      path          TEXT NOT NULL,
+      branch        TEXT,
+      status        TEXT NOT NULL DEFAULT 'active',
+      details       TEXT,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      released_at   TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_temp_resources_scope
+      ON temp_resources(scope_type, scope_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_temp_resources_status
+      ON temp_resources(status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_temp_resources_path
+      ON temp_resources(path);
+    CREATE INDEX IF NOT EXISTS idx_temp_resources_operation
+      ON temp_resources(operation_id);
+  `);
+}
+
+function applySchemaVersion4(db) {
+  const mergeQueueColumns = getTableColumns(db, 'merge_queue');
+  if (mergeQueueColumns.length > 0 && !mergeQueueColumns.includes('backoff_until')) {
+    db.exec(`ALTER TABLE merge_queue ADD COLUMN backoff_until TEXT`);
+  }
+  if (mergeQueueColumns.length > 0 && !mergeQueueColumns.includes('escalated_at')) {
+    db.exec(`ALTER TABLE merge_queue ADD COLUMN escalated_at TEXT`);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_merge_queue_backoff_until ON merge_queue(backoff_until);
+    CREATE INDEX IF NOT EXISTS idx_merge_queue_escalated_at ON merge_queue(escalated_at);
+  `);
+}
+
+function ensureSchemaMigrated(db) {
+  const repoRoot = db.__switchmanRepoRoot;
+  if (!repoRoot) {
+    throw new Error('Database repo root is not configured.');
+  }
+
+  const recordedState = readMigrationState(repoRoot);
+  const currentVersion = getSchemaVersion(db);
+
+  if (currentVersion > CURRENT_SCHEMA_VERSION) {
+    throw new Error(`Switchman database schema version ${currentVersion} is newer than this CLI supports (${CURRENT_SCHEMA_VERSION}). Upgrade Switchman before opening this repo.`);
+  }
+
+  if (recordedState?.status === 'running') {
+    throw new Error(`Switchman detected an interrupted database migration from version ${recordedState.from_version} to ${recordedState.to_version}. Resolve the migration state in ${getMigrationStatePath(repoRoot)} before reopening the database.`);
+  }
+
+  if (currentVersion === CURRENT_SCHEMA_VERSION) {
+    if (recordedState) {
+      clearMigrationState(repoRoot);
+    }
+    return;
+  }
+
+  writeMigrationState(repoRoot, {
+    status: 'running',
+    from_version: currentVersion,
+    to_version: CURRENT_SCHEMA_VERSION,
+    started_at: new Date().toISOString(),
+  });
+
+  try {
+    withImmediateTransaction(db, () => {
+      if (currentVersion < 1) {
+        applySchemaVersion1(db);
+      }
+      if (currentVersion < 2) {
+        applySchemaVersion2(db);
+      }
+      if (currentVersion < 3) {
+        applySchemaVersion3(db);
+      }
+      if (currentVersion < 4) {
+        applySchemaVersion4(db);
+      }
+      setSchemaVersion(db, CURRENT_SCHEMA_VERSION);
+    });
+    clearMigrationState(repoRoot);
+  } catch (err) {
+    writeMigrationState(repoRoot, {
+      status: 'failed',
+      from_version: currentVersion,
+      to_version: CURRENT_SCHEMA_VERSION,
+      failed_at: new Date().toISOString(),
+      error: String(err?.message || err),
+    });
+    throw err;
+  }
 }
 
 function normalizeScopeRoot(pattern) {
@@ -440,6 +603,42 @@ function buildSpecOverlap(sourceSpec = null, affectedSpec = null) {
     shared_subsystems: sharedSubsystems,
     shared_scopes: sharedScopes,
   };
+}
+
+function taskSpecMatchesObject(taskSpec = null, object = null) {
+  if (!taskSpec || !object) return false;
+  const allowedPaths = Array.isArray(taskSpec.allowed_paths) ? taskSpec.allowed_paths.filter(Boolean) : [];
+  if (allowedPaths.length > 0 && matchesPathPatterns(object.file_path, allowedPaths)) {
+    return true;
+  }
+
+  const subsystemTags = Array.isArray(taskSpec.subsystem_tags) ? taskSpec.subsystem_tags.filter(Boolean) : [];
+  return subsystemTags.some((tag) => (object.subsystem_tags || []).includes(tag));
+}
+
+function buildSemanticDependencyOverlap(db, sourceSpec, affectedSpec, changedFiles = []) {
+  const repoRoot = db.__switchmanRepoRoot;
+  if (!repoRoot || !sourceSpec || !affectedSpec || changedFiles.length === 0) {
+    return [];
+  }
+
+  const changedObjects = buildSemanticIndexForPath(repoRoot, changedFiles).objects || [];
+  const sourceObjects = changedObjects.filter((object) =>
+    changedFiles.includes(object.file_path)
+    && taskSpecMatchesObject(sourceSpec, object),
+  );
+  if (sourceObjects.length === 0) return [];
+
+  const affectedObjects = changedObjects.filter((object) => taskSpecMatchesObject(affectedSpec, object));
+  const affectedKeys = new Set(affectedObjects.map((object) => `${object.kind}:${object.name}`));
+  return sourceObjects
+    .filter((object) => affectedKeys.has(`${object.kind}:${object.name}`))
+    .map((object) => ({
+      kind: object.kind,
+      name: object.name,
+      file_path: object.file_path,
+      area: object.area || null,
+    }));
 }
 
 function buildLeaseScopeReservations(lease, taskSpec) {
@@ -906,7 +1105,7 @@ function resolveDependencyInvalidationsForAffectedTaskTx(db, affectedTaskId, res
   `).run(resolvedBy || null, resolvedBy || null, affectedTaskId);
 }
 
-function syncDependencyInvalidationsForLeaseTx(db, leaseId, source = 'write') {
+function syncDependencyInvalidationsForLeaseTx(db, leaseId, source = 'write', context = {}) {
   const execution = getLeaseExecutionContext(db, leaseId);
   if (!execution?.task || !execution.task_spec) {
     return [];
@@ -928,7 +1127,8 @@ function syncDependencyInvalidationsForLeaseTx(db, leaseId, source = 'write') {
     if ((affectedSpec.pipeline_id || null) === sourcePipelineId) continue;
 
     const overlap = buildSpecOverlap(sourceSpec, affectedSpec);
-    if (overlap.shared_subsystems.length === 0 && overlap.shared_scopes.length === 0) continue;
+    const semanticOverlap = buildSemanticDependencyOverlap(db, sourceSpec, affectedSpec, context.changed_files || []);
+    if (overlap.shared_subsystems.length === 0 && overlap.shared_scopes.length === 0 && semanticOverlap.length === 0) continue;
 
     const affectedWorktree = affectedTask.worktree || null;
     for (const subsystemTag of overlap.shared_subsystems) {
@@ -949,6 +1149,8 @@ function syncDependencyInvalidationsForLeaseTx(db, leaseId, source = 'write') {
           source,
           source_task_title: sourceTask.title,
           affected_task_title: affectedTask.title,
+          source_task_priority: Number(sourceTask.priority || 0),
+          affected_task_priority: Number(affectedTask.priority || 0),
         },
       });
     }
@@ -971,6 +1173,69 @@ function syncDependencyInvalidationsForLeaseTx(db, leaseId, source = 'write') {
           source,
           source_task_title: sourceTask.title,
           affected_task_title: affectedTask.title,
+          source_task_priority: Number(sourceTask.priority || 0),
+          affected_task_priority: Number(affectedTask.priority || 0),
+        },
+      });
+    }
+
+    const semanticContractOverlap = semanticOverlap.filter((item) => ['interface', 'type'].includes(item.kind));
+    const semanticObjectOverlap = semanticOverlap.filter((item) => !['interface', 'type'].includes(item.kind));
+
+    if (semanticContractOverlap.length > 0) {
+      desired.push({
+        source_lease_id: leaseId,
+        source_task_id: sourceTask.id,
+        source_pipeline_id: sourcePipelineId,
+        source_worktree: sourceWorktree,
+        affected_task_id: affectedTask.id,
+        affected_pipeline_id: affectedSpec.pipeline_id || null,
+        affected_worktree: affectedWorktree,
+        status: 'stale',
+        reason_type: 'semantic_contract_drift',
+        subsystem_tag: null,
+        source_scope_pattern: null,
+        affected_scope_pattern: null,
+        details: {
+          source,
+          source_task_title: sourceTask.title,
+          affected_task_title: affectedTask.title,
+          source_task_priority: Number(sourceTask.priority || 0),
+          affected_task_priority: Number(affectedTask.priority || 0),
+          contract_names: [...new Set(semanticContractOverlap.map((item) => item.name))],
+          contract_kinds: [...new Set(semanticContractOverlap.map((item) => item.kind))],
+          contract_files: [...new Set(semanticContractOverlap.map((item) => item.file_path))],
+          revalidation_set: 'contract',
+          severity: 'blocked',
+        },
+      });
+    }
+
+    if (semanticObjectOverlap.length > 0) {
+      desired.push({
+        source_lease_id: leaseId,
+        source_task_id: sourceTask.id,
+        source_pipeline_id: sourcePipelineId,
+        source_worktree: sourceWorktree,
+        affected_task_id: affectedTask.id,
+        affected_pipeline_id: affectedSpec.pipeline_id || null,
+        affected_worktree: affectedWorktree,
+        status: 'stale',
+        reason_type: 'semantic_object_overlap',
+        subsystem_tag: null,
+        source_scope_pattern: null,
+        affected_scope_pattern: null,
+        details: {
+          source,
+          source_task_title: sourceTask.title,
+          affected_task_title: affectedTask.title,
+          source_task_priority: Number(sourceTask.priority || 0),
+          affected_task_priority: Number(affectedTask.priority || 0),
+          object_names: [...new Set(semanticObjectOverlap.map((item) => item.name))],
+          object_kinds: [...new Set(semanticObjectOverlap.map((item) => item.kind))],
+          object_files: [...new Set(semanticObjectOverlap.map((item) => item.file_path))],
+          revalidation_set: 'semantic_object',
+          severity: 'warn',
         },
       });
     }
@@ -1278,7 +1543,7 @@ export function initDb(repoRoot) {
   db.__switchmanRepoRoot = repoRoot;
   db.__switchmanAuditSecret = getAuditSecret(repoRoot);
   configureDb(db, { initialize: true });
-  withBusyRetry(() => ensureSchema(db));
+  withBusyRetry(() => ensureSchemaMigrated(db));
   return db;
 }
 
@@ -1291,7 +1556,7 @@ export function openDb(repoRoot) {
   db.__switchmanRepoRoot = repoRoot;
   db.__switchmanAuditSecret = getAuditSecret(repoRoot);
   configureDb(db);
-  withBusyRetry(() => ensureSchema(db));
+  withBusyRetry(() => ensureSchemaMigrated(db));
   return db;
 }
 
@@ -1518,10 +1783,186 @@ export function logMergeQueueEvent(db, itemId, {
   `).run(itemId, eventType, status || null, details == null ? null : String(details));
 }
 
+export function listOperationJournal(db, {
+  scopeType = null,
+  scopeId = null,
+  status = null,
+  limit = 50,
+} = {}) {
+  const clauses = [];
+  const params = [];
+  if (scopeType) {
+    clauses.push('scope_type=?');
+    params.push(scopeType);
+  }
+  if (scopeId) {
+    clauses.push('scope_id=?');
+    params.push(scopeId);
+  }
+  if (status) {
+    clauses.push('status=?');
+    params.push(status);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`
+    SELECT *
+    FROM operation_journal
+    ${where}
+    ORDER BY datetime(started_at) DESC, id DESC
+    LIMIT ?
+  `).all(...params, limit);
+}
+
+export function startOperationJournalEntry(db, {
+  id = null,
+  scopeType,
+  scopeId,
+  operationType,
+  details = null,
+} = {}) {
+  const entryId = id || makeId('op');
+  db.prepare(`
+    INSERT INTO operation_journal (id, scope_type, scope_id, operation_type, status, details)
+    VALUES (?, ?, ?, ?, 'running', ?)
+  `).run(entryId, scopeType, scopeId, operationType, details == null ? null : String(details));
+  return db.prepare(`
+    SELECT *
+    FROM operation_journal
+    WHERE id=?
+  `).get(entryId);
+}
+
+export function finishOperationJournalEntry(db, entryId, {
+  status = 'completed',
+  details = null,
+} = {}) {
+  db.prepare(`
+    UPDATE operation_journal
+    SET status=?,
+        details=COALESCE(?, details),
+        updated_at=datetime('now'),
+        finished_at=datetime('now')
+    WHERE id=?
+  `).run(status, details == null ? null : String(details), entryId);
+  return db.prepare(`
+    SELECT *
+    FROM operation_journal
+    WHERE id=?
+  `).get(entryId);
+}
+
+export function listTempResources(db, {
+  scopeType = null,
+  scopeId = null,
+  operationId = null,
+  resourceType = null,
+  status = null,
+  limit = 100,
+} = {}) {
+  const clauses = [];
+  const params = [];
+  if (scopeType) {
+    clauses.push('scope_type=?');
+    params.push(scopeType);
+  }
+  if (scopeId) {
+    clauses.push('scope_id=?');
+    params.push(scopeId);
+  }
+  if (operationId) {
+    clauses.push('operation_id=?');
+    params.push(operationId);
+  }
+  if (resourceType) {
+    clauses.push('resource_type=?');
+    params.push(resourceType);
+  }
+  if (status) {
+    clauses.push('status=?');
+    params.push(status);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  return db.prepare(`
+    SELECT *
+    FROM temp_resources
+    ${where}
+    ORDER BY datetime(created_at) DESC, id DESC
+    LIMIT ?
+  `).all(...params, limit);
+}
+
+export function createTempResource(db, {
+  id = null,
+  scopeType,
+  scopeId,
+  operationId = null,
+  resourceType,
+  path,
+  branch = null,
+  details = null,
+  status = 'active',
+} = {}) {
+  const resourceId = id || makeId('res');
+  db.prepare(`
+    INSERT INTO temp_resources (
+      id, scope_type, scope_id, operation_id, resource_type, path, branch, status, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    resourceId,
+    scopeType,
+    scopeId,
+    operationId || null,
+    resourceType,
+    path,
+    branch || null,
+    status,
+    details == null ? null : String(details),
+  );
+  return db.prepare(`
+    SELECT *
+    FROM temp_resources
+    WHERE id=?
+  `).get(resourceId);
+}
+
+export function updateTempResource(db, resourceId, {
+  status = null,
+  path = null,
+  branch = null,
+  details = null,
+} = {}) {
+  db.prepare(`
+    UPDATE temp_resources
+    SET status=COALESCE(?, status),
+        path=COALESCE(?, path),
+        branch=COALESCE(?, branch),
+        details=COALESCE(?, details),
+        updated_at=datetime('now'),
+        released_at=CASE
+          WHEN COALESCE(?, status) = 'active' THEN NULL
+          ELSE COALESCE(released_at, datetime('now'))
+        END
+    WHERE id=?
+  `).run(
+    status,
+    path,
+    branch,
+    details == null ? null : String(details),
+    status,
+    resourceId,
+  );
+  return db.prepare(`
+    SELECT *
+    FROM temp_resources
+    WHERE id=?
+  `).get(resourceId);
+}
+
 export function startMergeQueueItem(db, itemId) {
   return withImmediateTransaction(db, () => {
     const item = getMergeQueueItem(db, itemId);
-    if (!item || !['queued', 'retrying'].includes(item.status)) {
+    if (!item || !['queued', 'retrying', 'held', 'escalated'].includes(item.status)) {
       return null;
     }
 
@@ -1531,7 +1972,7 @@ export function startMergeQueueItem(db, itemId) {
           started_at=COALESCE(started_at, datetime('now')),
           last_attempt_at=datetime('now'),
           updated_at=datetime('now')
-      WHERE id=? AND status IN ('queued', 'retrying')
+      WHERE id=? AND status IN ('queued', 'retrying', 'held', 'escalated')
     `).run(itemId);
 
     logMergeQueueEvent(db, itemId, {
@@ -1550,6 +1991,7 @@ export function markMergeQueueState(db, itemId, {
   nextAction = null,
   mergedCommit = null,
   incrementRetry = false,
+  backoffUntil = undefined,
 } = {}) {
   const terminal = ['merged', 'blocked', 'failed', 'canceled'].includes(status);
   db.prepare(`
@@ -1560,6 +2002,15 @@ export function markMergeQueueState(db, itemId, {
         next_action=?,
         merged_commit=COALESCE(?, merged_commit),
         retry_count=retry_count + ?,
+        backoff_until=CASE
+          WHEN ? THEN ?
+          WHEN ? = 'retrying' THEN backoff_until
+          ELSE NULL
+        END,
+        escalated_at=CASE
+          WHEN ? = 'escalated' THEN COALESCE(escalated_at, datetime('now'))
+          ELSE NULL
+        END,
         updated_at=datetime('now'),
         finished_at=CASE WHEN ? THEN datetime('now') ELSE finished_at END
     WHERE id=?
@@ -1570,6 +2021,10 @@ export function markMergeQueueState(db, itemId, {
     nextAction || null,
     mergedCommit || null,
     incrementRetry ? 1 : 0,
+    backoffUntil !== undefined ? 1 : 0,
+    backoffUntil || null,
+    status,
+    status,
     terminal ? 1 : 0,
     itemId,
   );
@@ -1591,7 +2046,7 @@ export function markMergeQueueState(db, itemId, {
 
 export function retryMergeQueueItem(db, itemId) {
   const item = getMergeQueueItem(db, itemId);
-  if (!item || !['blocked', 'failed'].includes(item.status)) {
+  if (!item || !['blocked', 'failed', 'held', 'escalated', 'retrying'].includes(item.status)) {
     return null;
   }
 
@@ -1601,6 +2056,8 @@ export function retryMergeQueueItem(db, itemId) {
         last_error_code=NULL,
         last_error_summary=NULL,
         next_action=NULL,
+        backoff_until=NULL,
+        escalated_at=NULL,
         finished_at=NULL,
         updated_at=datetime('now')
     WHERE id=?
@@ -1612,6 +2069,35 @@ export function retryMergeQueueItem(db, itemId) {
   });
 
   return getMergeQueueItem(db, itemId);
+}
+
+export function escalateMergeQueueItem(db, itemId, {
+  summary = null,
+  nextAction = null,
+} = {}) {
+  const item = getMergeQueueItem(db, itemId);
+  if (!item || ['merged', 'canceled'].includes(item.status)) {
+    return null;
+  }
+
+  const desiredSummary = summary || item.last_error_summary || 'Operator escalation requested before this queue item lands.';
+  const desiredNextAction = nextAction || item.next_action || `Run \`switchman explain queue ${itemId}\` to review the risk, then \`switchman queue retry ${itemId}\` when you are ready to land it again.`;
+
+  if (
+    item.status === 'escalated'
+    && (item.last_error_summary || null) === desiredSummary
+    && (item.next_action || null) === desiredNextAction
+  ) {
+    return item;
+  }
+
+  return markMergeQueueState(db, itemId, {
+    status: 'escalated',
+    lastErrorCode: 'queue_escalated_manual',
+    lastErrorSummary: desiredSummary,
+    nextAction: desiredNextAction,
+    backoffUntil: null,
+  });
 }
 
 export function removeMergeQueueItem(db, itemId) {
@@ -1771,7 +2257,7 @@ export function listDependencyInvalidations(db, { status = 'stale', pipelineId =
   }));
 }
 
-export function touchBoundaryValidationState(db, leaseId, source = 'write') {
+export function touchBoundaryValidationState(db, leaseId, source = 'write', context = {}) {
   return withImmediateTransaction(db, () => {
     const state = computeBoundaryValidationStateTx(db, leaseId, { touched: true, source });
     if (state) {
@@ -1790,7 +2276,7 @@ export function touchBoundaryValidationState(db, leaseId, source = 'write') {
       });
     }
 
-    const invalidations = syncDependencyInvalidationsForLeaseTx(db, leaseId, source);
+    const invalidations = syncDependencyInvalidationsForLeaseTx(db, leaseId, source, context);
     if (invalidations.length > 0) {
       logAuditEventTx(db, {
         eventType: 'dependency_invalidations_updated',
@@ -1802,6 +2288,8 @@ export function touchBoundaryValidationState(db, leaseId, source = 'write') {
           source,
           stale_count: invalidations.length,
           affected_task_ids: [...new Set(invalidations.map((item) => item.affected_task_id))],
+          reason_types: [...new Set(invalidations.map((item) => item.reason_type))],
+          revalidation_sets: [...new Set(invalidations.map((item) => item.details?.revalidation_set).filter(Boolean))],
         }),
       });
     }

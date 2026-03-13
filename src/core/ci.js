@@ -288,6 +288,12 @@ jobs:
             echo "\${{ steps.switchman_gate.outputs.switchman_summary }}"
             exit 1
           fi
+
+      - name: Sync Switchman PR state
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          switchman pipeline sync-pr --pipeline-from-env --skip-missing-pipeline --pr-from-env --github
 `;
 
   writeFileSync(workflowPath, workflow);

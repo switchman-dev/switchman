@@ -181,6 +181,7 @@ switchman gate install-ci
 
 That installs `.github/workflows/switchman-gate.yml`, which:
 - runs `switchman gate ci --github` on pushes and pull requests
+- auto-runs `switchman pipeline sync-pr --pipeline-from-env --skip-missing-pipeline --pr-from-env --github` on pull request updates
 - publishes a readable Switchman summary into the GitHub job output
 - fails the PR check when Switchman detects unmanaged changes, stale work, or risky overlap
 
@@ -189,6 +190,23 @@ For pipeline-specific landing state in GitHub job summaries or PR checks, use:
 ```bash
 switchman pipeline bundle pipe-123 --github
 ```
+
+If you want one command that bundles artifacts, updates the PR comment, and emits GitHub outputs together:
+
+```bash
+switchman pipeline sync-pr pipe-123 --pr-from-env --github
+```
+
+## Add Change Policy
+
+If you want Switchman to enforce extra review or validation for high-risk areas like auth, schema, or payments:
+
+```bash
+switchman policy init-change
+switchman policy show-change
+```
+
+That writes `.switchman/change-policy.json`, which planning and follow-up generation use to require the right tests, docs, and governance work before landing.
 
 ## More docs
 

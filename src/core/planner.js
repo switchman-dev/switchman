@@ -2,6 +2,8 @@ import { execSync } from 'child_process';
 import { existsSync, readdirSync, statSync } from 'fs';
 import { basename, join } from 'path';
 
+import { loadChangePolicy } from './policy.js';
+
 const DOMAIN_RULES = [
   { key: 'auth', regex: /\b(auth|login|session|oauth|permission|rbac|token)\b/i, source: ['src/auth/**', 'app/auth/**', 'lib/auth/**', 'server/auth/**', 'client/auth/**'] },
   { key: 'api', regex: /\b(api|endpoint|route|graphql|rest|handler)\b/i, source: ['src/api/**', 'app/api/**', 'server/api/**', 'routes/**'] },
@@ -376,7 +378,7 @@ function buildFollowupDeliverables({ taskType, riskLevel, domains }) {
   return uniq(deliverables);
 }
 
-function buildValidationRules({ taskType, riskLevel, domains }) {
+function buildValidationRules({ taskType, riskLevel, domains, changePolicy = null }) {
   if (taskType !== 'implementation') {
     return {
       enforcement: 'none',
@@ -403,14 +405,30 @@ function buildValidationRules({ taskType, riskLevel, domains }) {
     rationale.push('public or shared boundaries require updated docs or integration notes');
   }
 
-  const enforcement = domains.some((domain) => ['auth', 'payments', 'schema'].includes(domain))
+  const matchedPolicyRules = domains
+    .map((domain) => changePolicy?.domain_rules?.[domain] || null)
+    .filter(Boolean);
+  for (const rule of matchedPolicyRules) {
+    requiredCompletedTaskTypes.push(...(rule.required_completed_task_types || []));
+    rationale.push(...(rule.rationale || []));
+  }
+
+  const enforcementRank = { none: 0, warn: 1, blocked: 2 };
+  const defaultEnforcement = domains.some((domain) => ['auth', 'payments', 'schema'].includes(domain))
     ? 'blocked'
     : (requiredCompletedTaskTypes.length > 0 ? 'warn' : 'none');
+  const policyEnforcement = matchedPolicyRules
+    .map((rule) => rule.enforcement || 'none')
+    .reduce((highest, current) =>
+      enforcementRank[current] > enforcementRank[highest] ? current : highest, 'none');
+  const enforcement = enforcementRank[policyEnforcement] > enforcementRank[defaultEnforcement]
+    ? policyEnforcement
+    : defaultEnforcement;
 
   return {
     enforcement,
     required_completed_task_types: uniq(requiredCompletedTaskTypes),
-    rationale,
+    rationale: uniq(rationale),
   };
 }
 
@@ -430,7 +448,7 @@ function extractObjectiveKeywords(title, domains = []) {
   ]).slice(0, 8);
 }
 
-export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDescription = null, suggestedWorktree = null, dependencies = [], repoContext = null }) {
+export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDescription = null, suggestedWorktree = null, dependencies = [], repoContext = null, changePolicy = null }) {
   const taskType = inferTaskType(title);
   const text = `${issueTitle}\n${issueDescription || ''}\n${title}`.toLowerCase();
   const domains = detectDomains(text);
@@ -458,7 +476,7 @@ export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDesc
     expected_output_types: expectedOutputTypes,
     required_deliverables: buildRequiredDeliverables({ taskType, riskLevel, domains }),
     followup_deliverables: buildFollowupDeliverables({ taskType, riskLevel, domains }),
-    validation_rules: buildValidationRules({ taskType, riskLevel, domains }),
+    validation_rules: buildValidationRules({ taskType, riskLevel, domains, changePolicy }),
     success_criteria: buildSuccessCriteria({ taskType, allowedPaths, dependencies }),
     risk_level: riskLevel,
     execution_policy: buildExecutionPolicy({ taskType, riskLevel }),
@@ -468,6 +486,7 @@ export function buildTaskSpec({ pipelineId, taskId, title, issueTitle, issueDesc
 export function planPipelineTasks({ pipelineId, title, description = null, worktrees = [], maxTasks = 5, repoRoot = null }) {
   const subtaskTitles = deriveSubtaskTitles(title, description).slice(0, maxTasks);
   const repoContext = buildRepoContext(repoRoot);
+  const changePolicy = loadChangePolicy(repoRoot);
   let implementationTaskId = null;
 
   return subtaskTitles.map((subtaskTitle, index) => {
@@ -489,6 +508,7 @@ export function planPipelineTasks({ pipelineId, title, description = null, workt
       suggestedWorktree,
       dependencies,
       repoContext,
+      changePolicy,
     });
 
     const task = {

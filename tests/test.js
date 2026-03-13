@@ -4,7 +4,7 @@
  */
 
 import { execFileSync, execSync } from 'child_process';
-import { mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync, statSync, chmodSync } from 'fs';
+import { mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync, statSync, chmodSync, utimesSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { DatabaseSync } from 'node:sqlite';
@@ -19,7 +19,7 @@ import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 import { buildTaskSpec } from '../src/core/planner.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../src/core/policy.js';
-import { resolveQueueSource } from '../src/core/queue.js';
+import { resolveQueueSource, runMergeQueue } from '../src/core/queue.js';
 import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
@@ -47,8 +47,12 @@ import {
   getTask,
   getNextPendingTask,
   enqueueMergeItem,
+  getMergeQueueItem,
   listMergeQueue,
+  listOperationJournal,
+  listTempResources,
   markMergeQueueState,
+  startOperationJournalEntry,
   listLeases,
   listBoundaryValidationStates,
   listDependencyInvalidations,
@@ -705,6 +709,70 @@ test('Merge queue run fast-forwards a clean worktree branch into main', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Merge queue run prioritizes fresher queued branches before older behind branches', () => {
+  const repoDir = join(tmpdir(), `sw-queue-priority-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const stalePath = join(tmpdir(), `sw-queue-priority-stale-${Date.now()}`);
+  execSync(`git worktree add -b feature/queue-stale "${stalePath}"`, { cwd: repoDir });
+  writeFileSync(join(stalePath, 'stale.txt'), 'stale\n');
+  execSync('git add stale.txt', { cwd: stalePath });
+  execSync('git commit -m "stale work"', { cwd: stalePath });
+
+  writeFileSync(join(repoDir, 'base.txt'), 'base drift\n');
+  execSync('git add base.txt', { cwd: repoDir });
+  execSync('git commit -m "base drift"', { cwd: repoDir });
+
+  const freshPath = join(tmpdir(), `sw-queue-priority-fresh-${Date.now()}`);
+  execSync(`git worktree add -b feature/queue-fresh "${freshPath}"`, { cwd: repoDir });
+  writeFileSync(join(freshPath, 'fresh.txt'), 'fresh\n');
+  execSync('git add fresh.txt', { cwd: freshPath });
+  execSync('git commit -m "fresh work"', { cwd: freshPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'stale', path: stalePath, branch: 'feature/queue-stale' });
+  registerWorktree(queueDb, { name: 'fresh', path: freshPath, branch: 'feature/queue-fresh' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/queue-stale',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/queue-fresh',
+    targetBranch: 'main',
+  });
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const items = listMergeQueue(queueDb);
+  queueDb.close();
+
+  const merged = items.find((item) => item.status === 'merged');
+  const queued = items.find((item) => item.status === 'queued');
+  assert(cliResult.processed[0].item.source_ref === 'feature/queue-fresh', 'Queue runner chooses the fresher branch first');
+  assert(merged?.source_ref === 'feature/queue-fresh', 'Fresh queue item lands before the behind branch');
+  assert(queued?.source_ref === 'feature/queue-stale', 'Behind queue item remains queued for a later landing attempt');
+
+  execSync(`git worktree remove "${stalePath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${freshPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Merge queue run blocks missing source branches with a clear reason', () => {
   const repoDir = join(tmpdir(), `sw-queue-missing-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -834,6 +902,323 @@ test('Merge queue retry resets a blocked item back to retrying', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 54c: repo repair resets interrupted queue items back to retrying', () => {
+  const repoDir = join(tmpdir(), `sw-repair-queue-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const repairDb = initDb(repoDir);
+  registerWorktree(repairDb, { name: 'main', path: repoDir, branch: 'main' });
+  const item = enqueueMergeItem(repairDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/repair-me',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(repairDb, item.id, {
+    status: 'merging',
+    lastErrorCode: 'interrupted_queue_run',
+    lastErrorSummary: 'Interrupted while merging.',
+    nextAction: 'Run queue repair.',
+  });
+  repairDb.close();
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const verifyDb = openDb(repoDir);
+  const updated = listMergeQueue(verifyDb)[0];
+  verifyDb.close();
+
+  assert(repair.repaired, 'Repo repair reports that it repaired interrupted state');
+  assert(repair.actions.some((action) => action.kind === 'queue_item_reset' && action.queue_item_id === item.id), 'Repo repair reports the reset queue item');
+  assert(updated.status === 'retrying', 'Repo repair resets interrupted queue items to retrying');
+  assert(updated.next_action.includes('queue run'), 'Repo repair points the operator at queue run next');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56e: repo repair auto-registers git worktrees that exist but are missing from the database', () => {
+  const repoDir = join(tmpdir(), `sw-repair-register-git-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const repairDb = initDb(repoDir);
+  registerWorktree(repairDb, { name: 'main', path: repoDir, branch: 'main' });
+  repairDb.close();
+
+  const agentPath = join(tmpdir(), `sw-repair-register-git-agent-${Date.now()}`);
+  execSync(`git worktree add -b feature/repair-register "${agentPath}"`, { cwd: repoDir });
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const verifyDb = openDb(repoDir);
+  const worktrees = listWorktrees(verifyDb);
+  verifyDb.close();
+
+  assert(repair.actions.some((action) => action.kind === 'git_worktree_registered' && action.path.endsWith(`/${agentPath.split('/').pop()}`)), 'Repo repair reports the newly registered git worktree');
+  assert(worktrees.some((worktree) => worktree.path.endsWith(`/${agentPath.split('/').pop()}`) && worktree.branch === 'feature/repair-register'), 'Repo repair registers the missing git worktree in the database');
+
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 54g: repo repair removes stale temporary landing worktrees left by interrupted materialization', () => {
+  const repoDir = join(tmpdir(), `sw-repair-temp-wt-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const repairDb = initDb(repoDir);
+  registerWorktree(repairDb, { name: 'main', path: repoDir, branch: 'main' });
+  repairDb.close();
+
+  const tempWorktreePath = join(tmpdir(), `switchman-landing-${Date.now()}-stale`);
+  execSync(`git worktree add --detach "${tempWorktreePath}" main`, { cwd: repoDir });
+  const staleDate = new Date(Date.now() - (20 * 60 * 1000));
+  utimesSync(tempWorktreePath, staleDate, staleDate);
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const listed = execSync('git worktree list --porcelain', { cwd: repoDir, encoding: 'utf8' });
+
+  assert(repair.repaired, 'Repo repair reports that it removed stale temp landing worktree state');
+  assert(repair.actions.some((action) => action.kind === 'stale_temp_worktree_removed' && action.path.endsWith('/' + tempWorktreePath.split('/').pop())), 'Repo repair reports the removed stale temp landing worktree');
+  assert(!existsSync(tempWorktreePath), 'Repo repair removes the stale temp landing worktree from disk');
+  assert(!listed.includes(tempWorktreePath), 'Repo repair removes the stale temp landing worktree from git metadata');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56f: repo repair marks db worktrees missing when git no longer has them', () => {
+  const repoDir = join(tmpdir(), `sw-repair-missing-db-wt-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const missingPath = join(tmpdir(), `sw-repair-missing-db-path-${Date.now()}`);
+  mkdirSync(missingPath, { recursive: true });
+
+  const repairDb = initDb(repoDir);
+  registerWorktree(repairDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(repairDb, { name: 'ghost', path: missingPath, branch: 'feature/ghost' });
+  repairDb.close();
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const verifyDb = openDb(repoDir);
+  const ghost = listWorktrees(verifyDb).find((worktree) => worktree.name === 'ghost');
+  verifyDb.close();
+
+  assert(repair.actions.some((action) => action.kind === 'db_worktree_marked_missing' && action.worktree === 'ghost'), 'Repo repair reports the missing db worktree');
+  assert(ghost?.status === 'missing', 'Repo repair marks the missing db worktree as missing');
+
+  rmSync(missingPath, { recursive: true, force: true });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56c: repo repair closes interrupted queue journal operations after resetting the queue item', () => {
+  const repoDir = join(tmpdir(), `sw-repair-queue-journal-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const repairDb = initDb(repoDir);
+  registerWorktree(repairDb, { name: 'main', path: repoDir, branch: 'main' });
+  const item = enqueueMergeItem(repairDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/repair-journal',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(repairDb, item.id, {
+    status: 'rebasing',
+    lastErrorCode: 'interrupted_queue_run',
+    lastErrorSummary: 'Interrupted while rebasing.',
+    nextAction: 'Run queue repair.',
+  });
+  const op = startOperationJournalEntry(repairDb, {
+    scopeType: 'queue_item',
+    scopeId: item.id,
+    operationType: 'queue_rebase',
+    details: JSON.stringify({ queue_item_id: item.id }),
+  });
+  repairDb.close();
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const verifyDb = openDb(repoDir);
+  const updated = listMergeQueue(verifyDb)[0];
+  const journal = listOperationJournal(verifyDb, { scopeType: 'queue_item', scopeId: item.id, limit: 10 });
+  verifyDb.close();
+  const repairedOp = journal.find((entry) => entry.id === op.id);
+
+  assert(repair.actions.some((action) => action.kind === 'journal_operation_repaired' && action.operation_id === op.id), 'Repo repair reports the closed interrupted queue operation');
+  assert(updated.status === 'retrying', 'Repo repair still resets the queue item to retrying');
+  assert(repairedOp?.status === 'repaired', 'Repo repair marks the interrupted queue journal entry as repaired');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 54h: repo repair prunes missing temporary landing worktree metadata left by crashes', () => {
+  const repoDir = join(tmpdir(), `sw-repair-prune-temp-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const repairDb = initDb(repoDir);
+  registerWorktree(repairDb, { name: 'main', path: repoDir, branch: 'main' });
+  repairDb.close();
+
+  const tempWorktreePath = join(tmpdir(), `switchman-landing-${Date.now()}-missing`);
+  execSync(`git worktree add --detach "${tempWorktreePath}" main`, { cwd: repoDir });
+  rmSync(tempWorktreePath, { recursive: true, force: true });
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const listed = execSync('git worktree list --porcelain', { cwd: repoDir, encoding: 'utf8' });
+
+  assert(repair.repaired, 'Repo repair reports that it pruned stale temp landing metadata');
+  assert(repair.actions.some((action) => action.kind === 'stale_temp_worktree_pruned' && action.path.endsWith('/' + tempWorktreePath.split('/').pop())), 'Repo repair reports the pruned temp landing metadata');
+  assert(!listed.includes(tempWorktreePath), 'Repo repair prunes missing temp landing worktree metadata from git');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56g: repo repair blocks queued worktree items whose source worktree is missing', () => {
+  const repoDir = join(tmpdir(), `sw-repair-missing-queue-worktree-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const missingPath = join(tmpdir(), `sw-repair-missing-queue-path-${Date.now()}`);
+  mkdirSync(missingPath, { recursive: true });
+
+  const repairDb = initDb(repoDir);
+  registerWorktree(repairDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(repairDb, { name: 'agent-gone', path: missingPath, branch: 'feature/queue-gone' });
+  const item = enqueueMergeItem(repairDb, {
+    sourceType: 'worktree',
+    sourceRef: 'feature/queue-gone',
+    sourceWorktree: 'agent-gone',
+    targetBranch: 'main',
+  });
+  repairDb.close();
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const verifyDb = openDb(repoDir);
+  const updated = listMergeQueue(verifyDb).find((entry) => entry.id === item.id);
+  verifyDb.close();
+
+  assert(repair.actions.some((action) => action.kind === 'queue_item_blocked_missing_worktree' && action.queue_item_id === item.id), 'Repo repair reports the blocked queue item for a missing worktree');
+  assert(updated?.status === 'blocked', 'Repo repair blocks the queue item when its source worktree is missing');
+  assert(updated?.last_error_code === 'source_worktree_missing', 'Blocked queue item records a missing-worktree error code');
+
+  rmSync(missingPath, { recursive: true, force: true });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56a: queue run records rebase and merge operations in the operation journal', async () => {
+  const repoDir = join(tmpdir(), `sw-queue-journal-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agentPath = join(tmpdir(), `sw-queue-journal-agent-${Date.now()}`);
+  execSync(`git worktree add -b feature/queue-journal "${agentPath}"`, { cwd: repoDir });
+  writeFileSync(join(agentPath, 'queue.txt'), 'queued\n');
+  execSync('git add queue.txt', { cwd: agentPath });
+  execSync('git commit -m "queue work"', { cwd: agentPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'agent1', path: agentPath, branch: 'feature/queue-journal' });
+  const item = enqueueMergeItem(queueDb, {
+    sourceType: 'worktree',
+    sourceRef: 'feature/queue-journal',
+    sourceWorktree: 'agent1',
+    targetBranch: 'main',
+  });
+
+  await runMergeQueue(queueDb, repoDir, { maxItems: 1, targetBranch: 'main' });
+
+  const operations = listOperationJournal(queueDb, { scopeType: 'queue_item', scopeId: item.id, limit: 10 });
+  const rebase = operations.find((entry) => entry.operation_type === 'queue_rebase');
+  const merge = operations.find((entry) => entry.operation_type === 'queue_merge');
+
+  assert(rebase?.status === 'completed', 'Queue run records a completed rebase operation');
+  assert(merge?.status === 'completed', 'Queue run records a completed merge operation');
+  assert(String(merge?.details || '').includes('merged_commit'), 'Queue merge journal entry stores merge-result details');
+
+  queueDb.close();
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Merge queue run blocks when the repo gate fails before merge', () => {
   const repoDir = join(tmpdir(), `sw-queue-gate-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -911,6 +1296,797 @@ test('Merge queue status JSON includes retry counts and recent queue events', ()
   assert(statusJson.items[0].max_retries === 2, 'Queue status JSON includes the retry budget');
   assert(Array.isArray(statusJson.recent_events) && statusJson.recent_events.length > 0, 'Queue status JSON includes recent queue events');
   assert(statusJson.summary.counts.queued === 1, 'Queue status JSON includes queue counts');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue status explains freshness-based landing priority', () => {
+  const repoDir = join(tmpdir(), `sw-queue-status-freshness-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const stalePath = join(tmpdir(), `sw-queue-status-stale-${Date.now()}`);
+  execSync(`git worktree add -b feature/status-stale "${stalePath}"`, { cwd: repoDir });
+  writeFileSync(join(stalePath, 'stale.txt'), 'stale\n');
+  execSync('git add stale.txt', { cwd: stalePath });
+  execSync('git commit -m "stale work"', { cwd: stalePath });
+
+  writeFileSync(join(repoDir, 'base.txt'), 'base drift\n');
+  execSync('git add base.txt', { cwd: repoDir });
+  execSync('git commit -m "base drift"', { cwd: repoDir });
+
+  const freshPath = join(tmpdir(), `sw-queue-status-fresh-${Date.now()}`);
+  execSync(`git worktree add -b feature/status-fresh "${freshPath}"`, { cwd: repoDir });
+  writeFileSync(join(freshPath, 'fresh.txt'), 'fresh\n');
+  execSync('git add fresh.txt', { cwd: freshPath });
+  execSync('git commit -m "fresh work"', { cwd: freshPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'stale', path: stalePath, branch: 'feature/status-stale' });
+  registerWorktree(queueDb, { name: 'fresh', path: freshPath, branch: 'feature/status-fresh' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/status-stale',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/status-fresh',
+    targetBranch: 'main',
+  });
+  queueDb.close();
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(statusJson.summary.next.source_ref === 'feature/status-fresh', 'Queue status picks the fresher branch as the next landing candidate');
+  assert(statusJson.summary.next.queue_assessment.freshness === 'fresh', 'Queue status JSON includes the freshness assessment for the next item');
+  assert(statusJson.summary.next.queue_assessment.reason.includes('fresh branch'), 'Queue status JSON explains why the fresh branch lands next');
+  assert(statusJson.summary.next.recommendation.action === 'land_now', 'Queue status recommends landing the freshest clear branch now');
+  assert(statusJson.summary.focus_decision.action === 'land_now', 'Queue status surfaces the landing recommendation for the focus item');
+
+  execSync(`git worktree remove "${stalePath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${freshPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run deprioritizes stale pipeline-backed items behind clear fresh branches', () => {
+  const repoDir = join(tmpdir(), `sw-queue-stale-pipeline-run-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const stalePath = join(tmpdir(), `sw-queue-stale-pipeline-branch-${Date.now()}`);
+  execSync(`git worktree add -b feature/stale-pipeline "${stalePath}"`, { cwd: repoDir });
+  writeFileSync(join(stalePath, 'stale.txt'), 'stale\n');
+  execSync('git add stale.txt', { cwd: stalePath });
+  execSync('git commit -m "stale pipeline work"', { cwd: stalePath });
+
+  const freshPath = join(tmpdir(), `sw-queue-clear-branch-${Date.now()}`);
+  execSync(`git worktree add -b feature/clear-branch "${freshPath}"`, { cwd: repoDir });
+  writeFileSync(join(freshPath, 'fresh.txt'), 'fresh\n');
+  execSync('git add fresh.txt', { cwd: freshPath });
+  execSync('git commit -m "fresh clear work"', { cwd: freshPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'stale-pipeline', path: stalePath, branch: 'feature/stale-pipeline' });
+  registerWorktree(queueDb, { name: 'clear-branch', path: freshPath, branch: 'feature/clear-branch' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/stale-pipeline',
+    sourcePipelineId: 'pipe-stale-queue-order',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/clear-branch',
+    targetBranch: 'main',
+  });
+  const staleTaskId = createTask(queueDb, { id: 'pipe-stale-queue-order-01', title: 'Revalidate auth docs' });
+  upsertTaskSpec(queueDb, staleTaskId, {
+    pipeline_id: 'pipe-stale-queue-order',
+    task_type: 'docs',
+  });
+  const sourceTaskId = createTask(queueDb, { id: 'pipe-upstream-queue-order-01', title: 'Fresh auth change' });
+  upsertTaskSpec(queueDb, sourceTaskId, {
+    pipeline_id: 'pipe-upstream',
+    task_type: 'implementation',
+  });
+  const sourceLease = startTaskLease(queueDb, sourceTaskId, 'stale-pipeline', 'queue-tester');
+  queueDb.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-upstream',
+    'agent-upstream',
+    staleTaskId,
+    'pipe-stale-queue-order',
+    'stale-pipeline',
+    'stale',
+    'subsystem_overlap',
+    'auth',
+    null,
+    null,
+    JSON.stringify({ source_task_title: 'Fresh auth change' }),
+  );
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const items = listMergeQueue(queueDb);
+  queueDb.close();
+
+  const merged = items.find((item) => item.status === 'merged');
+  const queued = items.find((item) => item.status === 'queued');
+  assert(cliResult.processed[0].item.source_ref === 'feature/clear-branch', 'Queue runner lands the clear branch before the stale pipeline-backed branch');
+  assert(merged?.source_ref === 'feature/clear-branch', 'Clear branch is merged first when the competing pipeline item is stale');
+  assert(queued?.source_ref === 'feature/stale-pipeline', 'Stale pipeline-backed branch stays queued for revalidation');
+
+  execSync(`git worktree remove "${stalePath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${freshPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue status shows stale pipeline items as held back behind clearer landing work', () => {
+  const repoDir = join(tmpdir(), `sw-queue-held-back-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const stalePath = join(tmpdir(), `sw-queue-held-back-stale-${Date.now()}`);
+  execSync(`git worktree add -b feature/held-back-stale "${stalePath}"`, { cwd: repoDir });
+  writeFileSync(join(stalePath, 'stale.txt'), 'stale\n');
+  execSync('git add stale.txt', { cwd: stalePath });
+  execSync('git commit -m "stale queued work"', { cwd: stalePath });
+
+  const freshPath = join(tmpdir(), `sw-queue-held-back-fresh-${Date.now()}`);
+  execSync(`git worktree add -b feature/held-back-fresh "${freshPath}"`, { cwd: repoDir });
+  writeFileSync(join(freshPath, 'fresh.txt'), 'fresh\n');
+  execSync('git add fresh.txt', { cwd: freshPath });
+  execSync('git commit -m "clear queued work"', { cwd: freshPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'held-back-stale', path: stalePath, branch: 'feature/held-back-stale' });
+  registerWorktree(queueDb, { name: 'held-back-fresh', path: freshPath, branch: 'feature/held-back-fresh' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/held-back-stale',
+    sourcePipelineId: 'pipe-held-back',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/held-back-fresh',
+    targetBranch: 'main',
+  });
+  const staleTaskId = createTask(queueDb, { id: 'pipe-held-back-01', title: 'Revalidate config docs' });
+  upsertTaskSpec(queueDb, staleTaskId, {
+    pipeline_id: 'pipe-held-back',
+    task_type: 'docs',
+  });
+  const sourceTaskId = createTask(queueDb, { id: 'pipe-upstream-held-back-01', title: 'Fresh config change' });
+  upsertTaskSpec(queueDb, sourceTaskId, {
+    pipeline_id: 'pipe-upstream',
+    task_type: 'implementation',
+  });
+  const sourceLease = startTaskLease(queueDb, sourceTaskId, 'held-back-stale', 'queue-tester');
+  queueDb.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-upstream',
+    'agent-upstream',
+    staleTaskId,
+    'pipe-held-back',
+    'held-back-stale',
+    'stale',
+    'subsystem_overlap',
+    'config',
+    null,
+    null,
+    JSON.stringify({ source_task_title: 'Fresh config change' }),
+  );
+  queueDb.close();
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(statusJson.summary.next.source_ref === 'feature/held-back-fresh', 'Queue status keeps the clearer branch at the front of the landing queue');
+  assert(statusJson.summary.held_back[0].source_ref === 'feature/held-back-stale', 'Queue status reports the stale pipeline-backed branch as held back');
+  assert(statusJson.summary.held_back[0].queue_assessment.reason.includes('stale work'), 'Queue status explains that stale revalidation is why the item is held back');
+  assert(statusJson.summary.held_back[0].queue_assessment.next_action === 'switchman task retry-stale --pipeline pipe-held-back', 'Queue status points at the exact bulk revalidation command for the held-back pipeline');
+  assert(statusJson.summary.held_back[0].recommendation.action === 'hold', 'Queue status marks the stale pipeline-backed branch as a hold decision');
+  assert(statusJson.summary.recommendations.some((item) => item.action === 'land_now' && item.source_ref === 'feature/held-back-fresh'), 'Queue status recommendations include the branch that should land now');
+  assert(statusJson.summary.recommendations.some((item) => item.action === 'hold' && item.source_ref === 'feature/held-back-stale'), 'Queue status recommendations include the held-back stale branch');
+
+  execSync(`git worktree remove "${stalePath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${freshPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue status marks retrying items as retry decisions', () => {
+  const repoDir = join(tmpdir(), `sw-queue-retry-decision-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  const item = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/retry-me',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(queueDb, item.id, {
+    status: 'retrying',
+    lastErrorCode: 'merge_failed',
+    lastErrorSummary: 'merge needs another attempt after drift cleanup',
+    nextAction: 'Retry 1 of 1 scheduled automatically. Run `switchman queue run` again after fixing any underlying branch drift if needed.',
+    incrementRetry: true,
+  });
+  queueDb.close();
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(statusJson.summary.next.recommendation.action === 'retry', 'Queue status recommends retry for retrying items');
+  assert(statusJson.summary.focus_decision.action === 'retry', 'Queue status exposes the retry decision for the focus item');
+  assert(statusJson.summary.recommendations[0].action === 'retry', 'Queue recommendations list the retrying queue item as a retry decision');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue status prioritizes fresher high-priority pipeline goals over lower-priority goals', () => {
+  const repoDir = join(tmpdir(), `sw-queue-goal-priority-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const highPath = join(tmpdir(), `sw-queue-goal-high-${Date.now()}`);
+  execSync(`git worktree add -b feature/high-goal "${highPath}"`, { cwd: repoDir });
+  writeFileSync(join(highPath, 'high.txt'), 'high\n');
+  execSync('git add high.txt', { cwd: highPath });
+  execSync('git commit -m "high priority work"', { cwd: highPath });
+
+  const lowPath = join(tmpdir(), `sw-queue-goal-low-${Date.now()}`);
+  execSync(`git worktree add -b feature/low-goal "${lowPath}"`, { cwd: repoDir });
+  writeFileSync(join(lowPath, 'low.txt'), 'low\n');
+  execSync('git add low.txt', { cwd: lowPath });
+  execSync('git commit -m "low priority work"', { cwd: lowPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'high-goal', path: highPath, branch: 'feature/high-goal' });
+  registerWorktree(queueDb, { name: 'low-goal', path: lowPath, branch: 'feature/low-goal' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/low-goal',
+    sourcePipelineId: 'pipe-low-goal',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/high-goal',
+    sourcePipelineId: 'pipe-high-goal',
+    targetBranch: 'main',
+  });
+  const lowTaskId = createTask(queueDb, { id: 'pipe-low-goal-01', title: 'Refresh docs', priority: 4 });
+  upsertTaskSpec(queueDb, lowTaskId, {
+    pipeline_id: 'pipe-low-goal',
+    task_type: 'docs',
+    risk_level: 'low',
+  });
+  const highTaskId = createTask(queueDb, { id: 'pipe-high-goal-01', title: 'Ship login retries', priority: 9 });
+  upsertTaskSpec(queueDb, highTaskId, {
+    pipeline_id: 'pipe-high-goal',
+    task_type: 'implementation',
+    risk_level: 'medium',
+  });
+  queueDb.close();
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(statusJson.summary.next.source_ref === 'feature/high-goal', 'Queue status prioritizes the higher-priority pipeline goal when freshness is equal');
+  assert(statusJson.summary.next.queue_assessment.goal_priority === 9, 'Queue status includes the high goal priority in the assessment');
+  assert(statusJson.summary.next.queue_assessment.reason.includes('goal priority 9'), 'Queue status explains the high-priority landing preference');
+  assert(statusJson.summary.recommendations[0].action === 'land_now', 'Queue recommendations still mark the high-priority clear goal as land_now');
+
+  execSync(`git worktree remove "${highPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${lowPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue status escalates high-risk stale pipeline work instead of quietly holding it', () => {
+  const repoDir = join(tmpdir(), `sw-queue-escalate-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const riskyPath = join(tmpdir(), `sw-queue-escalate-risky-${Date.now()}`);
+  execSync(`git worktree add -b feature/risky-escalate "${riskyPath}"`, { cwd: repoDir });
+  writeFileSync(join(riskyPath, 'risk.txt'), 'risk\n');
+  execSync('git add risk.txt', { cwd: riskyPath });
+  execSync('git commit -m "risky work"', { cwd: riskyPath });
+
+  const clearPath = join(tmpdir(), `sw-queue-escalate-clear-${Date.now()}`);
+  execSync(`git worktree add -b feature/risky-clear "${clearPath}"`, { cwd: repoDir });
+  writeFileSync(join(clearPath, 'clear.txt'), 'clear\n');
+  execSync('git add clear.txt', { cwd: clearPath });
+  execSync('git commit -m "clear work"', { cwd: clearPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'risky-escalate', path: riskyPath, branch: 'feature/risky-escalate' });
+  registerWorktree(queueDb, { name: 'risky-clear', path: clearPath, branch: 'feature/risky-clear' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/risky-escalate',
+    sourcePipelineId: 'pipe-risky-escalate',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/risky-clear',
+    targetBranch: 'main',
+  });
+  const staleTaskId = createTask(queueDb, { id: 'pipe-risky-escalate-01', title: 'Auth hardening', priority: 8 });
+  upsertTaskSpec(queueDb, staleTaskId, {
+    pipeline_id: 'pipe-risky-escalate',
+    task_type: 'implementation',
+    risk_level: 'high',
+  });
+  const sourceTaskId = createTask(queueDb, { id: 'pipe-risky-source-01', title: 'Fresh auth change', priority: 7 });
+  upsertTaskSpec(queueDb, sourceTaskId, {
+    pipeline_id: 'pipe-risky-source',
+    task_type: 'implementation',
+    risk_level: 'medium',
+  });
+  const sourceLease = startTaskLease(queueDb, sourceTaskId, 'risky-escalate', 'queue-tester');
+  queueDb.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-risky-source',
+    'agent-upstream',
+    staleTaskId,
+    'pipe-risky-escalate',
+    'risky-escalate',
+    'stale',
+    'subsystem_overlap',
+    'auth',
+    null,
+    null,
+    JSON.stringify({ source_task_title: 'Fresh auth change' }),
+  );
+  queueDb.close();
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const escalated = statusJson.summary.held_back.find((item) => item.source_ref === 'feature/risky-escalate');
+  assert(statusJson.summary.next.source_ref === 'feature/risky-clear', 'Queue status keeps the clear branch ahead of stale high-risk work');
+  assert(escalated.recommendation.action === 'escalate', 'Queue status escalates high-risk stale work');
+  assert(escalated.queue_assessment.integration_risk === 'high', 'Queue status records the high integration risk in the assessment');
+  assert(escalated.recommendation.summary.includes('high-risk work is not clearly ready'), 'Queue status explains why the stale high-risk branch is escalated');
+
+  execSync(`git worktree remove "${riskyPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${clearPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run defers held stale work instead of trying to land it', () => {
+  const repoDir = join(tmpdir(), `sw-queue-run-defer-hold-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const stalePath = join(tmpdir(), `sw-queue-run-defer-hold-branch-${Date.now()}`);
+  execSync(`git worktree add -b feature/defer-hold "${stalePath}"`, { cwd: repoDir });
+  writeFileSync(join(stalePath, 'stale.txt'), 'stale\n');
+  execSync('git add stale.txt', { cwd: stalePath });
+  execSync('git commit -m "held work"', { cwd: stalePath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'defer-hold', path: stalePath, branch: 'feature/defer-hold' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/defer-hold',
+    sourcePipelineId: 'pipe-defer-hold',
+    targetBranch: 'main',
+  });
+  const staleTaskId = createTask(queueDb, { id: 'pipe-defer-hold-01', title: 'Revalidate docs', priority: 5 });
+  upsertTaskSpec(queueDb, staleTaskId, {
+    pipeline_id: 'pipe-defer-hold',
+    task_type: 'docs',
+    risk_level: 'low',
+  });
+  const sourceTaskId = createTask(queueDb, { id: 'pipe-defer-source-01', title: 'Fresh shared change', priority: 6 });
+  upsertTaskSpec(queueDb, sourceTaskId, {
+    pipeline_id: 'pipe-defer-source',
+    task_type: 'implementation',
+    risk_level: 'medium',
+  });
+  const sourceLease = startTaskLease(queueDb, sourceTaskId, 'defer-hold', 'queue-tester');
+  queueDb.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-defer-source',
+    'agent-upstream',
+    staleTaskId,
+    'pipe-defer-hold',
+    'defer-hold',
+    'stale',
+    'subsystem_overlap',
+    'docs',
+    null,
+    null,
+    JSON.stringify({ source_task_title: 'Fresh shared change' }),
+  );
+  queueDb.close();
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const verifyDb = openDb(repoDir);
+  const items = listMergeQueue(verifyDb);
+  verifyDb.close();
+
+  assert(cliResult.processed.length === 0, 'Queue run does not process held stale items');
+  assert(cliResult.deferred.source_ref === 'feature/defer-hold', 'Queue run reports the deferred held item in JSON output');
+  assert(cliResult.deferred.recommendation.action === 'hold', 'Queue run reports hold as the deferred decision');
+  assert(items[0].status === 'held', 'Deferred held item is persisted as held');
+  assert(items[0].last_error_code === 'queue_hold', 'Deferred held item records a hold-specific queue code');
+
+  execSync(`git worktree remove "${stalePath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run defers escalated high-risk work instead of landing it blindly', () => {
+  const repoDir = join(tmpdir(), `sw-queue-run-defer-escalate-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const riskyPath = join(tmpdir(), `sw-queue-run-defer-escalate-branch-${Date.now()}`);
+  execSync(`git worktree add -b feature/defer-escalate "${riskyPath}"`, { cwd: repoDir });
+  writeFileSync(join(riskyPath, 'risk.txt'), 'risk\n');
+  execSync('git add risk.txt', { cwd: riskyPath });
+  execSync('git commit -m "risky held work"', { cwd: riskyPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'defer-escalate', path: riskyPath, branch: 'feature/defer-escalate' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/defer-escalate',
+    sourcePipelineId: 'pipe-defer-escalate',
+    targetBranch: 'main',
+  });
+  const staleTaskId = createTask(queueDb, { id: 'pipe-defer-escalate-01', title: 'Auth hardening', priority: 9 });
+  upsertTaskSpec(queueDb, staleTaskId, {
+    pipeline_id: 'pipe-defer-escalate',
+    task_type: 'implementation',
+    risk_level: 'high',
+  });
+  const sourceTaskId = createTask(queueDb, { id: 'pipe-defer-escalate-source-01', title: 'Fresh auth change', priority: 7 });
+  upsertTaskSpec(queueDb, sourceTaskId, {
+    pipeline_id: 'pipe-defer-escalate-source',
+    task_type: 'implementation',
+    risk_level: 'medium',
+  });
+  const sourceLease = startTaskLease(queueDb, sourceTaskId, 'defer-escalate', 'queue-tester');
+  queueDb.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-defer-escalate-source',
+    'agent-upstream',
+    staleTaskId,
+    'pipe-defer-escalate',
+    'defer-escalate',
+    'stale',
+    'subsystem_overlap',
+    'auth',
+    null,
+    null,
+    JSON.stringify({ source_task_title: 'Fresh auth change' }),
+  );
+  queueDb.close();
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const verifyDb = openDb(repoDir);
+  const items = listMergeQueue(verifyDb);
+  verifyDb.close();
+
+  assert(cliResult.processed.length === 0, 'Queue run does not process escalated items automatically');
+  assert(cliResult.deferred.source_ref === 'feature/defer-escalate', 'Queue run reports the deferred escalated item in JSON output');
+  assert(cliResult.deferred.recommendation.action === 'escalate', 'Queue run reports escalate as the deferred decision');
+  assert(items[0].status === 'escalated', 'Deferred escalated item is persisted as escalated for operator review');
+  assert(items[0].last_error_code === 'queue_escalated', 'Deferred escalated item records an escalation-specific queue code');
+
+  execSync(`git worktree remove "${riskyPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue retry can reopen held and escalated items back to retrying', () => {
+  const repoDir = join(tmpdir(), `sw-queue-reopen-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  const heldItem = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/held-item',
+    targetBranch: 'main',
+  });
+  const escalatedItem = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/escalated-item',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(queueDb, heldItem.id, {
+    status: 'held',
+    lastErrorCode: 'queue_hold',
+    lastErrorSummary: 'hold until stale work is revalidated',
+    nextAction: 'switchman task retry-stale --pipeline pipe-held',
+  });
+  markMergeQueueState(queueDb, escalatedItem.id, {
+    status: 'escalated',
+    lastErrorCode: 'queue_escalated',
+    lastErrorSummary: 'escalate before landing high-risk work',
+    nextAction: 'switchman queue status',
+  });
+  const retryingItem = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/retrying-item',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(queueDb, retryingItem.id, {
+    status: 'retrying',
+    lastErrorCode: 'merge_conflict',
+    lastErrorSummary: 'retry with backoff first',
+    nextAction: 'switchman queue retry mq-test',
+    backoffUntil: new Date(Date.now() + 60_000).toISOString(),
+  });
+
+  const retriedHeld = retryMergeQueueItem(queueDb, heldItem.id);
+  const retriedEscalated = retryMergeQueueItem(queueDb, escalatedItem.id);
+  const retriedRetrying = retryMergeQueueItem(queueDb, retryingItem.id);
+
+  assert(retriedHeld.status === 'retrying', 'Queue retry reopens held items');
+  assert(retriedEscalated.status === 'retrying', 'Queue retry reopens escalated items');
+  assert(retriedRetrying.status === 'retrying', 'Queue retry can also restart retrying items immediately');
+  assert(retriedHeld.last_error_code === null, 'Reopening a held item clears the deferred queue code');
+  assert(retriedEscalated.last_error_code === null, 'Reopening an escalated item clears the deferred queue code');
+  assert(retriedRetrying.backoff_until === null, 'Retrying a backoff item clears the deferred retry window');
+
+  queueDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run waits for retry backoff windows before retrying work', () => {
+  const repoDir = join(tmpdir(), `sw-queue-retry-backoff-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  execSync('git branch feature/retry-backoff', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  const item = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/retry-backoff',
+    targetBranch: 'main',
+    maxRetries: 2,
+  });
+  markMergeQueueState(queueDb, item.id, {
+    status: 'retrying',
+    lastErrorCode: 'merge_conflict',
+    lastErrorSummary: 'Automatic retry backoff is still active.',
+    nextAction: `Retry 1 of 2 is waiting until later. Run \`switchman queue retry ${item.id}\` to retry sooner.`,
+    backoffUntil: new Date(Date.now() + 60_000).toISOString(),
+  });
+  queueDb.close();
+
+  const cliResult = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(cliResult.processed.length === 0, 'Queue run leaves retrying items alone while their backoff window is still active');
+  assert(cliResult.deferred.id === item.id, 'Queue run reports the deferred retry item while waiting for backoff');
+  assert(cliResult.deferred.recommendation.action === 'retry', 'Queue run keeps the retry recommendation visible for deferred backoff work');
+  assert(cliResult.deferred.recommendation.command === `switchman queue retry ${item.id}`, 'Queue run points operators at the exact override command for retry backoff');
+
+  const verifyDb = openDb(repoDir);
+  const updated = getMergeQueueItem(verifyDb, item.id);
+  verifyDb.close();
+  assert(updated.status === 'retrying', 'Retry backoff leaves the queue item in retrying state');
+  assert(updated.backoff_until !== null, 'Retry backoff keeps the deferred retry window recorded');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue escalate records explicit operator review guidance', () => {
+  const repoDir = join(tmpdir(), `sw-queue-escalate-cli-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  const item = enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/manual-escalation',
+    targetBranch: 'main',
+  });
+  queueDb.close();
+
+  const escalated = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'escalate',
+    item.id,
+    '--reason',
+    'Security-sensitive change needs explicit operator review.',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const explainJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain',
+    'queue',
+    item.id,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(escalated.status === 'escalated', 'Queue escalate marks the item as escalated');
+  assert(escalated.last_error_code === 'queue_escalated_manual', 'Queue escalate records a manual escalation code');
+  assert(escalated.next_action.includes(`switchman queue retry ${item.id}`), 'Queue escalate gives an exact resume command');
+  assert(explainJson.next_action.includes(`switchman queue retry ${item.id}`), 'Explain queue carries the escalation recovery command');
+
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -1035,6 +2211,17 @@ test('Merge queue run blocks once retry budget is exhausted for rebase conflicts
     cwd: repoDir,
     encoding: 'utf8',
   });
+  const queuedItem = listMergeQueue(queueDb)[0];
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'retry',
+    queuedItem.id,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
   const secondResult = JSON.parse(execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
     'queue',
@@ -1065,6 +2252,62 @@ test('Fix 1: busy_timeout is set on new connections', () => {
   const timeout = Object.values(row)[0];
   assert(timeout >= 5000, `busy_timeout is set to ${timeout}ms (expected ≥ 5000)`);
   freshDb.close();
+});
+
+test('Fix 55a: initDb records the current schema version explicitly', () => {
+  const repoDir = join(tmpdir(), `sw-schema-version-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const db = initDb(repoDir);
+  const row = db.prepare('PRAGMA user_version').get();
+  const version = Object.values(row || {})[0];
+  db.close();
+
+  assert(version === 4, 'New Switchman databases record schema version 4 explicitly');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 55b: openDb fails closed for newer schema versions', () => {
+  const repoDir = join(tmpdir(), `sw-schema-future-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const db = initDb(repoDir);
+  db.exec('PRAGMA user_version=999');
+  db.close();
+
+  let message = '';
+  try {
+    openDb(repoDir);
+  } catch (err) {
+    message = String(err.message || err);
+  }
+
+  assert(message.includes('newer than this CLI supports'), 'openDb rejects schema versions newer than the current CLI supports');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 55c: openDb refuses to proceed when a migration was left running', () => {
+  const repoDir = join(tmpdir(), `sw-schema-interrupted-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  initDb(repoDir).close();
+  writeFileSync(join(repoDir, '.switchman', 'migration-state.json'), `${JSON.stringify({
+    status: 'running',
+    from_version: 0,
+    to_version: 1,
+    started_at: new Date().toISOString(),
+  }, null, 2)}\n`);
+
+  let message = '';
+  try {
+    openDb(repoDir);
+  } catch (err) {
+    message = String(err.message || err);
+  }
+
+  assert(message.includes('interrupted database migration'), 'openDb fails closed when migration state says a migration was interrupted');
+  assert(message.includes('migration-state.json'), 'Migration failure points operators at the recorded migration state file');
+
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Fix 1b: parallel CLI task acquisition avoids transient database lock failures', () => {
@@ -2701,6 +3944,8 @@ test('Fix 22c: gate install-ci writes a GitHub Actions workflow', () => {
   assert(workflow.includes('id: switchman_gate'), 'Installed workflow exposes the gate step outputs for follow-up workflow logic');
   assert(workflow.includes('continue-on-error: true'), 'Installed workflow keeps running long enough to publish a readable result');
   assert(workflow.includes('Enforce Switchman gate'), 'Installed workflow includes an explicit enforcement step for the PR check');
+  assert(workflow.includes("if: github.event_name == 'pull_request'"), 'Installed workflow only syncs PR state on pull request events');
+  assert(workflow.includes('switchman pipeline sync-pr --pipeline-from-env --skip-missing-pipeline --pr-from-env --github'), 'Installed workflow auto-syncs PR state through the hosted sync-pr path');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -3650,10 +4895,15 @@ test('Fix 28p: pipeline PR summary includes active policy requirements', () => {
   assert(result.pr_artifact.policy_state.missing_task_types.includes('docs'), 'Pipeline PR summary carries the missing policy-required task types');
   assert(result.pr_artifact.policy_state.evidence_by_task_type.tests.some((entry) => entry.task_id === 'pipe-pr-policy-02'), 'Pipeline PR summary carries concrete evidence for satisfied test requirements');
   assert(result.pr_artifact.policy_state.evidence_by_task_type.governance.some((entry) => entry.artifact_path?.includes('docs/reviews/pipe-pr-policy/pipe-pr-policy-04.md')), 'Pipeline PR summary carries governance artifact evidence');
+  assert(result.pr_artifact.policy_state.evidence_objects.some((entry) => entry.requirement_key === 'completed_task_type:tests' && entry.task_id === 'pipe-pr-policy-02'), 'Pipeline PR summary carries stable policy evidence objects');
+  assert(result.pr_artifact.policy_state.evidence_objects.some((entry) => entry.satisfied_by && entry.satisfied_by.actor_type), 'Pipeline PR summary attributes who or what satisfied each evidence object');
+  assert(result.pr_artifact.policy_state.satisfaction_history.some((entry) => entry.event_type === 'policy_requirement_satisfied'), 'Pipeline PR summary carries policy satisfaction history');
   assert(result.markdown.includes('## Policy Requirements'), 'Pipeline PR markdown includes a policy requirements section');
+  assert(result.markdown.includes('Satisfaction history:'), 'Pipeline PR markdown includes policy satisfaction history lines');
   assert(result.markdown.includes('Evidence for governance'), 'Pipeline PR markdown lists the evidence backing satisfied policy requirements');
   assert(result.pr_artifact.body.includes('Policy domains: auth'), 'Pipeline PR body includes the active policy domains');
   assert(result.pr_artifact.body.includes('Policy evidence:'), 'Pipeline PR body includes a compact policy evidence summary');
+  assert(result.pr_artifact.body.includes('Policy evidence objects:'), 'Pipeline PR body includes the compact evidence object summary');
 
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -3752,6 +5002,8 @@ test('Fix 28a1: pipeline status surfaces policy state in JSON and text output', 
   assert(jsonOutput.policy_state.domains.includes('auth'), 'Pipeline status JSON includes the active governed domain');
   assert(jsonOutput.policy_state.missing_task_types.includes('docs'), 'Pipeline status JSON includes missing policy-required work');
   assert(jsonOutput.policy_state.evidence_by_task_type.tests.some((entry) => entry.task_id === 'pipe-status-policy-02'), 'Pipeline status JSON includes concrete evidence for satisfied requirements');
+  assert(jsonOutput.policy_state.evidence_objects.some((entry) => entry.requirement_key === 'completed_task_type:tests'), 'Pipeline status JSON includes stable policy evidence objects');
+  assert(jsonOutput.policy_state.satisfaction_history.some((entry) => entry.event_type === 'policy_requirement_satisfied'), 'Pipeline status JSON includes policy satisfaction history');
   assert(textOutput.includes('Policy'), 'Pipeline status text includes the policy panel');
   assert(textOutput.includes('auth'), 'Pipeline status text includes the governed domain name');
   assert(textOutput.includes('tests: pipe-status-policy-02'), 'Pipeline status text includes satisfied policy evidence entries');
@@ -3810,6 +5062,154 @@ test('Fix 28aa: doctor surfaces operator-friendly attention and next steps', () 
   assert(textOutput.includes('next:'), 'Doctor CLI prints actionable next guidance');
   assert(textOutput.includes('run:'), 'Doctor CLI prints exact follow-through commands');
   assert(textOutput.includes('scope:src/**'), 'Doctor CLI prints scope ownership for active leases');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 54d: doctor --repair repairs safe state before reporting health', () => {
+  const repoDir = join(tmpdir(), `sw-doctor-repair-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const item = enqueueMergeItem(db, {
+    sourceType: 'branch',
+    sourceRef: 'feature/doctor-repair',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(db, item.id, {
+    status: 'validating',
+    lastErrorCode: 'interrupted_queue_run',
+    lastErrorSummary: 'Interrupted while validating.',
+    nextAction: 'Run queue repair.',
+  });
+  db.close();
+
+  const doctorJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const doctorText = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--repair',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(doctorJson.repair.repaired, 'Doctor JSON includes the repair report when --repair is used');
+  assert(doctorJson.repair.actions.some((action) => action.kind === 'queue_item_reset' && action.queue_item_id === item.id), 'Doctor repair JSON reports the reset queue item');
+  assert(doctorJson.repair.summary.counts.auto_fixed >= 1, 'Doctor repair JSON includes structured auto-fixed counts');
+  assert(
+    doctorText.includes('Repaired safe interrupted repo state before running doctor')
+      || doctorText.includes('No repo repair action needed before doctor'),
+    'Doctor text reports the repair preflight state',
+  );
+
+  const verifyDb = openDb(repoDir);
+  const updated = listMergeQueue(verifyDb)[0];
+  verifyDb.close();
+  assert(updated.status === 'retrying', 'Doctor --repair leaves interrupted queue items in retrying state');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56l: repair and doctor report structured auto-fixed and manual-review sections', () => {
+  const repoDir = join(tmpdir(), `sw-repair-reporting-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-repair-reporting-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-repair-reporting-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/repair-reporting-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/repair-reporting-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: 'agent1', path: branchAPath, branch: 'feature/repair-reporting-a' });
+  registerWorktree(db, { name: 'agent2', path: branchBPath, branch: 'feature/repair-reporting-b' });
+  const taskA = createTask(db, { id: 'pipe-repair-reporting-01', title: 'Implementation task' });
+  upsertTaskSpec(db, taskA, { pipeline_id: 'pipe-repair-reporting', task_type: 'implementation' });
+  const taskB = createTask(db, { id: 'pipe-repair-reporting-02', title: 'Docs task' });
+  upsertTaskSpec(db, taskB, { pipeline_id: 'pipe-repair-reporting', task_type: 'docs' });
+  assignTask(db, taskA, 'agent1');
+  completeTask(db, taskA);
+  assignTask(db, taskB, 'agent2');
+  completeTask(db, taskB);
+  const queueItem = enqueueMergeItem(db, {
+    sourceType: 'branch',
+    sourceRef: 'feature/repair-reporting',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(db, queueItem.id, {
+    status: 'validating',
+    lastErrorCode: 'interrupted_queue_run',
+    lastErrorSummary: 'Interrupted while validating.',
+    nextAction: 'Run queue repair.',
+  });
+  db.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-repair-reporting', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-repair-reporting', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  const gitDirFile = join(recovery.recovery_path, '.git');
+  const gitDirContents = readFileSync(gitDirFile, 'utf8');
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+  mkdirSync(recovery.recovery_path, { recursive: true });
+  writeFileSync(gitDirFile, gitDirContents);
+
+  const repairJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const repairText = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+  ], { cwd: repoDir, encoding: 'utf8' });
+  const doctorText = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor', '--repair',
+  ], { cwd: repoDir, encoding: 'utf8' });
+
+  assert(repairJson.summary.counts.auto_fixed >= 1, 'Repair JSON reports auto-fixed item counts');
+  assert(repairJson.summary.counts.manual_review >= 1, 'Repair JSON reports manual-review item counts');
+  assert(repairJson.summary.auto_fixed.some((action) => action.kind === 'queue_item_reset' && action.queue_item_id === queueItem.id), 'Repair JSON keeps auto-fixed repair actions in the structured summary');
+  assert(repairJson.summary.manual_review.some((warning) => warning.kind === 'temp_resource_manual_review' && warning.path === recovery.recovery_path), 'Repair JSON keeps manual-review items in the structured summary');
+  assert(repairText.includes('auto-fixed:'), 'Repair text includes an auto-fixed section');
+  assert(doctorText.includes('manual review:'), 'Doctor repair text includes a manual-review section');
+
+  rmSync(recovery.recovery_path, { recursive: true, force: true });
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -4183,6 +5583,254 @@ test('Fix 28ab: doctor and repo gate surface stale dependency invalidations', ()
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 28ab1: dependency invalidations record semantic exported-object drift', () => {
+  const repoDir = join(tmpdir(), `sw-doctor-semantic-stale-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const oldTaskId = createTask(db, { title: 'Keep auth guard compatible' });
+  upsertTaskSpec(db, oldTaskId, {
+    pipeline_id: 'pipe-semantic-old',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, oldTaskId, 'main');
+  const oldLease = getActiveLeaseForTask(db, oldTaskId);
+  completeLeaseTask(db, oldLease.id);
+
+  const newTaskId = createTask(db, { title: 'Refresh auth guard exports' });
+  upsertTaskSpec(db, newTaskId, {
+    pipeline_id: 'pipe-semantic-new',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+    objective_keywords: ['auth'],
+  });
+  assignTask(db, newTaskId, 'main');
+  const lease = getActiveLeaseForTask(db, newTaskId);
+  execSync('mkdir -p src/auth && printf "export function ensureAuth() { return true; }\\n" > src/auth/guard.js', { cwd: repoDir, shell: '/bin/sh' });
+  evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
+
+  const invalidations = listDependencyInvalidations(db, { affectedTaskId: oldTaskId });
+  const semanticInvalidation = invalidations.find((item) => item.reason_type === 'semantic_object_overlap');
+  assert(Boolean(semanticInvalidation), 'Dependency invalidations include a semantic exported-object overlap reason');
+  assert(semanticInvalidation.details.object_names.includes('ensureAuth'), 'Semantic invalidations record the exported object name that drifted');
+
+  db.close();
+
+  const doctorJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const semanticDoctorInvalidation = doctorJson.merge_readiness.dependency_invalidations.find((item) => item.reason_type === 'semantic_object_overlap');
+  assert(Boolean(semanticDoctorInvalidation), 'Doctor JSON surfaces semantic exported-object invalidations');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28ab2: dependency invalidations escalate exported contract drift into contract revalidation sets', () => {
+  const repoDir = join(tmpdir(), `sw-doctor-contract-stale-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const oldTaskId = createTask(db, { title: 'Keep auth contract compatible' });
+  upsertTaskSpec(db, oldTaskId, {
+    pipeline_id: 'pipe-contract-old',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+  });
+  assignTask(db, oldTaskId, 'main');
+  const oldLease = getActiveLeaseForTask(db, oldTaskId);
+  completeLeaseTask(db, oldLease.id);
+
+  const newTaskId = createTask(db, { title: 'Refresh auth contract exports' });
+  upsertTaskSpec(db, newTaskId, {
+    pipeline_id: 'pipe-contract-new',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+    expected_output_types: ['source'],
+    required_deliverables: ['source'],
+    objective_keywords: ['auth'],
+  });
+  assignTask(db, newTaskId, 'main');
+  const lease = getActiveLeaseForTask(db, newTaskId);
+  execSync('mkdir -p src/auth && printf "export interface AuthSession { userId: string }\\n" > src/auth/contracts.ts', { cwd: repoDir, shell: '/bin/sh' });
+  evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
+
+  const invalidations = listDependencyInvalidations(db, { affectedTaskId: oldTaskId });
+  const contractInvalidation = invalidations.find((item) => item.reason_type === 'semantic_contract_drift');
+  assert(Boolean(contractInvalidation), 'Dependency invalidations include a semantic contract drift reason');
+  assert(contractInvalidation.details.contract_names.includes('AuthSession'), 'Contract invalidations record the exported contract name that drifted');
+  assert(contractInvalidation.details.revalidation_set === 'contract', 'Contract invalidations classify the revalidation set as contract');
+  db.close();
+
+  const doctorJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+  const contractCluster = doctorJson.merge_readiness.stale_clusters.find((item) => item.affected_pipeline_id === 'pipe-contract-old');
+  assert(Boolean(contractCluster), 'Doctor JSON groups contract drift into a stale cluster');
+  assert(contractCluster.revalidation_set_type === 'contract', 'Contract drift stale clusters are labeled as contract revalidation sets');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28ab3: stale clusters prioritize urgent contract revalidation ahead of lower-priority stale work', () => {
+  const repoDir = join(tmpdir(), `sw-stale-priority-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const lowTaskId = createTask(db, { id: 'pipe-low-01', title: 'Low-priority docs follow-up', priority: 3 });
+  upsertTaskSpec(db, lowTaskId, {
+    pipeline_id: 'pipe-low',
+    task_type: 'docs',
+    allowed_paths: ['docs/**'],
+    subsystem_tags: ['auth'],
+  });
+  const highTaskId = createTask(db, { id: 'pipe-high-01', title: 'High-priority auth contract consumer', priority: 9 });
+  upsertTaskSpec(db, highTaskId, {
+    pipeline_id: 'pipe-high',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+  });
+  const lowSourceTaskId = createTask(db, { id: 'pipe-source-low-01', title: 'Low source', priority: 2 });
+  upsertTaskSpec(db, lowSourceTaskId, {
+    pipeline_id: 'pipe-source-low',
+    task_type: 'implementation',
+    allowed_paths: ['docs/**'],
+    subsystem_tags: ['config'],
+  });
+  const highSourceTaskId = createTask(db, { id: 'pipe-source-high-01', title: 'High source', priority: 7 });
+  upsertTaskSpec(db, highSourceTaskId, {
+    pipeline_id: 'pipe-source-high',
+    task_type: 'implementation',
+    allowed_paths: ['src/auth/**'],
+    subsystem_tags: ['auth'],
+  });
+  assignTask(db, lowSourceTaskId, 'main');
+  assignTask(db, highSourceTaskId, 'main');
+  const lowSourceLease = getActiveLeaseForTask(db, lowSourceTaskId);
+  const highSourceLease = getActiveLeaseForTask(db, highSourceTaskId);
+
+  db.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    lowSourceLease.id,
+    lowSourceTaskId,
+    'pipe-source-low',
+    'agent-low',
+    lowTaskId,
+    'pipe-low',
+    'main',
+    'stale',
+    'scope_overlap',
+    null,
+    'docs/**',
+    'docs/**',
+    JSON.stringify({
+      source: 'test',
+      source_task_title: 'Low source',
+      affected_task_title: 'Low-priority docs follow-up',
+      source_task_priority: 2,
+      affected_task_priority: 3,
+      revalidation_set: 'scope',
+      severity: 'warn',
+    }),
+  );
+  db.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    highSourceLease.id,
+    highSourceTaskId,
+    'pipe-source-high',
+    'agent-high',
+    highTaskId,
+    'pipe-high',
+    'main',
+    'stale',
+    'semantic_contract_drift',
+    null,
+    null,
+    null,
+    JSON.stringify({
+      source: 'test',
+      source_task_title: 'High source',
+      affected_task_title: 'High-priority auth contract consumer',
+      source_task_priority: 7,
+      affected_task_priority: 9,
+      contract_names: ['AuthSession'],
+      revalidation_set: 'contract',
+      severity: 'blocked',
+    }),
+  );
+  db.close();
+
+  const doctorJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'doctor',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(doctorJson.merge_readiness.stale_clusters[0].affected_pipeline_id === 'pipe-high', 'High-priority contract drift sorts to the front of stale clusters');
+  assert(doctorJson.merge_readiness.stale_clusters[0].rerun_priority === 'urgent', 'High-priority contract drift is marked urgent for rerun');
+  assert(doctorJson.merge_readiness.stale_clusters[0].rerun_priority_score > doctorJson.merge_readiness.stale_clusters[1].rerun_priority_score, 'Urgent contract drift gets a higher rerun priority score than lower-priority stale work');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 28b: planner emits subsystem-aware specs for high-risk work', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-planner-risk-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -4464,8 +6112,10 @@ test('Fix 28d0a: pipeline bundle carries policy audit entries into PR and landin
 
   assert(summaryJson.trust_audit.some((entry) => entry.category === 'policy' && entry.summary.includes('Policy validation')), 'PR summary JSON includes policy trust audit entries');
   assert(summaryJson.pr_artifact.trust_audit.some((entry) => entry.category === 'policy'), 'PR artifact carries policy trust audit entries');
+  assert(Array.isArray(summaryJson.pr_artifact.policy_state.satisfaction_history), 'PR artifact carries a policy satisfaction history array');
   assert(summaryMarkdown.includes('## Policy & Stale Audit'), 'PR summary markdown includes the trust audit section for policy changes');
   assert(landingJson.trust_audit.some((entry) => entry.category === 'policy'), 'Landing summary JSON includes policy trust audit entries');
+  assert(Array.isArray(landingJson.policy_state.evidence_objects), 'Landing summary JSON carries a policy evidence object array too');
 
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -4967,6 +6617,103 @@ echo "$@" >> "${ghLogPath}"
   assert(ghLog.includes('pr comment 88'), 'pipeline sync-pr updates the PR comment');
   assert(stepSummary.includes('## Check Summary'), 'pipeline sync-pr writes the GitHub step summary');
   assert(output.includes('switchman_check_status='), 'pipeline sync-pr writes GitHub check outputs');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28e5: pipeline sync-pr can infer the pipeline from GitHub branch context', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-sync-pr-env-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const docsWorktreePath = join(tmpdir(), `sw-pipeline-sync-pr-env-docs-${Date.now()}`);
+  execSync(`git worktree add -b feature/docs-refresh "${docsWorktreePath}"`, { cwd: repoDir });
+
+  const ghLogPath = join(repoDir, 'gh-log.txt');
+  const ghScriptPath = join(repoDir, 'gh-stub.sh');
+  writeFileSync(ghScriptPath, `#!/bin/sh
+echo "$@" >> "${ghLogPath}"
+`, 'utf8');
+  execSync(`chmod +x "${ghScriptPath}"`);
+
+  const eventPath = join(repoDir, 'github-event.json');
+  writeFileSync(eventPath, `${JSON.stringify({ pull_request: { number: 91 } }, null, 2)}\n`);
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'docs', path: docsWorktreePath, branch: 'feature/docs-refresh' });
+  startPipeline(pipelineDb, {
+    title: 'Refresh docs',
+    description: '- update docs',
+    pipelineId: 'pipe-sync-pr-env',
+    priority: 5,
+  });
+  assignTask(pipelineDb, 'pipe-sync-pr-env-01', 'docs');
+  completeTask(pipelineDb, 'pipe-sync-pr-env-01');
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'sync-pr',
+    '--pipeline-from-env',
+    '--skip-missing-pipeline',
+    '--pr-from-env',
+    '--gh-command',
+    ghScriptPath,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_EVENT_PATH: eventPath,
+      GITHUB_HEAD_REF: 'feature/docs-refresh',
+    },
+  }));
+
+  const ghLog = readFileSync(ghLogPath, 'utf8');
+  assert(result.pipeline_id === 'pipe-sync-pr-env', 'pipeline sync-pr infers the pipeline id from the GitHub branch context');
+  assert(ghLog.includes('pr comment 91'), 'pipeline sync-pr still updates the PR comment after branch-based inference');
+
+  execSync(`git worktree remove "${docsWorktreePath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 28e6: pipeline sync-pr can skip cleanly when no pipeline matches the GitHub branch', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-sync-pr-skip-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git checkout -b feature/unknown-branch', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  pipelineDb.close();
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'sync-pr',
+    '--pipeline-from-env',
+    '--skip-missing-pipeline',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_HEAD_REF: 'feature/unknown-branch',
+    },
+  }));
+
+  assert(result.skipped === true, 'pipeline sync-pr can skip successfully when branch inference finds no matching pipeline');
+  assert(result.reason === 'no_pipeline_inferred', 'pipeline sync-pr reports why the hosted sync was skipped');
 
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -5536,7 +7283,7 @@ test('Fix 28fg: pipeline land recover creates a conflict-ready recovery worktree
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Fix 28fga: pipeline land recover blocks duplicate recovery worktrees unless replaced', () => {
+test('Fix 28fga: pipeline land recover reuses an existing recovery worktree unless replaced', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-land-dup-recover-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   execSync('git init -b main', { cwd: repoDir });
@@ -5590,18 +7337,14 @@ test('Fix 28fga: pipeline land recover blocks duplicate recovery worktrees unles
     '--json',
   ], { cwd: repoDir, encoding: 'utf8' }));
 
-  let duplicateError = '';
-  try {
-    execFileSync(process.execPath, [
-      join(process.cwd(), 'src/cli/index.js'),
-      'pipeline',
-      'land',
-      'pipe-land-dup',
-      '--recover',
-    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  } catch (err) {
-    duplicateError = `${err.stdout || ''}${err.stderr || ''}`;
-  }
+  const reusedRecovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline',
+    'land',
+    'pipe-land-dup',
+    '--recover',
+    '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
 
   const replacedRecovery = JSON.parse(execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
@@ -5613,11 +7356,72 @@ test('Fix 28fga: pipeline land recover blocks duplicate recovery worktrees unles
     '--json',
   ], { cwd: repoDir, encoding: 'utf8' }));
 
-  assert(duplicateError.includes('already exists'), 'Duplicate recovery creation is blocked until the old recovery is cleared or replaced');
+  assert(reusedRecovery.reused_existing, 'Duplicate recovery creation reuses the existing recovery worktree when it is still valid');
+  assert(reusedRecovery.recovery_path === firstRecovery.recovery_path, 'Reused recovery keeps the same recovery path');
   assert(!existsSync(firstRecovery.recovery_path), 'Replacing recovery removes the previous recovery worktree');
   assert(existsSync(replacedRecovery.recovery_path), 'Replacing recovery creates a fresh recovery worktree');
 
   execSync(`git worktree remove "${replacedRecovery.recovery_path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56h: pipeline land recover is idempotent when the existing recovery worktree is still valid', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-recover-idempotent-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-recover-idempotent-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-recover-idempotent-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-recover-idempotent-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-recover-idempotent-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-recover-idempotent-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-recover-idempotent-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-recover-idempotent-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-recover-idempotent', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-recover-idempotent-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-recover-idempotent', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-recover-idempotent', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const firstRecovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-recover-idempotent', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const secondRecovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-recover-idempotent', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(secondRecovery.reused_existing, 'Rerunning recover reuses the existing recovery worktree');
+  assert(secondRecovery.recovery_path === firstRecovery.recovery_path, 'Idempotent recover returns the same recovery path');
+
+  execSync(`git worktree remove "${firstRecovery.recovery_path}" --force`, { cwd: repoDir });
   execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
   execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
@@ -5744,6 +7548,75 @@ test('Fix 28fh: pipeline land resume marks a resolved recovery branch ready for 
   assert(statusJson.landing_branch.last_failure === null, 'Pipeline status clears the previous landing failure after resume');
   assert(statusJson.landing_branch.last_materialized.head_commit === resumed.head_commit, 'Pipeline status tracks the resolved landing commit as the current head');
   assert(queueAdd.source_ref === 'switchman/pipeline-landing/pipe-land-resume', 'Queue add uses the resumed landing branch');
+
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56i: pipeline land resume is idempotent after the recovery is already resumed', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-resume-idempotent-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-resume-idempotent-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-resume-idempotent-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-resume-idempotent-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-resume-idempotent-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-resume-idempotent-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-resume-idempotent-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-resume-idempotent-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-resume-idempotent', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-resume-idempotent-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-resume-idempotent', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-resume-idempotent', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-resume-idempotent', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  writeFileSync(join(recovery.recovery_path, 'README.md'), 'resolved\n');
+  execSync('git add README.md', { cwd: recovery.recovery_path });
+  execSync('git commit -m "resolve conflict"', { cwd: recovery.recovery_path });
+
+  const firstResume = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-resume-idempotent', '--resume', recovery.recovery_path, '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const secondResume = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-resume-idempotent', '--resume', recovery.recovery_path, '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(!firstResume.already_resumed, 'First resume performs the recovery handoff');
+  assert(secondResume.already_resumed, 'Second resume reports the recovery as already resumed');
+  assert(secondResume.head_commit === firstResume.head_commit, 'Idempotent resume keeps the same landing head commit');
 
   execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
   execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
@@ -5880,6 +7753,570 @@ test('Fix 28fj: pipeline land cleanup clears missing recorded recovery paths wit
   assert(!cleanup.removed, 'Cleanup does not fail when the recovery worktree was already removed');
   assert(!cleanup.existed, 'Cleanup reports that the recorded recovery path was already gone');
   assert(explain.landing.last_recovery === null, 'Cleanup clears missing recovery paths from landing state too');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 54a: pipeline repair clears broken recovery metadata automatically', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-repair-recovery-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-repair-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-repair-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-repair-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-repair-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-repair-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-repair-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-repair-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-repair', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-repair-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-repair', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-land-repair', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-land-repair', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'repair', 'pipe-land-repair', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const explain = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain', 'landing', 'pipe-land-repair', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(repair.repaired, 'Pipeline repair reports that it repaired broken state');
+  assert(repair.actions.some((action) => action.kind === 'recovery_state_cleared'), 'Pipeline repair clears missing recovery metadata');
+  assert(explain.landing.last_recovery === null, 'Pipeline repair clears the broken recovery record from landing state');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 54b: pipeline repair refreshes stale synthetic landing branches idempotently', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-repair-refresh-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-repair-refresh-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-repair-refresh-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-repair-refresh-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-repair-refresh-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'a.txt'), 'A\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'b.txt'), 'B\n');
+  execSync('git add b.txt', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-repair-refresh-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-repair-refresh-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-repair-refresh-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-repair-refresh', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-repair-refresh-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-repair-refresh', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  const initial = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-land-repair-refresh', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  writeFileSync(join(branchAPath, 'a.txt'), 'A updated\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a update"', { cwd: branchAPath });
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'repair', 'pipe-land-repair-refresh', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const status = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'status', 'pipe-land-repair-refresh', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const secondRepair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'repair', 'pipe-land-repair-refresh', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(repair.repaired, 'Pipeline repair reports that it refreshed stale landing state');
+  assert(repair.actions.some((action) => action.kind === 'landing_branch_refreshed'), 'Pipeline repair refreshes stale synthetic landing branches');
+  assert(status.landing_branch.stale === false, 'Pipeline repair leaves the landing branch current');
+  assert(initial.head_commit !== repair.actions.find((action) => action.kind === 'landing_branch_refreshed').head_commit, 'Pipeline repair updates the synthetic landing branch head commit');
+  assert(!secondRepair.repaired, 'Pipeline repair is idempotent once the landing branch is current again');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 54e: pipeline repair clears recovery metadata when the recovery path still exists but is no longer a git worktree', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-repair-untracked-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-repair-untracked-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-repair-untracked-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-repair-untracked-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-repair-untracked-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-repair-untracked-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-repair-untracked-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-repair-untracked-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-repair-untracked', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-repair-untracked-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-repair-untracked', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-land-repair-untracked', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-land-repair-untracked', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+  mkdirSync(recovery.recovery_path, { recursive: true });
+  writeFileSync(join(recovery.recovery_path, 'LEFTOVER.txt'), 'left behind\n');
+
+  const before = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain', 'landing', 'pipe-land-repair-untracked', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'repair', 'pipe-land-repair-untracked', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const after = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'explain', 'landing', 'pipe-land-repair-untracked', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(before.landing.last_recovery.state.status === 'untracked', 'Explain landing classifies an on-disk but untracked recovery path explicitly');
+  assert(repair.repaired, 'Pipeline repair reports that it repaired the untracked recovery metadata');
+  assert(repair.actions.some((action) => action.kind === 'recovery_state_cleared' && action.recovery_status === 'untracked'), 'Pipeline repair clears untracked recovery metadata');
+  assert(after.landing.last_recovery === null, 'Pipeline repair clears the untracked recovery record from landing state');
+
+  rmSync(recovery.recovery_path, { recursive: true, force: true });
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56d: repo repair closes interrupted pipeline journal operations after pipeline repair succeeds', () => {
+  const repoDir = join(tmpdir(), `sw-repair-pipeline-journal-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-repair-pipeline-journal-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-repair-pipeline-journal-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/repair-pipeline-journal-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/repair-pipeline-journal-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/repair-pipeline-journal-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/repair-pipeline-journal-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-repair-journal-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-repair-journal', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-repair-journal-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-repair-journal', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-repair-journal', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-repair-journal', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+  const op = startOperationJournalEntry(pipelineDb, {
+    scopeType: 'pipeline',
+    scopeId: 'pipe-repair-journal',
+    operationType: 'landing_recovery_prepare',
+    details: JSON.stringify({ pipeline_id: 'pipe-repair-journal', recovery_path: recovery.recovery_path }),
+  });
+  pipelineDb.close();
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const verifyDb = openDb(repoDir);
+  const journal = listOperationJournal(verifyDb, { scopeType: 'pipeline', scopeId: 'pipe-repair-journal', limit: 20 });
+  verifyDb.close();
+  const repairedOp = journal.find((entry) => entry.id === op.id);
+
+  assert(repair.actions.some((action) => action.kind === 'pipeline_repaired' && action.pipeline_id === 'pipe-repair-journal'), 'Repo repair reports the repaired pipeline');
+  assert(repair.actions.some((action) => action.kind === 'journal_operation_repaired' && action.operation_id === op.id), 'Repo repair reports the closed interrupted pipeline operation');
+  assert(repairedOp?.status === 'repaired', 'Repo repair marks the interrupted pipeline journal entry as repaired');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 54f: pipeline repair re-materializes a synthetic landing branch when the ref exists without recorded landing state', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-repair-reconcile-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-repair-reconcile-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-repair-reconcile-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-repair-reconcile-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-repair-reconcile-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'a.txt'), 'A\n');
+  execSync('git add a.txt', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'b.txt'), 'B\n');
+  execSync('git add b.txt', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-repair-reconcile-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-repair-reconcile-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-land-repair-reconcile-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-land-repair-reconcile', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-land-repair-reconcile-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-land-repair-reconcile', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  execSync('git branch switchman/pipeline-landing/pipe-land-repair-reconcile main', { cwd: repoDir });
+
+  const before = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'status', 'pipe-land-repair-reconcile', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'repair', 'pipe-land-repair-reconcile', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const after = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'status', 'pipe-land-repair-reconcile', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  assert(before.landing_branch.last_materialized === null, 'Pipeline status starts without recorded landing materialization');
+  assert(before.landing_branch.branch_exists, 'Synthetic landing branch ref exists before repair');
+  assert(repair.repaired, 'Pipeline repair reports that it reconciled the landing branch state');
+  assert(repair.actions.some((action) => action.kind === 'landing_branch_reconciled'), 'Pipeline repair re-materializes landing state when the ref exists without audit history');
+  assert(after.landing_branch.last_materialized !== null, 'Pipeline repair records landing materialization state after reconciliation');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56b: pipeline landing records materialization and recovery operations in the operation journal', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-journal-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-journal-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-journal-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-journal-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-journal-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-journal-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-journal-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-journal-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-journal', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-journal-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-journal', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-journal', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-journal', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  const operations = listOperationJournal(pipelineDb, { scopeType: 'pipeline', scopeId: 'pipe-journal', limit: 20 });
+  const materialize = operations.find((entry) => entry.operation_type === 'landing_materialize');
+  const recoveryPrepare = operations.find((entry) => entry.operation_type === 'landing_recovery_prepare');
+
+  assert(materialize?.status === 'failed', 'Landing materialization journal records the failed merge-conflict attempt');
+  assert(String(materialize?.details || '').includes('landing_branch_merge_conflict'), 'Landing materialization journal stores the failure reason code');
+  assert(recoveryPrepare?.status === 'completed', 'Landing recovery preparation is journaled as completed');
+  assert(String(recoveryPrepare?.details || '').includes(recovery.recovery_path), 'Landing recovery journal stores the recovery worktree path');
+
+  pipelineDb.close();
+  execSync(`git worktree remove "${recovery.recovery_path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56j: pipeline landing resources are tracked through landing and recovery lifecycle changes', () => {
+  const repoDir = join(tmpdir(), `sw-pipeline-resource-lifecycle-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-pipeline-resource-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-pipeline-resource-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/pipeline-resource-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/pipeline-resource-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/pipeline-resource-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/pipeline-resource-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-resource-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-resource', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-resource-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-resource', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-resource', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-resource', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  let verifyDb = openDb(repoDir);
+  let resources = listTempResources(verifyDb, { scopeType: 'pipeline', scopeId: 'pipe-resource', limit: 20 });
+  const releasedLandingResource = resources.find((resource) => resource.resource_type === 'landing_temp_worktree' && resource.status === 'released');
+  const activeRecoveryResource = resources.find((resource) => resource.resource_type === 'landing_recovery_worktree' && resource.status === 'active');
+  verifyDb.close();
+
+  assert(Boolean(releasedLandingResource), 'Landing materialization releases its tracked temp worktree resource after cleanup');
+  assert(activeRecoveryResource?.path === recovery.recovery_path, 'Recovery preparation records the active recovery worktree resource path');
+
+  writeFileSync(join(recovery.recovery_path, 'README.md'), 'resolved\n');
+  execSync('git add README.md', { cwd: recovery.recovery_path });
+  execSync('git commit -m "resolve conflict"', { cwd: recovery.recovery_path });
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-resource', '--resume', recovery.recovery_path, '--json',
+  ], { cwd: repoDir, encoding: 'utf8' });
+
+  verifyDb = openDb(repoDir);
+  resources = listTempResources(verifyDb, { scopeType: 'pipeline', scopeId: 'pipe-resource', limit: 20 });
+  const resolvedRecoveryResource = resources.find((resource) => resource.resource_type === 'landing_recovery_worktree' && resource.path === recovery.recovery_path);
+  verifyDb.close();
+
+  assert(resolvedRecoveryResource?.status === 'resolved', 'Recovery resume marks the tracked recovery worktree resource as resolved');
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-resource', '--cleanup', recovery.recovery_path, '--json',
+  ], { cwd: repoDir, encoding: 'utf8' });
+
+  verifyDb = openDb(repoDir);
+  resources = listTempResources(verifyDb, { scopeType: 'pipeline', scopeId: 'pipe-resource', limit: 20 });
+  const releasedRecoveryResource = resources.find((resource) => resource.resource_type === 'landing_recovery_worktree' && resource.path === recovery.recovery_path);
+  verifyDb.close();
+
+  assert(releasedRecoveryResource?.status === 'released', 'Recovery cleanup marks the tracked recovery worktree resource as released');
+
+  execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 56k: repo repair reconciles missing tracked recovery resources', () => {
+  const repoDir = join(tmpdir(), `sw-repair-recovery-resource-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'shared\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const branchAPath = join(tmpdir(), `sw-repair-recovery-resource-a-${Date.now()}`);
+  const branchBPath = join(tmpdir(), `sw-repair-recovery-resource-b-${Date.now()}`);
+  execSync(`git worktree add -b feature/repair-recovery-resource-a "${branchAPath}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/repair-recovery-resource-b "${branchBPath}"`, { cwd: repoDir });
+  writeFileSync(join(branchAPath, 'README.md'), 'branch-a\n');
+  execSync('git add README.md', { cwd: branchAPath });
+  execSync('git commit -m "branch a"', { cwd: branchAPath });
+  writeFileSync(join(branchBPath, 'README.md'), 'branch-b\n');
+  execSync('git add README.md', { cwd: branchBPath });
+  execSync('git commit -m "branch b"', { cwd: branchBPath });
+
+  const pipelineDb = initDb(repoDir);
+  registerWorktree(pipelineDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(pipelineDb, { name: 'agent1', path: branchAPath, branch: 'feature/repair-recovery-resource-a' });
+  registerWorktree(pipelineDb, { name: 'agent2', path: branchBPath, branch: 'feature/repair-recovery-resource-b' });
+  const taskA = createTask(pipelineDb, { id: 'pipe-repair-resource-01', title: 'Implementation task' });
+  upsertTaskSpec(pipelineDb, taskA, { pipeline_id: 'pipe-repair-resource', task_type: 'implementation' });
+  const taskB = createTask(pipelineDb, { id: 'pipe-repair-resource-02', title: 'Docs task' });
+  upsertTaskSpec(pipelineDb, taskB, { pipeline_id: 'pipe-repair-resource', task_type: 'docs' });
+  assignTask(pipelineDb, taskA, 'agent1');
+  completeTask(pipelineDb, taskA);
+  assignTask(pipelineDb, taskB, 'agent2');
+  completeTask(pipelineDb, taskB);
+  pipelineDb.close();
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'pipeline', 'land', 'pipe-repair-resource', '--refresh',
+    ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {}
+
+  const recovery = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'pipeline', 'land', 'pipe-repair-resource', '--recover', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  rmSync(recovery.recovery_path, { recursive: true, force: true });
+  execSync('git worktree prune', { cwd: repoDir });
+
+  const repair = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'repair', '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+
+  const verifyDb = openDb(repoDir);
+  const resources = listTempResources(verifyDb, { scopeType: 'pipeline', scopeId: 'pipe-repair-resource', limit: 20 });
+  verifyDb.close();
+  const repairedRecoveryResource = resources.find((resource) => resource.resource_type === 'landing_recovery_worktree' && resource.path === recovery.recovery_path);
+
+  assert(repair.actions.some((action) => action.kind === 'temp_resource_reconciled' && action.path === recovery.recovery_path), 'Repo repair reports when it reconciles a missing tracked recovery resource');
+  assert(repairedRecoveryResource?.status === 'abandoned', 'Repo repair marks the missing tracked recovery resource as abandoned');
 
   execSync(`git worktree remove "${branchAPath}" --force`, { cwd: repoDir });
   execSync(`git worktree remove "${branchBPath}" --force`, { cwd: repoDir });
