@@ -1,7 +1,7 @@
 import { finishOperationJournalEntry, getMergeQueueItem, getTaskSpec, listDependencyInvalidations, listMergeQueue, listTasks, listWorktrees, markMergeQueueState, startMergeQueueItem, startOperationJournalEntry } from './db.js';
 import { gitAssessBranchFreshness, gitBranchExists, gitMergeBranchInto, gitRebaseOnto } from './git.js';
 import { runAiMergeGate } from './merge-gate.js';
-import { evaluatePipelinePolicyGate, preparePipelineLandingTarget } from './pipeline.js';
+import { evaluatePipelinePolicyGate, getPipelineStaleWaveContext, preparePipelineLandingTarget } from './pipeline.js';
 import { scanAllWorktrees } from './detector.js';
 
 const QUEUE_RETRY_BACKOFF_BASE_MS = 30_000;
@@ -203,7 +203,7 @@ function summarizeQueueGoalContext(db, item) {
 }
 
 function assessQueueCandidate(db, repoRoot, item) {
-  if (!db || !repoRoot || !['queued', 'retrying', 'held', 'escalated'].includes(item.status)) {
+  if (!db || !repoRoot || !['queued', 'retrying', 'held', 'wave_blocked', 'escalated'].includes(item.status)) {
     return {
       freshness: 'unknown',
       revalidation_state: 'unknown',
@@ -217,6 +217,8 @@ function assessQueueCandidate(db, repoRoot, item) {
         ? 'retrying item waiting for another landing attempt'
         : item.status === 'held'
           ? 'held item waiting for a safe landing window'
+          : item.status === 'wave_blocked'
+            ? 'wave-blocked item waiting for coordinated revalidation across the same stale wave'
           : item.status === 'escalated'
             ? 'escalated item waiting for operator review'
         : 'queued item waiting to land',
@@ -248,6 +250,9 @@ function assessQueueCandidate(db, repoRoot, item) {
     const staleInvalidations = pipelineId
       ? listDependencyInvalidations(db, { pipelineId }).filter((entry) => entry.affected_pipeline_id === pipelineId)
       : [];
+    const staleWaveContext = pipelineId
+      ? getPipelineStaleWaveContext(db, pipelineId)
+      : { shared_wave_count: 0, largest_wave_size: 0, primary_wave: null };
     const statusWeight = item.status === 'queued' ? 0 : 1;
     const freshnessWeight = freshness.state === 'fresh' ? 0 : freshness.state === 'behind' ? 2 : 4;
     const urgencyWeight = goalContext.goal_priority >= 8 ? -2 : goalContext.goal_priority >= 6 ? -1 : 0;
@@ -257,6 +262,7 @@ function assessQueueCandidate(db, repoRoot, item) {
         ? 'warn'
         : 'clear';
     const revalidationWeight = staleSeverity === 'block' ? 6 : staleSeverity === 'warn' ? 3 : 0;
+    const waveWeight = staleWaveContext.largest_wave_size >= 3 ? 3 : staleWaveContext.largest_wave_size >= 2 ? 2 : 0;
     const integrationWeight = goalContext.integration_risk === 'high' ? 1 : 0;
     const backoffWaiting = item.status === 'retrying' && isQueueBackoffActive(item);
     const backoffWeight = backoffWaiting ? 3 : 0;
@@ -275,6 +281,9 @@ function assessQueueCandidate(db, repoRoot, item) {
       : staleSeverity === 'warn'
         ? `pipeline ${pipelineId} has stale work to revalidate, so clearer landing candidates land first`
         : null;
+    const waveReason = staleWaveContext.primary_wave && staleWaveContext.largest_wave_size > 1
+      ? `the same stale wave also affects ${staleWaveContext.primary_wave.related_affected_pipelines.filter((entry) => entry !== pipelineId).join(', ')}`
+      : null;
     const riskReason = goalContext.integration_risk === 'high'
       ? `pipeline ${pipelineId} carries high integration risk and may need escalation if it is not clearly ready`
       : goalContext.integration_risk === 'medium'
@@ -288,12 +297,15 @@ function assessQueueCandidate(db, repoRoot, item) {
       revalidation_state: staleSeverity === 'clear' ? 'clear' : 'stale',
       stale_invalidation_count: staleInvalidations.length,
       stale_severity: staleSeverity,
+      stale_wave_count: staleWaveContext.shared_wave_count,
+      stale_wave_size: staleWaveContext.largest_wave_size,
+      stale_wave_summary: staleWaveContext.primary_wave?.summary || null,
       branch_availability: 'ready',
       goal_priority: goalContext.goal_priority,
       goal_title: goalContext.goal_title,
       integration_risk: goalContext.integration_risk,
-      priority_score: freshnessWeight + statusWeight + revalidationWeight + integrationWeight + urgencyWeight + backoffWeight,
-      reason: [freshnessReason, urgencyReason, revalidationReason, riskReason, backoffReason].filter(Boolean).join('; '),
+      priority_score: freshnessWeight + statusWeight + revalidationWeight + waveWeight + integrationWeight + urgencyWeight + backoffWeight,
+      reason: [freshnessReason, urgencyReason, revalidationReason, waveReason, riskReason, backoffReason].filter(Boolean).join('; '),
       freshness_details: freshness,
       backoff_until: item.backoff_until || null,
       backoff_active: backoffWaiting,
@@ -318,7 +330,7 @@ function assessQueueCandidate(db, repoRoot, item) {
 
 function rankQueueItems(items, { db = null, repoRoot = null } = {}) {
   return items
-    .filter((item) => ['queued', 'retrying', 'held', 'escalated'].includes(item.status))
+    .filter((item) => ['queued', 'retrying', 'held', 'wave_blocked', 'escalated'].includes(item.status))
     .map((item) => ({
       ...item,
       queue_assessment: assessQueueCandidate(db, repoRoot, item),
@@ -328,6 +340,13 @@ function rankQueueItems(items, { db = null, repoRoot = null } = {}) {
       if (scoreDelta !== 0) return scoreDelta;
       return String(left.created_at || '').localeCompare(String(right.created_at || ''));
     });
+}
+
+function annotateQueueCandidates(items, { db = null, repoRoot = null } = {}) {
+  return rankQueueItems(items, { db, repoRoot }).map((item) => ({
+    ...item,
+    recommendation: recommendQueueAction(item),
+  }));
 }
 
 function recommendQueueAction(item) {
@@ -350,8 +369,18 @@ function recommendQueueAction(item) {
   if (item.status === 'held' && assessment.stale_invalidation_count > 0) {
     return {
       action: 'hold',
-      summary: item.next_action || assessment.next_action || 'hold until the stale pipeline work is revalidated',
+      summary: item.next_action || (assessment.stale_wave_size > 1
+        ? `hold for coordinated revalidation: ${assessment.stale_wave_summary || 'the same stale wave'} affects ${assessment.stale_wave_size} goals`
+        : assessment.next_action) || 'hold until the stale pipeline work is revalidated',
       command: assessment.next_action || 'switchman queue retry <itemId>',
+    };
+  }
+
+  if (item.status === 'wave_blocked' && assessment.stale_invalidation_count > 0) {
+    return {
+      action: 'hold',
+      summary: item.next_action || `hold for coordinated revalidation: ${assessment.stale_wave_summary || 'shared stale wave'} affects ${assessment.stale_wave_size} goals`,
+      command: assessment.next_action || 'switchman queue status',
     };
   }
 
@@ -386,7 +415,9 @@ function recommendQueueAction(item) {
   if (assessment.stale_invalidation_count > 0) {
     return {
       action: 'hold',
-      summary: assessment.next_action
+      summary: assessment.stale_wave_size > 1
+        ? `hold for coordinated revalidation first: ${assessment.stale_wave_summary || 'shared stale wave'} affects ${assessment.stale_wave_size} goals`
+        : assessment.next_action
         ? `hold for revalidation first: ${assessment.next_action}`
         : 'hold until the stale pipeline work is revalidated',
       command: assessment.next_action || 'switchman queue status',
@@ -418,11 +449,126 @@ function recommendQueueAction(item) {
   };
 }
 
+function classifyQueuePlanLane(item) {
+  const action = item.recommendation?.action || 'hold';
+  const assessment = item.queue_assessment || {};
+
+  if (action === 'escalate') {
+    return {
+      lane: 'escalate',
+      summary: item.recommendation?.summary || 'needs operator review before it should land',
+      command: item.recommendation?.command || `switchman explain queue ${item.id}`,
+    };
+  }
+
+  if (action === 'retry') {
+    if (assessment.backoff_active) {
+      return {
+        lane: 'prepare_next',
+        summary: item.recommendation?.summary || 'wait for retry backoff, then retry this landing candidate',
+        command: item.recommendation?.command || `switchman queue retry ${item.id}`,
+      };
+    }
+    return {
+      lane: 'prepare_next',
+      summary: item.recommendation?.summary || 'retry this landing candidate once the immediate issue is cleared',
+      command: item.recommendation?.command || 'switchman queue run',
+    };
+  }
+
+  if (action === 'land_now') {
+    return {
+      lane: 'land_now',
+      summary: item.recommendation?.summary || 'this is ready to land now',
+      command: item.recommendation?.command || 'switchman queue run',
+    };
+  }
+
+  if (assessment.stale_invalidation_count > 0) {
+    return {
+      lane: 'unblock_first',
+      summary: item.recommendation?.summary || 'revalidate this goal before it can land',
+      command: item.recommendation?.command || assessment.next_action || 'switchman queue status',
+    };
+  }
+
+  if (assessment.freshness === 'behind' || assessment.freshness === 'unknown') {
+    return {
+      lane: 'defer',
+      summary: item.recommendation?.summary || 'wait until fresher candidates land first',
+      command: item.recommendation?.command || 'switchman queue run',
+    };
+  }
+
+  return {
+    lane: 'prepare_next',
+    summary: item.recommendation?.summary || 'keep this candidate close behind the current landing focus',
+    command: item.recommendation?.command || 'switchman queue status',
+  };
+}
+
+function buildQueueGoalPlan(candidates = []) {
+  const lanes = {
+    land_now: [],
+    prepare_next: [],
+    unblock_first: [],
+    escalate: [],
+    defer: [],
+  };
+
+  for (const item of candidates) {
+    const plan = classifyQueuePlanLane(item);
+    lanes[plan.lane].push({
+      item_id: item.id,
+      source_ref: item.source_ref,
+      source_type: item.source_type,
+      pipeline_id: item.source_pipeline_id || null,
+      goal_title: item.queue_assessment?.goal_title || null,
+      goal_priority: item.queue_assessment?.goal_priority || null,
+      action: item.recommendation?.action || 'hold',
+      freshness: item.queue_assessment?.freshness || 'unknown',
+      stale_invalidation_count: item.queue_assessment?.stale_invalidation_count || 0,
+      integration_risk: item.queue_assessment?.integration_risk || 'normal',
+      summary: plan.summary,
+      command: plan.command,
+    });
+  }
+
+  return lanes;
+}
+
+function buildQueueRecommendedSequence(candidates = [], limit = 5) {
+  const ordered = [];
+  const pushLane = (laneName, items, stage) => {
+    for (const item of items) {
+      if (ordered.length >= limit) return;
+      ordered.push({
+        stage,
+        lane: laneName,
+        item_id: item.item_id,
+        source_ref: item.source_ref,
+        source_type: item.source_type,
+        pipeline_id: item.pipeline_id,
+        goal_title: item.goal_title,
+        goal_priority: item.goal_priority,
+        action: item.action,
+        summary: item.summary,
+        command: item.command,
+      });
+    }
+  };
+
+  const plan = buildQueueGoalPlan(candidates);
+  pushLane('land_now', plan.land_now, '1');
+  pushLane('prepare_next', plan.prepare_next, '2');
+  pushLane('unblock_first', plan.unblock_first, '3');
+  pushLane('escalate', plan.escalate, '4');
+  pushLane('defer', plan.defer, '5');
+  return ordered;
+}
+
 function chooseNextQueueItem(items, { db = null, repoRoot = null } = {}) {
-  const candidates = rankQueueItems(items, { db, repoRoot }).map((item) => ({
-    ...item,
-    recommendation: recommendQueueAction(item),
-  }));
+  const candidates = annotateQueueCandidates(items, { db, repoRoot });
   return candidates[0] || null;
 }
 
@@ -434,11 +580,11 @@ function isQueueItemRunnable(item) {
   return ['land_now', 'retry'].includes(item.recommendation.action);
 }
 
-function chooseRunnableQueueItem(items, { db = null, repoRoot = null } = {}) {
-  const candidates = rankQueueItems(items, { db, repoRoot }).map((item) => ({
-    ...item,
-    recommendation: recommendQueueAction(item),
-  }));
+function chooseRunnableQueueItem(items, { db = null, repoRoot = null, followPlan = false } = {}) {
+  const candidates = annotateQueueCandidates(items, { db, repoRoot });
+  if (followPlan) {
+    return candidates.find((item) => classifyQueuePlanLane(item).lane === 'land_now' && isQueueItemRunnable(item)) || null;
+  }
   return candidates.find((item) => isQueueItemRunnable(item))
     || candidates.find((item) =>
       item.recommendation?.action === 'hold'
@@ -452,7 +598,9 @@ function syncDeferredQueueState(db, item) {
     return item;
   }
 
-  const desiredStatus = item.recommendation.action === 'hold' ? 'held' : 'escalated';
+  const desiredStatus = item.recommendation.action === 'hold'
+    ? (item.queue_assessment?.stale_wave_size > 1 ? 'wave_blocked' : 'held')
+    : 'escalated';
   const desiredNextAction = item.recommendation.action === 'escalate'
     ? `Run \`switchman explain queue ${item.id}\` to review the landing risk, then \`switchman queue retry ${item.id}\` when it is ready again.`
     : item.queue_assessment?.next_action || item.recommendation.command || null;
@@ -468,17 +616,15 @@ function syncDeferredQueueState(db, item) {
 
   return markMergeQueueState(db, item.id, {
     status: desiredStatus,
-    lastErrorCode: desiredStatus === 'held' ? 'queue_hold' : 'queue_escalated',
+    lastErrorCode: desiredStatus === 'wave_blocked' ? 'queue_wave_blocked' : desiredStatus === 'held' ? 'queue_hold' : 'queue_escalated',
     lastErrorSummary: desiredSummary,
     nextAction: desiredNextAction,
   });
 }
 
 export function buildQueueStatusSummary(items, { db = null, repoRoot = null } = {}) {
-  const rankedCandidates = rankQueueItems(items, { db, repoRoot }).map((item) => ({
-    ...item,
-    recommendation: recommendQueueAction(item),
-  }));
+  const rankedCandidates = annotateQueueCandidates(items, { db, repoRoot });
+  const plan = buildQueueGoalPlan(rankedCandidates.slice(0, 8));
   const next = rankedCandidates[0]
     || items.find((item) => ['validating', 'rebasing', 'merging'].includes(item.status))
     || null;
@@ -489,6 +635,7 @@ export function buildQueueStatusSummary(items, { db = null, repoRoot = null } = 
     merging: items.filter((item) => item.status === 'merging').length,
     retrying: items.filter((item) => item.status === 'retrying').length,
     held: items.filter((item) => item.status === 'held').length,
+    wave_blocked: items.filter((item) => item.status === 'wave_blocked').length,
     escalated: items.filter((item) => item.status === 'escalated').length,
     blocked: items.filter((item) => item.status === 'blocked').length,
     merged: items.filter((item) => item.status === 'merged').length,
@@ -501,6 +648,8 @@ export function buildQueueStatusSummary(items, { db = null, repoRoot = null } = 
     held_back: rankedCandidates.slice(1, 4),
     decision_summary: next?.queue_assessment?.reason || null,
     focus_decision: next?.recommendation || null,
+    plan,
+    recommended_sequence: buildQueueRecommendedSequence(rankedCandidates.slice(0, 8)),
     recommendations: rankedCandidates.slice(0, 5).map((item) => ({
       item_id: item.id,
       source_ref: item.source_ref,
@@ -510,15 +659,18 @@ export function buildQueueStatusSummary(items, { db = null, repoRoot = null } = 
       command: item.recommendation?.command || null,
       freshness: item.queue_assessment?.freshness || 'unknown',
       stale_invalidation_count: item.queue_assessment?.stale_invalidation_count || 0,
+      stale_wave_count: item.queue_assessment?.stale_wave_count || 0,
+      stale_wave_size: item.queue_assessment?.stale_wave_size || 0,
+      stale_wave_summary: item.queue_assessment?.stale_wave_summary || null,
       goal_priority: item.queue_assessment?.goal_priority || null,
       integration_risk: item.queue_assessment?.integration_risk || 'normal',
     })),
   };
 }
 
-export async function runNextQueueItem(db, repoRoot, { targetBranch = 'main' } = {}) {
+export async function runNextQueueItem(db, repoRoot, { targetBranch = 'main', followPlan = false } = {}) {
   const currentItems = listMergeQueue(db);
-  const nextItem = chooseRunnableQueueItem(currentItems, { db, repoRoot });
+  const nextItem = chooseRunnableQueueItem(currentItems, { db, repoRoot, followPlan });
   if (!nextItem) {
     const deferred = chooseNextQueueItem(currentItems, { db, repoRoot });
     if (deferred) {
@@ -653,22 +805,37 @@ export async function runNextQueueItem(db, repoRoot, { targetBranch = 'main' } =
   }
 }
 
-export async function runMergeQueue(db, repoRoot, { maxItems = 1, targetBranch = 'main' } = {}) {
+export async function runMergeQueue(db, repoRoot, {
+  maxItems = 1,
+  targetBranch = 'main',
+  followPlan = false,
+  mergeBudget = null,
+} = {}) {
   const processed = [];
   let deferred = null;
+  let mergedCount = 0;
   for (let count = 0; count < maxItems; count++) {
-    const result = await runNextQueueItem(db, repoRoot, { targetBranch });
+    if (mergeBudget !== null && mergedCount >= mergeBudget) break;
+    const result = await runNextQueueItem(db, repoRoot, { targetBranch, followPlan });
     if (!result.item) {
       deferred = result.deferred || deferred;
       break;
     }
     processed.push(result);
+    if (result.status === 'merged') {
+      mergedCount += 1;
+    }
     if (result.status !== 'merged') break;
   }
 
   return {
     processed,
     deferred,
+    execution_policy: {
+      follow_plan: followPlan,
+      merge_budget: mergeBudget,
+      merged_count: mergedCount,
+    },
     summary: buildQueueStatusSummary(listMergeQueue(db), { db, repoRoot }),
   };
 }

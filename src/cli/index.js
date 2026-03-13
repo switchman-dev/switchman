@@ -3218,9 +3218,22 @@ What it helps you answer:
       ...(summary.blocked[0] ? [`${chalk.cyan('$')} switchman queue retry ${summary.blocked[0].id}`] : []),
     ];
 
+    const queuePlanLines = [
+      ...(summary.plan?.land_now?.slice(0, 2).map((item) => `${renderChip('LAND NOW', item.item_id, chalk.green)} ${item.source_type}:${item.source_ref} ${chalk.dim(item.summary)}`) || []),
+      ...(summary.plan?.prepare_next?.slice(0, 2).map((item) => `${renderChip('PREP NEXT', item.item_id, chalk.cyan)} ${item.source_type}:${item.source_ref} ${chalk.dim(item.summary)}`) || []),
+      ...(summary.plan?.unblock_first?.slice(0, 2).map((item) => `${renderChip('UNBLOCK', item.item_id, chalk.yellow)} ${item.source_type}:${item.source_ref} ${chalk.dim(item.summary)}`) || []),
+      ...(summary.plan?.escalate?.slice(0, 2).map((item) => `${renderChip('ESCALATE', item.item_id, chalk.red)} ${item.source_type}:${item.source_ref} ${chalk.dim(item.summary)}`) || []),
+      ...(summary.plan?.defer?.slice(0, 2).map((item) => `${renderChip('DEFER', item.item_id, chalk.white)} ${item.source_type}:${item.source_ref} ${chalk.dim(item.summary)}`) || []),
+    ];
+    const queueSequenceLines = summary.recommended_sequence?.length > 0
+      ? summary.recommended_sequence.map((item) => `${chalk.bold(`${item.stage}.`)} ${item.source_type}:${item.source_ref} ${chalk.dim(`[${item.lane}]`)} ${item.summary}`)
+      : [chalk.green('No recommended sequence beyond the current landing focus.')];
+
     console.log('');
     for (const block of [
       renderPanel('Landing focus', queueFocusLines, chalk.green),
+      renderPanel('Recommended sequence', queueSequenceLines, summary.recommended_sequence?.length > 0 ? chalk.cyan : chalk.green),
+      renderPanel('Queue plan', queuePlanLines.length > 0 ? queuePlanLines : [chalk.green('Nothing else needs planning right now.')], queuePlanLines.length > 0 ? chalk.cyan : chalk.green),
       renderPanel('Held back', queueHeldBackLines, summary.held_back.length > 0 ? chalk.yellow : chalk.green),
       renderPanel('Blocked', queueBlockedLines, summary.counts.blocked > 0 ? chalk.red : chalk.green),
       renderPanel('In flight', queueWatchLines, queueWatchLines[0] === 'No in-flight queue items right now.' ? chalk.green : chalk.blue),
@@ -3242,6 +3255,8 @@ queueCmd
   .command('run')
   .description('Process landing-queue items one at a time')
   .option('--max-items <n>', 'Maximum queue items to process', '1')
+  .option('--follow-plan', 'Only run queue items that are currently in the land_now lane')
+  .option('--merge-budget <n>', 'Maximum successful merges to allow in this run')
   .option('--target <branch>', 'Default target branch', 'main')
   .option('--watch', 'Keep polling for new queue items')
   .option('--watch-interval-ms <n>', 'Polling interval for --watch mode', '1000')
@@ -3250,6 +3265,7 @@ queueCmd
   .addHelpText('after', `
 Examples:
   switchman queue run
+  switchman queue run --follow-plan --merge-budget 2
   switchman queue run --watch
   switchman queue run --watch --watch-interval-ms 1000
 `)
@@ -3258,12 +3274,21 @@ Examples:
 
     try {
       const watch = Boolean(opts.watch);
+      const followPlan = Boolean(opts.followPlan);
       const watchIntervalMs = Math.max(0, Number.parseInt(opts.watchIntervalMs, 10) || 1000);
       const maxCycles = opts.maxCycles ? Math.max(1, Number.parseInt(opts.maxCycles, 10) || 1) : null;
+      const mergeBudget = opts.mergeBudget !== undefined
+        ? Math.max(0, Number.parseInt(opts.mergeBudget, 10) || 0)
+        : null;
       const aggregate = {
         processed: [],
         cycles: 0,
         watch,
+        execution_policy: {
+          follow_plan: followPlan,
+          merge_budget: mergeBudget,
+          merged_count: 0,
+        },
       };
 
       while (true) {
@@ -3271,16 +3296,20 @@ Examples:
         const result = await runMergeQueue(db, repoRoot, {
           maxItems: Number.parseInt(opts.maxItems, 10) || 1,
           targetBranch: opts.target || 'main',
+          followPlan,
+          mergeBudget,
         });
         db.close();
 
         aggregate.processed.push(...result.processed);
         aggregate.summary = result.summary;
         aggregate.deferred = result.deferred || aggregate.deferred || null;
+        aggregate.execution_policy = result.execution_policy || aggregate.execution_policy;
         aggregate.cycles += 1;
 
         if (!watch) break;
         if (maxCycles && aggregate.cycles >= maxCycles) break;
+        if (mergeBudget !== null && aggregate.execution_policy.merged_count >= mergeBudget) break;
         if (result.processed.length === 0) {
           sleepSync(watchIntervalMs);
         }
@@ -3296,6 +3325,9 @@ Examples:
         if (deferredFocus?.recommendation?.action) {
           console.log(chalk.yellow('No landing candidate is ready to run right now.'));
           console.log(`  ${chalk.dim('focus:')} ${deferredFocus.id} ${deferredFocus.source_type}:${deferredFocus.source_ref}`);
+          if (followPlan) {
+            console.log(`  ${chalk.dim('policy:')} following the queue plan, so only land_now items will run automatically`);
+          }
           if (deferredFocus.recommendation?.summary) {
             console.log(`  ${chalk.dim('decision:')} ${deferredFocus.recommendation.summary}`);
           }
@@ -3325,6 +3357,10 @@ Examples:
           console.log(`  ${chalk.red('why:')} ${item.last_error_summary}`);
           if (item.next_action) console.log(`  ${chalk.yellow('next:')} ${item.next_action}`);
         }
+      }
+
+      if (aggregate.execution_policy.follow_plan) {
+        console.log(`${chalk.dim('plan-aware run:')} merged ${aggregate.execution_policy.merged_count}${aggregate.execution_policy.merge_budget !== null ? ` of ${aggregate.execution_policy.merge_budget}` : ''} budgeted item(s)`);
       }
 
       await maybeCaptureTelemetry('queue_used', {

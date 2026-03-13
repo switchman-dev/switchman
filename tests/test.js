@@ -2012,6 +2012,275 @@ test('Merge queue status prioritizes fresher high-priority pipeline goals over l
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Merge queue status builds a longer-horizon queue plan across active goals', () => {
+  const repoDir = join(tmpdir(), `sw-queue-plan-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const nowPath = join(tmpdir(), `sw-queue-plan-now-${Date.now()}`);
+  execSync(`git worktree add -b feature/plan-now "${nowPath}"`, { cwd: repoDir });
+  writeFileSync(join(nowPath, 'now.txt'), 'now\n');
+  execSync('git add now.txt', { cwd: nowPath });
+  execSync('git commit -m "plan now"', { cwd: nowPath });
+
+  const laterPath = join(tmpdir(), `sw-queue-plan-later-${Date.now()}`);
+  execSync(`git worktree add -b feature/plan-later "${laterPath}"`, { cwd: repoDir });
+  writeFileSync(join(laterPath, 'later.txt'), 'later\n');
+  execSync('git add later.txt', { cwd: laterPath });
+  execSync('git commit -m "plan later"', { cwd: laterPath });
+
+  const stalePath = join(tmpdir(), `sw-queue-plan-stale-${Date.now()}`);
+  execSync(`git worktree add -b feature/plan-stale "${stalePath}"`, { cwd: repoDir });
+  writeFileSync(join(stalePath, 'stale.txt'), 'stale\n');
+  execSync('git add stale.txt', { cwd: stalePath });
+  execSync('git commit -m "plan stale"', { cwd: stalePath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'plan-now', path: nowPath, branch: 'feature/plan-now' });
+  registerWorktree(queueDb, { name: 'plan-later', path: laterPath, branch: 'feature/plan-later' });
+  registerWorktree(queueDb, { name: 'plan-stale', path: stalePath, branch: 'feature/plan-stale' });
+
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/plan-now',
+    sourcePipelineId: 'pipe-plan-now',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/plan-later',
+    sourcePipelineId: 'pipe-plan-later',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/plan-stale',
+    sourcePipelineId: 'pipe-plan-stale',
+    targetBranch: 'main',
+  });
+
+  const nowTask = createTask(queueDb, { id: 'pipe-plan-now-01', title: 'Ship now goal', priority: 8 });
+  upsertTaskSpec(queueDb, nowTask, {
+    pipeline_id: 'pipe-plan-now',
+    task_type: 'implementation',
+    risk_level: 'medium',
+  });
+  const laterTask = createTask(queueDb, { id: 'pipe-plan-later-01', title: 'Ship later goal', priority: 6 });
+  upsertTaskSpec(queueDb, laterTask, {
+    pipeline_id: 'pipe-plan-later',
+    task_type: 'implementation',
+    risk_level: 'low',
+  });
+  const staleTask = createTask(queueDb, { id: 'pipe-plan-stale-01', title: 'Revalidate stale goal', priority: 7 });
+  upsertTaskSpec(queueDb, staleTask, {
+    pipeline_id: 'pipe-plan-stale',
+    task_type: 'implementation',
+    risk_level: 'low',
+  });
+  const sourceTaskId = createTask(queueDb, { id: 'pipe-plan-source-01', title: 'Shared API change', priority: 9 });
+  upsertTaskSpec(queueDb, sourceTaskId, {
+    pipeline_id: 'pipe-plan-source',
+    task_type: 'implementation',
+    subsystem_tags: ['api'],
+  });
+  assignTask(queueDb, sourceTaskId, 'plan-stale');
+  const sourceLease = getActiveLeaseForTask(queueDb, sourceTaskId);
+  queueDb.prepare(`
+    INSERT INTO dependency_invalidations (
+      source_lease_id, source_task_id, source_pipeline_id, source_worktree,
+      affected_task_id, affected_pipeline_id, affected_worktree,
+      status, reason_type, subsystem_tag, source_scope_pattern, affected_scope_pattern, details
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    sourceLease.id,
+    sourceTaskId,
+    'pipe-plan-source',
+    'plan-stale',
+    staleTask,
+    'pipe-plan-stale',
+    'plan-stale',
+    'stale',
+    'subsystem_overlap',
+    'api',
+    null,
+    null,
+    JSON.stringify({ source_task_title: 'Shared API change' }),
+  );
+  queueDb.close();
+
+  execSync('git checkout main', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'main-drift.txt'), 'drift\n');
+  execSync('git add main-drift.txt', { cwd: repoDir });
+  execSync('git commit -m "main drift"', { cwd: repoDir });
+  execSync('git rebase main', { cwd: nowPath });
+
+  const statusJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(statusJson.summary.plan.land_now.some((item) => item.source_ref === 'feature/plan-now'), 'Queue plan marks the clearest candidate as land_now');
+  assert(statusJson.summary.plan.unblock_first.some((item) => item.source_ref === 'feature/plan-stale'), 'Queue plan marks stale work as unblock_first');
+  assert(statusJson.summary.plan.defer.some((item) => item.source_ref === 'feature/plan-later'), 'Queue plan marks behind work as defer');
+  assert(statusJson.summary.recommended_sequence[0].source_ref === 'feature/plan-now', 'Queue sequence starts with the clearest landing candidate');
+  assert(statusJson.summary.recommended_sequence.some((item) => item.source_ref === 'feature/plan-stale' && item.lane === 'unblock_first'), 'Queue sequence includes stale work as a later unblock step');
+  assert(statusJson.summary.recommended_sequence.some((item) => item.source_ref === 'feature/plan-later' && item.lane === 'defer'), 'Queue sequence includes behind work as a defer step');
+
+  execSync(`git worktree remove "${nowPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${laterPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${stalePath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run can follow the queue plan with a merge budget', () => {
+  const repoDir = join(tmpdir(), `sw-queue-follow-plan-budget-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const firstPath = join(tmpdir(), `sw-queue-follow-plan-first-${Date.now()}`);
+  execSync(`git worktree add -b feature/follow-plan-first "${firstPath}"`, { cwd: repoDir });
+  writeFileSync(join(firstPath, 'first.txt'), 'first\n');
+  execSync('git add first.txt', { cwd: firstPath });
+  execSync('git commit -m "first landing candidate"', { cwd: firstPath });
+
+  const secondPath = join(tmpdir(), `sw-queue-follow-plan-second-${Date.now()}`);
+  execSync(`git worktree add -b feature/follow-plan-second "${secondPath}"`, { cwd: repoDir });
+  writeFileSync(join(secondPath, 'second.txt'), 'second\n');
+  execSync('git add second.txt', { cwd: secondPath });
+  execSync('git commit -m "second landing candidate"', { cwd: secondPath });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'follow-plan-first', path: firstPath, branch: 'feature/follow-plan-first' });
+  registerWorktree(queueDb, { name: 'follow-plan-second', path: secondPath, branch: 'feature/follow-plan-second' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/follow-plan-first',
+    sourcePipelineId: 'pipe-follow-plan-first',
+    targetBranch: 'main',
+  });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/follow-plan-second',
+    sourcePipelineId: 'pipe-follow-plan-second',
+    targetBranch: 'main',
+  });
+  const firstTask = createTask(queueDb, { id: 'pipe-follow-plan-first-01', title: 'First plan goal', priority: 9 });
+  upsertTaskSpec(queueDb, firstTask, {
+    pipeline_id: 'pipe-follow-plan-first',
+    task_type: 'implementation',
+  });
+  const secondTask = createTask(queueDb, { id: 'pipe-follow-plan-second-01', title: 'Second plan goal', priority: 5 });
+  upsertTaskSpec(queueDb, secondTask, {
+    pipeline_id: 'pipe-follow-plan-second',
+    task_type: 'implementation',
+  });
+  queueDb.close();
+
+  const runJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+    '--follow-plan',
+    '--merge-budget',
+    '1',
+    '--max-items',
+    '5',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const verifyDb = initDb(repoDir);
+  const items = listMergeQueue(verifyDb);
+  verifyDb.close();
+
+  assert(runJson.execution_policy.follow_plan === true, 'Queue run JSON records that the plan-aware execution policy was enabled');
+  assert(runJson.execution_policy.merge_budget === 1, 'Queue run JSON records the merge budget');
+  assert(runJson.execution_policy.merged_count === 1, 'Queue run JSON records the number of merges consumed from the budget');
+  assert(runJson.processed.length === 1, 'Queue run stops after consuming the requested merge budget');
+  assert(runJson.processed[0].item.source_ref === 'feature/follow-plan-first', 'Queue run merges the first ranked land_now candidate first');
+  assert(items.filter((item) => item.status === 'merged').length === 1, 'Exactly one queue item is merged when the budget is one');
+  assert(items.some((item) => item.source_ref === 'feature/follow-plan-second' && item.status === 'queued'), 'The next land_now candidate stays queued for a later run once the budget is spent');
+
+  execSync(`git worktree remove "${firstPath}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${secondPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue run follow-plan defers behind work instead of auto-landing it', () => {
+  const repoDir = join(tmpdir(), `sw-queue-follow-plan-defer-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const behindPath = join(tmpdir(), `sw-queue-follow-plan-behind-${Date.now()}`);
+  execSync(`git worktree add -b feature/follow-plan-behind "${behindPath}"`, { cwd: repoDir });
+  writeFileSync(join(behindPath, 'behind.txt'), 'behind\n');
+  execSync('git add behind.txt', { cwd: behindPath });
+  execSync('git commit -m "behind candidate"', { cwd: behindPath });
+
+  writeFileSync(join(repoDir, 'main-drift.txt'), 'main drift\n');
+  execSync('git add main-drift.txt', { cwd: repoDir });
+  execSync('git commit -m "main drift"', { cwd: repoDir });
+
+  const queueDb = initDb(repoDir);
+  registerWorktree(queueDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(queueDb, { name: 'follow-plan-behind', path: behindPath, branch: 'feature/follow-plan-behind' });
+  enqueueMergeItem(queueDb, {
+    sourceType: 'branch',
+    sourceRef: 'feature/follow-plan-behind',
+    targetBranch: 'main',
+  });
+  queueDb.close();
+
+  const runJson = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'run',
+    '--json',
+    '--follow-plan',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const verifyDb = initDb(repoDir);
+  const items = listMergeQueue(verifyDb);
+  verifyDb.close();
+
+  assert(runJson.execution_policy.follow_plan === true, 'Queue run JSON records follow-plan mode for deferred runs too');
+  assert(runJson.processed.length === 0, 'Queue run does not auto-land non-land_now work in follow-plan mode');
+  assert(runJson.deferred.source_ref === 'feature/follow-plan-behind', 'Queue run reports the deferred behind item as the current focus');
+  assert(runJson.deferred.recommendation.action === 'hold', 'Queue run keeps behind work as a hold decision in follow-plan mode');
+  assert(items.some((item) => item.source_ref === 'feature/follow-plan-behind' && item.status === 'held'), 'Behind work is persisted as held rather than being auto-landed');
+
+  execSync(`git worktree remove "${behindPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Merge queue status escalates high-risk stale pipeline work instead of quietly holding it', () => {
   const repoDir = join(tmpdir(), `sw-queue-escalate-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
