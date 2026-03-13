@@ -1783,12 +1783,24 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
       };
     });
 
-  const blockedWorktrees = scanReport.unclaimedChanges.map((entry) => ({
-    worktree: entry.worktree,
-    files: entry.files,
-    reason_code: entry.reasons?.[0]?.reason_code || null,
-    next_step: nextStepForReason(entry.reasons?.[0]?.reason_code) || 'inspect the changed files and bring them back under Switchman claims',
-  }));
+  const worktreeByName = new Map((scanReport.worktrees || []).map((worktree) => [worktree.name, worktree]));
+  const blockedWorktrees = scanReport.unclaimedChanges.map((entry) => {
+    const worktreeInfo = worktreeByName.get(entry.worktree) || null;
+    const reasonCode = entry.reasons?.[0]?.reason_code || null;
+    const isDirtyWorktree = reasonCode === 'no_active_lease';
+    return {
+      worktree: entry.worktree,
+      path: worktreeInfo?.path || null,
+      files: entry.files,
+      reason_code: reasonCode,
+      next_step: isDirtyWorktree
+        ? 'commit or discard the changed files in that worktree, then rescan before continuing'
+        : (nextStepForReason(reasonCode) || 'inspect the changed files and bring them back under Switchman claims'),
+      command: worktreeInfo?.path
+        ? `cd ${JSON.stringify(worktreeInfo.path)} && git status`
+        : 'switchman scan',
+    };
+  });
 
   const fileConflicts = scanReport.fileConflicts.map((conflict) => ({
     file: conflict.file,
@@ -1838,9 +1850,9 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     ...blockedWorktrees.map((entry) => ({
       kind: 'unmanaged_changes',
       title: `${entry.worktree} has unmanaged changed files`,
-      detail: `${entry.files.slice(0, 3).join(', ')}${entry.files.length > 3 ? ` +${entry.files.length - 3} more` : ''}`,
+      detail: `${entry.files.slice(0, 3).join(', ')}${entry.files.length > 3 ? ` +${entry.files.length - 3} more` : ''}${entry.path ? ` • ${entry.path}` : ''}`,
       next_step: entry.next_step,
-      command: 'switchman scan',
+      command: entry.command,
       severity: 'block',
     })),
     ...fileConflicts.map((conflict) => ({

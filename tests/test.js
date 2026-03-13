@@ -2879,7 +2879,7 @@ test('Fix 55a: initDb records the current schema version explicitly', () => {
   const version = Object.values(row || {})[0];
   db.close();
 
-  assert(version === 5, 'New Switchman databases record schema version 5 explicitly');
+  assert(version === 6, 'New Switchman databases record schema version 6 explicitly');
 
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -3155,6 +3155,37 @@ test('Fix 3b: active file claims are unique across tasks', () => {
   ).all('src/shared.js');
   assert(claims.length === 1, 'Only one active claim exists for the file');
   uniqueDb.close();
+});
+
+test('Fix 3ba: database enforces one active claim per file even when callers bypass the pre-check', () => {
+  const repoDir = join(tmpdir(), `sw-unique-index-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const uniqueDb = initDb(repoDir);
+  const taskA = createTask(uniqueDb, { title: 'task A' });
+  const taskB = createTask(uniqueDb, { title: 'task B' });
+  assignTask(uniqueDb, taskA, 'agent-a');
+  assignTask(uniqueDb, taskB, 'agent-b');
+  const leaseA = uniqueDb.prepare(`SELECT id FROM leases WHERE task_id=? AND status='active'`).get(taskA);
+  const leaseB = uniqueDb.prepare(`SELECT id FROM leases WHERE task_id=? AND status='active'`).get(taskB);
+
+  uniqueDb.prepare(`
+    INSERT INTO file_claims (task_id, lease_id, file_path, worktree, agent)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(taskA, leaseA.id, 'src/shared.js', 'agent-a', 'codex-a');
+
+  let threw = false;
+  try {
+    uniqueDb.prepare(`
+      INSERT INTO file_claims (task_id, lease_id, file_path, worktree, agent)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(taskB, leaseB.id, 'src/shared.js', 'agent-b', 'codex-b');
+  } catch {
+    threw = true;
+  }
+
+  assert(threw, 'The database rejects a second active claim for the same file path');
+  uniqueDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Fix 3c: claiming a nonexistent task is rejected', () => {
@@ -6118,6 +6149,37 @@ test('Queue status help explains when to use it', () => {
 
   assert(helpOutput.includes('Use this when finished branches are waiting to land'), 'Queue status help explains its operator use case');
   assert(helpOutput.includes('what lands next'), 'Queue status help explains the questions it answers');
+});
+
+test('Fix 55f: status points dirty worktrees at the exact worktree path and git fix flow', () => {
+  const repoDir = join(tmpdir(), `sw-status-dirty-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  db.close();
+
+  writeFileSync(join(repoDir, 'dirty.txt'), 'needs commit\n');
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const renderedRepoDir = realpathSync(repoDir);
+  assert(textOutput.includes(`Run next: cd ${JSON.stringify(renderedRepoDir)} && git status`), 'Dirty-worktree status points at the exact worktree path to inspect');
+  assert(textOutput.includes('commit or discard the changed files in that worktree'), 'Dirty-worktree status explains the fix instead of only saying to rescan');
+
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Pipeline status help explains when to use it', () => {

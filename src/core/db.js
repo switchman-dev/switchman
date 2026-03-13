@@ -14,7 +14,7 @@ const SWITCHMAN_DIR = '.switchman';
 const DB_FILE = 'switchman.db';
 const AUDIT_KEY_FILE = 'audit.key';
 const MIGRATION_STATE_FILE = 'migration-state.json';
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 
 // How long (ms) a writer will wait for a lock before giving up.
 // 5 seconds is generous for a CLI tool with 3-10 concurrent agents.
@@ -524,6 +524,24 @@ function applySchemaVersion5(db) {
   `);
 }
 
+function applySchemaVersion6(db) {
+  db.exec(`
+    UPDATE file_claims
+    SET released_at = COALESCE(released_at, datetime('now'))
+    WHERE released_at IS NULL
+      AND id NOT IN (
+        SELECT MIN(id)
+        FROM file_claims
+        WHERE released_at IS NULL
+        GROUP BY file_path
+      );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_file_claims_active_path
+      ON file_claims(file_path)
+      WHERE released_at IS NULL;
+  `);
+}
+
 function ensureSchemaMigrated(db) {
   const repoRoot = db.__switchmanRepoRoot;
   if (!repoRoot) {
@@ -571,6 +589,9 @@ function ensureSchemaMigrated(db) {
       }
       if (currentVersion < 5) {
         applySchemaVersion5(db);
+      }
+      if (currentVersion < 6) {
+        applySchemaVersion6(db);
       }
       setSchemaVersion(db, CURRENT_SCHEMA_VERSION);
     });
@@ -2746,7 +2767,18 @@ export function claimFiles(db, taskId, worktree, filePaths, agent) {
         throw new Error('One or more files are already actively claimed by another task.');
       }
 
-      insert.run(taskId, lease.id, normalizedPath, worktree, agent || null);
+      try {
+        insert.run(taskId, lease.id, normalizedPath, worktree, agent || null);
+      } catch (err) {
+        const message = String(err?.message || '').toLowerCase();
+        const isActiveClaimConstraint =
+          message.includes('idx_file_claims_active_path')
+          || (message.includes('unique') && message.includes('file_claims'));
+        if (isActiveClaimConstraint) {
+          throw new Error('One or more files are already actively claimed by another task.');
+        }
+        throw err;
+      }
       activeClaimByPath.set(normalizedPath, {
         task_id: taskId,
         lease_id: lease.id,
