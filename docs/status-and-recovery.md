@@ -43,8 +43,9 @@ switchman gate ci
 ### A file claim is blocked
 
 - another task already owns that file
-- do not use `--force`
+- do not use `--force` as a shortcut
 - choose a different file or let the other task finish first
+- only use `--force` if you have already confirmed the existing claim is stale or invalid and you are doing manual recovery on purpose
 
 ### A task is still in progress but the agent is gone
 

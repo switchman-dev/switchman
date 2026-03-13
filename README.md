@@ -2,9 +2,12 @@
 
 **Run 10+ agents on one codebase. Safely.**
 
-Switchman acts like a project manager for your AI coding assistants. It hands out tasks, stops agents from editing the same file at the same time, and double-checks their work before saving.
+[![CI](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml/badge.svg)](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/switchman-dev.svg)](https://www.npmjs.com/package/switchman-dev)
 
-When you run multiple agents on the same repo, they need shared coordination or they collide, duplicate work, and create risky merges. Switchman gives them leases, scoped ownership, merge gates, and landing workflows so they can move in parallel without stepping on each other.
+Switchman is the coordination and governance layer for AI-native software teams. It helps you plan work, route tasks across agents, prevent overlap, and land changes safely instead of stitching parallel output back together by hand.
+
+When you run multiple agents on the same repo, they need shared coordination or they collide, duplicate work, and create risky merges. Switchman gives them leases, scoped ownership, policy gates, queue planning, and governed landing workflows so they can move in parallel without stepping on each other.
 
 In the docs, `workspace` means the folder each agent works in. Some commands still use the Git term `worktree`, because that is the underlying Git feature.
 
@@ -16,8 +19,12 @@ Requirements:
 - Node.js 22.5+
 - Git 2.5+
 
+Why Node 22.5+?
+- Switchman uses the built-in `node:sqlite` runtime support for its repo-local coordination database.
+- Keeping that dependency in the Node runtime makes install and recovery simpler, but it currently means targeting newer Node releases on purpose.
+
 ```bash
-npm install -g @switchman-dev
+npm install -g switchman-dev
 ```
 
 ## 2 minute proof
@@ -63,15 +70,17 @@ switchman queue status
 Git worktrees, branches, and raw coding agents are useful, but they do not coordinate themselves.
 
 What it adds that plain Git does not:
+- task planning, so incoming goals can be broken into governed parallel work
 - task assignment, so agents do not duplicate work
 - file locking, so parallel edits do not quietly collide
 - live status, so you can see what is running, blocked, or stale
 - stale-work recovery, so abandoned work does not clog the repo
-- governed landing, so finished work reaches `main` one item at a time with retries and checks
+- queue intelligence, so the clearest work lands first across competing goals
+- governed landing, so finished work reaches `main` one item at a time with retries, checks, and policy enforcement
 
 In short:
 - Git gives you branches
-- Switchman gives you coordination
+- Switchman gives you coordination, governance, and a safe path to land
 
 ## Quickstart
 
@@ -94,10 +103,18 @@ switchman status --watch
 switchman gate ci
 ```
 
+If you only do three things on the first run, do these:
+1. `switchman setup --agents 5`
+2. `switchman task add "Implement auth helper" --priority 9`
+3. `switchman status --watch`
+
 What `switchman setup` gives you:
 - one shared Switchman database in `.switchman/`
 - linked workspaces for each agent
 - local MCP config for Claude Code and Cursor
+
+Current limit:
+- `switchman setup --agents` currently supports up to `10` agent workspaces in one command
 
 Fastest path to success:
 1. Use Claude Code for the first run.
@@ -111,6 +128,7 @@ If you want the recommended editor setup guide, start here:
 - [Claude Code setup](docs/setup-claude-code.md)
 
 If you want a guided demo, see [examples/README.md](examples/README.md).
+If you want the deeper multi-task planning and PR workflow, see [docs/pipelines.md](docs/pipelines.md).
 
 ## What good looks like
 
@@ -121,6 +139,79 @@ You know the first run is working when:
 - `switchman gate ci` passes cleanly
 
 That is the moment Switchman should feel different from “just using a few branches.”
+
+## Start Here
+
+If you are trying to decide where to start:
+- want the fastest proof: run `switchman demo`
+- want to wire up a real repo: run `switchman setup --agents 5`
+- want to understand blocked or stale work: run `switchman status`
+- want a longer hands-on walkthrough: open [examples/README.md](examples/README.md)
+
+## The Workflow
+
+Switchman is built for the workflow of turning multiple competing engineering goals into coordinated parallel execution and a trusted, dependency-aware path to merge.
+
+In practice, that means it helps teams:
+- break work into parallel tasks
+- assign work across agents and humans
+- stop overlapping edits early
+- detect stale or drifted work before merge chaos
+- route validation and governance follow-ups
+- decide what should land next
+- leave an audit trail of what happened and why
+
+## Real-World Walkthrough
+
+Here is what a real first team workflow can look like across several goals in one shared repo:
+
+1. Product work arrives:
+   - harden auth flows
+   - ship a schema update
+   - refresh related docs
+2. You create parallel work:
+
+```bash
+switchman setup --agents 5
+switchman task add "Harden auth middleware" --priority 9
+switchman task add "Ship schema migration" --priority 8
+switchman task add "Update auth and schema docs" --priority 6
+switchman status --watch
+```
+
+3. Agents pick up work in separate workspaces:
+   - agent1 takes auth
+   - agent2 takes the migration
+   - agent3 takes docs
+4. If two agents reach for the same file, Switchman blocks the second claim early instead of letting the overlap turn into merge cleanup later.
+5. While work is running, `switchman status` shows:
+   - what is active
+   - what is blocked
+   - what has gone stale
+   - what should land next
+6. When branches finish, queue them:
+
+```bash
+switchman queue add agent1
+switchman queue add agent2
+switchman queue add agent3
+switchman queue status
+switchman queue run --follow-plan --merge-budget 2
+```
+
+7. If a shared change invalidates another task, Switchman marks it stale and points at the exact recovery command instead of leaving the team to guess.
+8. Before merge, run the repo gate:
+
+```bash
+switchman gate ci
+```
+
+What good looks like:
+- each agent stayed in its own lane
+- overlap was blocked before wasted work spread
+- stale work was visible instead of silently wrong
+- the queue made it obvious what should land now and what should wait
+- the repo reached `main` through a governed path instead of manual merge babysitting
 
 ## Why not just use branches or worktrees?
 
@@ -133,6 +224,33 @@ They do not tell you:
 - whether finished work is still safe to land
 
 Switchman is for the point where “we can manage this by hand” stops being true.
+
+## Safety note on `--force`
+
+`switchman claim --force` exists for manual recovery, not normal operation.
+
+Legitimate use:
+- you have already confirmed the conflicting claim is stale, abandoned, or otherwise incorrect
+- you are performing operator-led cleanup and need to unblock the repo deliberately
+
+Not a legitimate use:
+- "the other agent is probably done"
+- "I just want to keep moving"
+- "we'll clean it up in the PR later"
+
+Normal path:
+1. run `switchman status`
+2. run `switchman explain claim <path>`
+3. reap or retry the stale work if needed
+4. only then use `--force` if you intentionally want to override a known-bad claim
+
+If that feels too risky, that is the point. It is meant to be an escape hatch, not a convenience flag.
+
+## Releases and changelog
+
+If you want to track what changed between versions:
+- [CHANGELOG.md](CHANGELOG.md)
+- [GitHub releases](https://github.com/switchman-dev/switchman/releases)
 
 ## Choose your setup
 
@@ -170,6 +288,15 @@ More help:
 - [Merge queue](docs/merge-queue.md)
 - [Stale lease policy](docs/stale-lease-policy.md)
 - [Telemetry](docs/telemetry.md)
+
+The most useful explain commands when something is unclear:
+
+```bash
+switchman explain claim src/auth/login.js
+switchman explain queue <item-id>
+switchman explain stale --pipeline <pipeline-id>
+switchman explain landing <pipeline-id>
+```
 
 ## Turn On PR Checks
 

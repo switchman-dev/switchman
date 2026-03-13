@@ -4845,13 +4845,14 @@ program
   .command('claim <taskId> <worktree> [files...]')
   .description('Lock files for a task before editing')
   .option('--agent <name>', 'Agent name')
-  .option('--force', 'Claim even if conflicts exist')
+  .option('--force', 'Emergency override for manual recovery when a conflicting claim is known to be stale or wrong')
   .addHelpText('after', `
 Examples:
   switchman claim task-123 agent2 src/auth.js src/server.js
   switchman claim task-123 agent2 src/auth.js --agent cursor
 
 Use this before editing files in a shared repo.
+Only use --force for operator-led recovery after checking switchman status or switchman explain claim <path>.
 `)
   .action((taskId, worktree, files, opts) => {
     if (!files.length) {
@@ -4870,7 +4871,7 @@ Use this before editing files in a shared repo.
         for (const c of conflicts) {
           console.log(`  ${chalk.yellow(c.file)} → already claimed by worktree ${chalk.cyan(c.claimedBy.worktree)} (task: ${c.claimedBy.task_title})`);
         }
-        console.log(chalk.dim('\nUse --force to claim anyway, or pick different files first.'));
+        console.log(chalk.dim('\nDo not use --force as a shortcut. Check status or explain the claim first, then only override if the existing claim is known-bad.'));
         console.log(`${chalk.yellow('next:')} switchman status`);
         process.exitCode = 1;
         return;
