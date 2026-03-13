@@ -1,6 +1,6 @@
 import { execSync } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { dirname, join, posix } from 'path';
 
 const SOURCE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx']);
 
@@ -111,21 +111,22 @@ function parseFileObjects(repoPath, filePath) {
   }));
 }
 
-function trackedFiles(repoPath) {
+export function listTrackedFiles(repoPath, { sourceOnly = false } = {}) {
   try {
     const output = execSync('git ls-files', {
       cwd: repoPath,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
-    return output.split('\n').filter(Boolean);
+    const files = output.split('\n').filter(Boolean);
+    return sourceOnly ? files.filter(isSourceLikePath) : files;
   } catch {
     return [];
   }
 }
 
 export function buildSemanticIndexForPath(repoPath, filePaths = null) {
-  const files = filePaths || trackedFiles(repoPath);
+  const files = filePaths || listTrackedFiles(repoPath);
   const objects = files
     .filter(isSourceLikePath)
     .flatMap((filePath) => parseFileObjects(repoPath, filePath))
@@ -139,6 +140,67 @@ export function buildSemanticIndexForPath(repoPath, filePaths = null) {
     generated_at: new Date().toISOString(),
     object_count: objects.length,
     objects: objects.map(({ source_text, ...object }) => object),
+  };
+}
+
+function extractImportSpecifiers(content) {
+  const specifiers = new Set();
+  const patterns = [
+    /import\s+[^'"]*?from\s+['"]([^'"]+)['"]/g,
+    /export\s+[^'"]*?from\s+['"]([^'"]+)['"]/g,
+    /require\(\s*['"]([^'"]+)['"]\s*\)/g,
+    /import\(\s*['"]([^'"]+)['"]\s*\)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      if (match[1]) specifiers.add(match[1]);
+    }
+  }
+  return [...specifiers];
+}
+
+function resolveImportTarget(filePath, specifier, trackedSourceFiles) {
+  if (!specifier || !specifier.startsWith('.')) return null;
+  const fromDir = dirname(filePath);
+  const rawTarget = posix.normalize(posix.join(fromDir === '.' ? '' : fromDir, specifier));
+  const candidates = [];
+  if ([...SOURCE_EXTENSIONS].some((ext) => rawTarget.endsWith(ext))) {
+    candidates.push(rawTarget);
+  } else {
+    for (const ext of SOURCE_EXTENSIONS) {
+      candidates.push(`${rawTarget}${ext}`);
+      candidates.push(posix.join(rawTarget, `index${ext}`));
+    }
+  }
+  return candidates.find((candidate) => trackedSourceFiles.has(candidate)) || null;
+}
+
+export function buildModuleDependencyIndexForPath(repoPath, { filePaths = null } = {}) {
+  const files = (filePaths || listTrackedFiles(repoPath, { sourceOnly: true })).filter(isSourceLikePath);
+  const trackedSourceFiles = new Set(files);
+  const dependencies = [];
+
+  for (const filePath of files) {
+    const absolutePath = join(repoPath, filePath);
+    if (!existsSync(absolutePath)) continue;
+    const content = readFileSync(absolutePath, 'utf8');
+    for (const specifier of extractImportSpecifiers(content)) {
+      const resolvedPath = resolveImportTarget(filePath, specifier, trackedSourceFiles);
+      if (!resolvedPath) continue;
+      dependencies.push({
+        file_path: filePath,
+        imported_path: resolvedPath,
+        import_specifier: specifier,
+        area: areaForPath(filePath),
+        subsystem_tags: classifySubsystems(filePath),
+      });
+    }
+  }
+
+  return {
+    generated_at: new Date().toISOString(),
+    dependency_count: dependencies.length,
+    dependencies,
   };
 }
 
@@ -227,7 +289,7 @@ function normalizeObjectRow(row) {
 }
 
 export function importCodeObjectsToStore(db, repoRoot, { filePaths = null } = {}) {
-  const files = filePaths || trackedFiles(repoRoot);
+  const files = filePaths || listTrackedFiles(repoRoot);
   const objects = files
     .filter(isSourceLikePath)
     .flatMap((filePath) => parseFileObjects(repoRoot, filePath));
@@ -308,4 +370,8 @@ export function materializeCodeObjects(db, repoRoot, { outputRoot = repoRoot } =
     file_count: files.length,
     files: files.sort(),
   };
+}
+
+export function classifySubsystemsForPath(filePath) {
+  return classifySubsystems(filePath);
 }
