@@ -2034,6 +2034,20 @@ function buildUnifiedStatusReport({
     ...(queueItems.length > 0 ? ['switchman queue status'] : []),
     ...(queueSummary.next ? ['switchman queue run'] : []),
   ].filter(Boolean);
+  const isFirstRunReady = tasks.length === 0
+    && doctorReport.active_work.length === 0
+    && queueItems.length === 0
+    && claims.length === 0;
+  const defaultNextSteps = isFirstRunReady
+    ? [
+      'add a first task with `switchman task add "Your first task" --priority 8`',
+      'keep `switchman status --watch` open while agents start work',
+      'run `switchman demo` if you want the shortest proof before using a real repo',
+    ]
+    : ['run `switchman gate ci` before merge', 'run `switchman scan` after major parallel work'];
+  const defaultSuggestedCommands = isFirstRunReady
+    ? ['switchman task add "Your first task" --priority 8', 'switchman status --watch', 'switchman demo']
+    : ['switchman gate ci', 'switchman scan'];
 
   return {
     generated_at: new Date().toISOString(),
@@ -2047,6 +2061,8 @@ function buildUnifiedStatusReport({
       ? 'Repo needs attention before more work or merge.'
       : attention.some((item) => item.severity === 'warn')
         ? 'Repo is running, but a few items need review.'
+        : isFirstRunReady
+          ? 'Switchman is set up and ready. Add a task or run the demo to start.'
         : 'Repo looks healthy. Agents are coordinated and merge checks are clear.',
     lease_policy: leasePolicy,
     counts: {
@@ -2070,10 +2086,10 @@ function buildUnifiedStatusReport({
       file_path: claim.file_path,
     })),
     next_steps: [...new Set([
-      ...doctorReport.next_steps,
+      ...(attention.length > 0 ? doctorReport.next_steps : defaultNextSteps),
       ...queueAttention.map((item) => item.next_step),
     ])].slice(0, 6),
-    suggested_commands: [...new Set(suggestedCommands)].slice(0, 6),
+    suggested_commands: [...new Set(attention.length > 0 ? suggestedCommands : defaultSuggestedCommands)].slice(0, 6),
   };
 }
 
@@ -2142,7 +2158,15 @@ function renderUnifiedStatusReport(report) {
     ? ('title' in focusItem
       ? `${focusItem.title}${focusItem.detail ? ` ${chalk.dim(`• ${focusItem.detail}`)}` : ''}`
       : `${focusItem.title} ${chalk.dim(focusItem.id)}`)
+    : report.counts.pending === 0 && report.counts.in_progress === 0 && report.queue.items.length === 0
+      ? 'Nothing active yet. Add a task or run the demo to start.'
     : 'Nothing urgent. Safe to keep parallel work moving.';
+  const primaryCommand = ('command' in (focusItem || {}) && focusItem?.command)
+    ? focusItem.command
+    : report.suggested_commands[0] || 'switchman status --watch';
+  const nextStepLine = ('next_step' in (focusItem || {}) && focusItem?.next_step)
+    ? focusItem.next_step
+    : report.next_steps[0] || 'Keep work moving and check back here if anything blocks.';
   const queueLoad = queueCounts.queued + queueCounts.retrying + queueCounts.merging + queueCounts.blocked;
   const landingLabel = report.merge_readiness.ci_gate_ok ? 'ready' : 'hold';
 
@@ -2172,7 +2196,10 @@ function renderUnifiedStatusReport(report) {
     { label: 'merging', value: queueCounts.merging, color: chalk.blue },
     { label: 'merged', value: queueCounts.merged, color: chalk.green },
   ]));
-  console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
+  console.log(`${chalk.bold('Now:')} ${report.summary}`);
+  console.log(`${chalk.bold('Attention:')} ${focusLine}`);
+  console.log(`${chalk.bold('Run next:')} ${chalk.cyan(primaryCommand)}`);
+  console.log(`${chalk.dim('why:')} ${nextStepLine}`);
   console.log(chalk.dim(`policy: ${formatRelativePolicy(report.lease_policy)} • requeue on reap ${report.lease_policy.requeue_task_on_reap ? 'on' : 'off'}`));
   if (report.merge_readiness.policy_state?.active) {
     console.log(chalk.dim(`change policy: ${report.merge_readiness.policy_state.domains.join(', ')} • ${report.merge_readiness.policy_state.enforcement} • missing ${report.merge_readiness.policy_state.missing_task_types.join(', ') || 'none'}`));
@@ -2438,13 +2465,13 @@ Examples:
       console.log(`  ${chalk.dim('landing:')} ${result.queue.processed.filter((entry) => entry.status === 'merged').length} queue item(s) merged safely`);
       console.log(`  ${chalk.dim('final gate:')} ${result.final_gate.ok ? chalk.green('clean') : chalk.red('attention needed')}`);
       console.log('');
-      console.log(chalk.bold('Try it yourself:'));
+      console.log(chalk.bold('What to do next:'));
       for (const step of result.next_steps) {
         console.log(`  ${chalk.cyan(step)}`);
       }
       if (!opts.cleanup) {
         console.log('');
-        console.log(chalk.dim('This demo repo stays on disk so you can inspect it or record it.'));
+        console.log(chalk.dim('The demo repo stays on disk so you can inspect it, record it, or keep experimenting.'));
       }
     } catch (err) {
       printErrorWithNext(err.message, 'switchman demo --json');
@@ -2575,11 +2602,11 @@ Examples:
 
       console.log('');
       console.log(chalk.bold('Next steps:'));
-      console.log(`  1. Add your tasks:`);
+      console.log(`  1. Add a first task:`);
       console.log(`     ${chalk.cyan('switchman task add "Your first task" --priority 8')}`);
-      console.log(`  2. Open Claude Code or Cursor in each folder above — the local MCP config will attach Switchman automatically`);
-      console.log(`  3. Check status at any time:`);
-      console.log(`     ${chalk.cyan('switchman status')}`);
+      console.log(`  2. Open Claude Code or Cursor in the workspaces above — the local MCP config will attach Switchman automatically`);
+      console.log(`  3. Keep the repo dashboard open while work starts:`);
+      console.log(`     ${chalk.cyan('switchman status --watch')}`);
       console.log('');
 
       const verification = collectSetupVerification(repoRoot);
@@ -3145,7 +3172,8 @@ What it helps you answer:
         ? 'warn'
         : 'healthy';
     const queueHealthColor = colorForHealth(queueHealth);
-    const focus = summary.blocked[0] || summary.retrying[0] || summary.next || null;
+    const retryingItems = items.filter((item) => item.status === 'retrying');
+    const focus = summary.blocked[0] || retryingItems[0] || summary.next || null;
     const focusLine = focus
       ? `${focus.id} ${focus.source_type}:${focus.source_ref}${focus.last_error_summary ? ` ${chalk.dim(`• ${focus.last_error_summary}`)}` : ''}`
       : 'Nothing waiting. Landing queue is clear.';

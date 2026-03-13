@@ -632,6 +632,7 @@ export function createGitWorktree(repoRoot, name, branch) {
   execSync(`git worktree add -b "${branch}" "${wtPath}"`, {
     cwd: repoRoot,
     encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
   });
   return wtPath;
 }

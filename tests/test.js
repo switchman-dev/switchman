@@ -2983,6 +2983,7 @@ test('Setup prints a first-run verification summary', () => {
   assert(output.includes('Project database'), 'Setup verification checks the project database');
   assert(output.includes('Cursor MCP'), 'Setup verification checks local editor config');
   assert(output.includes('Try next:'), 'Setup verification suggests exact next commands');
+  assert(output.includes('switchman status --watch'), 'Setup points the operator at the live status dashboard');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -5928,6 +5929,9 @@ test('Status text surfaces one front-door operator view', () => {
   });
 
   assert(textOutput.includes('switchman status'), 'Status text includes the dashboard banner');
+  assert(textOutput.includes('Now:'), 'Status text starts with a plain-language summary');
+  assert(textOutput.includes('Attention:'), 'Status text highlights the top thing to look at');
+  assert(textOutput.includes('Run next:'), 'Status text gives one exact next command near the top');
   assert(textOutput.includes('Blocked'), 'Status text includes the blocked panel');
   assert(textOutput.includes('Landing queue'), 'Status text includes merge queue visibility');
   assert(textOutput.includes('Next action'), 'Status text includes the next action panel');
@@ -5972,6 +5976,48 @@ test('Fix 28k: demo command creates a self-contained proof repo with blocked ove
   assert(existsSync(join(demoDir, 'docs', 'auth-flow.md')), 'Demo repo includes the merged docs change on main');
 
   rmSync(demoDir, { recursive: true, force: true });
+});
+
+test('Status on a fresh setup gives first-run guidance instead of generic healthy output', () => {
+  const repoDir = join(tmpdir(), `sw-status-first-run-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  db.close();
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(textOutput.includes('Nothing active yet. Add a task or run the demo to start.'), 'Fresh status explains the first useful next move');
+  assert(textOutput.includes('Now: Switchman is set up and ready. Add a task or run the demo to start.'), 'Fresh status starts with a simple first-run summary');
+  assert(textOutput.includes('Run next: switchman task add "Your first task" --priority 8'), 'Fresh status makes the first command obvious');
+  assert(textOutput.includes('switchman task add "Your first task" --priority 8'), 'Fresh status suggests adding a first task');
+  assert(textOutput.includes('switchman demo'), 'Fresh status points at the demo as the shortest proof path');
+  assert(jsonOutput.summary === 'Switchman is set up and ready. Add a task or run the demo to start.', 'Fresh status JSON uses the first-run summary');
+  assert(jsonOutput.suggested_commands.includes('switchman demo'), 'Fresh status JSON includes the demo in suggested commands');
+
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Queue status help explains when to use it', () => {
