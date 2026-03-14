@@ -16,7 +16,7 @@
  *   switchman status             - Show the repo dashboard
  */
 
-import { program } from 'commander';
+import { Help, program } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
@@ -2242,6 +2242,27 @@ function renderUnifiedStatusReport(report) {
 
   const blockedItems = report.attention.filter((item) => item.severity === 'block');
   const warningItems = report.attention.filter((item) => item.severity !== 'block');
+  const isQuietEmptyState = report.active_work.length === 0
+    && blockedItems.length === 0
+    && warningItems.length === 0
+    && report.queue.items.length === 0
+    && report.next_up.length === 0
+    && report.failed_tasks.length === 0;
+
+  if (isQuietEmptyState) {
+    console.log('');
+    console.log(healthColor('='.repeat(72)));
+    console.log(`${badge} ${chalk.bold('switchman status')} ${chalk.dim('• mission control for parallel agents')}`);
+    console.log(`${chalk.dim(report.repo_root)}`);
+    console.log(`${chalk.dim(report.summary)}`);
+    console.log(healthColor('='.repeat(72)));
+    console.log('');
+    console.log(chalk.green('Nothing is running yet.'));
+    console.log(`Add work with: ${chalk.cyan('switchman task add "Your first task" --priority 8')}`);
+    console.log(`Or prove the flow in 30 seconds with: ${chalk.cyan('switchman demo')}`);
+    console.log('');
+    return;
+  }
 
   const blockedLines = blockedItems.length > 0
     ? blockedItems.slice(0, 4).flatMap((item) => {
@@ -2530,22 +2551,71 @@ program
   .version('0.1.0');
 
 program.showHelpAfterError('(run with --help for usage examples)');
+program.configureHelp({
+  visibleCommands(cmd) {
+    const commands = Help.prototype.visibleCommands.call(this, cmd);
+    if (cmd.parent) return commands;
+    return commands.filter((command) => !command._switchmanAdvanced);
+  },
+});
 program.addHelpText('after', `
 Start here:
   switchman demo
-  switchman setup --agents 5
+  switchman setup --agents 3
+  switchman task add "Your task" --priority 8
   switchman status --watch
   switchman gate ci
+  switchman queue run
 
-Most useful commands:
-  switchman task add "Implement auth helper" --priority 9
-  switchman lease next --json
-  switchman queue run --watch
+For you (the operator):
+  switchman demo
+  switchman setup
+  switchman status
+  switchman repair
+  switchman scan
+  switchman queue run
+  switchman gate ci
+
+For your agents (via CLAUDE.md or MCP):
+  switchman lease next
+  switchman claim
+  switchman task done
+  switchman write
+  switchman wrap
 
 Docs:
   README.md
-  docs/setup-cursor.md
+  docs/setup-claude-code.md
+
+Power tools:
+  switchman advanced --help
 `);
+
+const advancedCmd = program
+  .command('advanced')
+  .description('Show advanced, experimental, and power-user command groups')
+  .addHelpText('after', `
+Advanced operator commands:
+  switchman pipeline <...>
+  switchman audit <...>
+  switchman policy <...>
+  switchman monitor <...>
+  switchman repair
+
+Experimental commands:
+  switchman semantic <...>
+  switchman object <...>
+
+Compatibility aliases:
+  switchman doctor
+
+Tip:
+  The main help keeps the day-one workflow small on purpose.
+`)
+  .action(() => {
+    advancedCmd.outputHelp();
+  });
+advancedCmd._switchmanAdvanced = false;
 
 program
   .command('demo')
@@ -2737,8 +2807,11 @@ Examples:
       console.log(`  2. Open Claude Code or Cursor in the workspaces above — the local MCP config will attach Switchman automatically`);
       console.log(`  3. Keep the repo dashboard open while work starts:`);
       console.log(`     ${chalk.cyan('switchman status --watch')}`);
+      console.log(`  4. Run the final check and land finished work:`);
+      console.log(`     ${chalk.cyan('switchman gate ci')}`);
+      console.log(`     ${chalk.cyan('switchman queue run')}`);
       if (opts.monitor) {
-        console.log(`  4. Watch for rogue edits or direct writes in real time:`);
+        console.log(`  5. Watch for rogue edits or direct writes in real time:`);
         console.log(`     ${chalk.cyan('switchman monitor status')}`);
       }
       console.log('');
@@ -2784,6 +2857,16 @@ Use this after setup or whenever editor/config wiring feels off.
       next_step_count: report.next_steps.length,
     }, { homeDir: opts.home || null });
     if (!report.ok) process.exitCode = 1;
+  });
+
+program
+  .command('upgrade')
+  .description('See Switchman upgrade options and paid plan details')
+  .action(() => {
+    console.log(chalk.bold('Switchman upgrade'));
+    console.log('');
+    console.log('Explore paid plans and team features at:');
+    console.log(`  ${chalk.cyan('https://switchman.dev/pro')}`);
   });
 
 
@@ -3305,6 +3388,15 @@ What it helps you answer:
 
     if (opts.json) {
       console.log(JSON.stringify({ items, summary, recent_events: recentEvents }, null, 2));
+      return;
+    }
+
+    if (items.length === 0) {
+      console.log('');
+      console.log(chalk.bold('switchman queue status'));
+      console.log('');
+      console.log('Queue is empty.');
+      console.log(`Add finished work with: ${chalk.cyan('switchman queue add --worktree agent1')}`);
       return;
     }
 
@@ -3902,6 +3994,7 @@ explainCmd
 // ── pipeline ──────────────────────────────────────────────────────────────────
 
 const pipelineCmd = program.command('pipeline').description('Create and summarize issue-to-PR execution pipelines');
+pipelineCmd._switchmanAdvanced = true;
 pipelineCmd.addHelpText('after', `
 Examples:
   switchman pipeline start "Harden auth API permissions"
@@ -5303,12 +5396,14 @@ program
   .description('Show one dashboard view of what is running, blocked, and ready next')
   .option('--json', 'Output raw JSON')
   .option('--watch', 'Keep refreshing status in the terminal')
+  .option('--repair', 'Repair safe interrupted queue and pipeline state before rendering status')
   .option('--watch-interval-ms <n>', 'Polling interval for --watch mode', '2000')
   .option('--max-cycles <n>', 'Maximum refresh cycles before exiting', '0')
   .addHelpText('after', `
 Examples:
   switchman status
   switchman status --watch
+  switchman status --repair
   switchman status --json
 
 Use this first when the repo feels stuck.
@@ -5326,12 +5421,31 @@ Use this first when the repo feels stuck.
         console.clear();
       }
 
+      let repairResult = null;
+      if (opts.repair) {
+        const repairDb = getDb(repoRoot);
+        try {
+          repairResult = repairRepoState(repairDb, repoRoot);
+        } finally {
+          repairDb.close();
+        }
+      }
+
       const report = await collectStatusSnapshot(repoRoot);
       cycles += 1;
 
       if (opts.json) {
-        console.log(JSON.stringify(watch ? { ...report, watch: true, cycles } : report, null, 2));
+        const payload = watch ? { ...report, watch: true, cycles } : report;
+        console.log(JSON.stringify(opts.repair ? { ...payload, repair: repairResult } : payload, null, 2));
       } else {
+        if (opts.repair && repairResult) {
+          printRepairSummary(repairResult, {
+            repairedHeading: `${chalk.green('✓')} Repaired safe interrupted repo state before rendering status`,
+            noRepairHeading: `${chalk.green('✓')} No repo repair action needed before rendering status`,
+            limit: 6,
+          });
+          console.log('');
+        }
         renderUnifiedStatusReport(report);
         if (watch) {
           const signature = buildWatchSignature(report);
@@ -5399,9 +5513,11 @@ program
     }
   });
 
-program
+const doctorCmd = program
   .command('doctor')
-  .description('Show one operator-focused health view: what is running, what is blocked, and what to do next')
+  .description('Show one operator-focused health view: what is running, what is blocked, and what to do next');
+doctorCmd._switchmanAdvanced = true;
+doctorCmd
   .option('--repair', 'Repair safe interrupted queue and pipeline state before reporting health')
   .option('--json', 'Output raw JSON')
   .addHelpText('after', `
@@ -5539,6 +5655,7 @@ Examples:
 `);
 
 const auditCmd = program.command('audit').description('Inspect and verify the tamper-evident audit trail');
+auditCmd._switchmanAdvanced = true;
 
 auditCmd
   .command('change <pipelineId>')
@@ -5861,6 +5978,7 @@ gateCmd
 const semanticCmd = program
   .command('semantic')
   .description('Inspect or materialize the derived semantic code-object view');
+semanticCmd._switchmanAdvanced = true;
 
 semanticCmd
   .command('materialize')
@@ -5877,6 +5995,7 @@ semanticCmd
 const objectCmd = program
   .command('object')
   .description('Experimental object-source mode backed by canonical exported code objects');
+objectCmd._switchmanAdvanced = true;
 
 objectCmd
   .command('import')
@@ -5958,6 +6077,7 @@ objectCmd
 // ── monitor ──────────────────────────────────────────────────────────────────
 
 const monitorCmd = program.command('monitor').description('Observe workspaces for runtime file changes');
+monitorCmd._switchmanAdvanced = true;
 
 monitorCmd
   .command('once')
@@ -6134,6 +6254,7 @@ program
 // ── policy ───────────────────────────────────────────────────────────────────
 
 const policyCmd = program.command('policy').description('Manage enforcement and change-governance policy');
+policyCmd._switchmanAdvanced = true;
 
 policyCmd
   .command('init')

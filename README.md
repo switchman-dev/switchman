@@ -95,22 +95,20 @@ Recommended first run:
 
 ```bash
 cd my-project
-switchman setup --agents 5
-switchman verify-setup
-
+switchman demo
+switchman setup --agents 3
 switchman task add "Implement auth helper" --priority 9
-switchman task add "Add auth tests" --priority 8
-switchman task add "Update auth docs" --priority 7
-
-switchman status
 switchman status --watch
 switchman gate ci
+switchman queue run
 ```
 
-If you only do three things on the first run, do these:
-1. `switchman setup --agents 5`
-2. `switchman task add "Implement auth helper" --priority 9`
-3. `switchman status --watch`
+If you only do five things on the first run, do these:
+1. `switchman demo`
+2. `switchman setup --agents 3`
+3. `switchman task add "Implement auth helper" --priority 9`
+4. `switchman status --watch`
+5. `switchman gate ci && switchman queue run`
 
 What `switchman setup` gives you:
 - one shared Switchman database in `.switchman/`
@@ -124,9 +122,10 @@ Fastest path to success:
 1. Use Claude Code for the first run.
 2. Run `switchman verify-setup` once so editor wiring is confirmed before you start.
 3. Open one Claude Code window per generated workspace.
-4. Let each agent pick up one clearly separate task.
-5. Keep `switchman status --watch` open in another terminal.
-6. Run `switchman gate ci` when the tasks finish.
+4. Add clear tasks before the agents start.
+5. Let each agent pick up one clearly separate task.
+6. Keep `switchman status --watch` open in another terminal.
+7. Run `switchman gate ci`, then `switchman queue run`, when the tasks finish.
 
 If you want the recommended editor setup guide, start here:
 - [Claude Code setup](docs/setup-claude-code.md)
@@ -148,9 +147,20 @@ That is the moment Switchman should feel different from “just using a few bran
 
 If you are trying to decide where to start:
 - want the fastest proof: run `switchman demo`
-- want to wire up a real repo: run `switchman setup --agents 5`
+- want to wire up a real repo: run `switchman setup --agents 3`
+- want to add real work: run `switchman task add "Your task" --priority 8`
 - want to understand blocked or stale work: run `switchman status`
 - want a longer hands-on walkthrough: open [examples/README.md](examples/README.md)
+
+## Enforcement Gateway
+
+Switchman is strongest when agents write through the governed gateway instead of editing files directly.
+
+- MCP agents should prefer `switchman_write_file`, `switchman_append_file`, `switchman_make_directory`, `switchman_move_path`, and `switchman_remove_path`
+- CLI operators can use `switchman write` and `switchman wrap` for governed writes and wrapped commands
+- `switchman monitor` is started automatically by `switchman setup` unless you opt out, so rogue edits are detected in the background
+
+That closes the gap between "please follow the claiming protocol" and "Switchman can actually catch ungoverned writes when something goes wrong."
 
 ## The Workflow
 

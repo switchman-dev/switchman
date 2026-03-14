@@ -6168,9 +6168,10 @@ test('CLI help includes examples for the main entrypoint', () => {
   });
 
   assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
-  assert(helpOutput.includes('switchman demo'), 'Top-level help includes the shortest proof command');
-  assert(helpOutput.includes('switchman status --watch'), 'Top-level help includes a practical status example');
-  assert(helpOutput.includes('docs/setup-cursor.md'), 'Top-level help points users to the recommended setup guide');
+  assert(helpOutput.includes('For you (the operator):'), 'Top-level help includes an operator section');
+  assert(helpOutput.includes('For your agents (via CLAUDE.md or MCP):'), 'Top-level help includes an agent section');
+  assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the missing add-task first-run step');
+  assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
 });
 
 test('Fix 28k: demo command creates a self-contained proof repo with blocked overlap and safe landing', () => {
@@ -6229,9 +6230,8 @@ test('Status on a fresh setup gives first-run guidance instead of generic health
     encoding: 'utf8',
   }));
 
-  assert(textOutput.includes('Nothing active yet. Add a task or run the demo to start.'), 'Fresh status explains the first useful next move');
-  assert(textOutput.includes('Now: Switchman is set up and ready. Add a task or run the demo to start.'), 'Fresh status starts with a simple first-run summary');
-  assert(textOutput.includes('Run next: switchman task add "Your first task" --priority 8'), 'Fresh status makes the first command obvious');
+  assert(textOutput.includes('Nothing is running yet.'), 'Fresh status collapses to a quiet empty state');
+  assert(textOutput.includes('Add work with: switchman task add "Your first task" --priority 8'), 'Fresh status makes the first command obvious');
   assert(textOutput.includes('switchman task add "Your first task" --priority 8'), 'Fresh status suggests adding a first task');
   assert(textOutput.includes('switchman demo'), 'Fresh status points at the demo as the shortest proof path');
   assert(jsonOutput.summary === 'Switchman is set up and ready. Add a task or run the demo to start.', 'Fresh status JSON uses the first-run summary');
@@ -6253,6 +6253,35 @@ test('Queue status help explains when to use it', () => {
 
   assert(helpOutput.includes('Use this when finished branches are waiting to land'), 'Queue status help explains its operator use case');
   assert(helpOutput.includes('what lands next'), 'Queue status help explains the questions it answers');
+});
+
+test('Queue status collapses to one clear empty-state next step when nothing is queued', () => {
+  const repoDir = join(tmpdir(), `sw-queue-empty-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  db.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'queue',
+    'status',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('Queue is empty.'), 'Queue status explains the empty state plainly');
+  assert(output.includes('switchman queue add --worktree agent1'), 'Queue status gives one exact next step when empty');
+
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Fix 55f: status points dirty worktrees at the exact worktree path and git fix flow', () => {

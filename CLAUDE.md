@@ -54,6 +54,17 @@ Implement the task. Make commits as normal. Other agents will avoid your claimed
 
 If you discover mid-task that you need to edit additional files, call `switchman_task_claim` again for those files before editing them.
 
+When MCP write tools are available, prefer the Switchman enforcement gateway over native file writes:
+```text
+switchman_write_file(...)
+switchman_append_file(...)
+switchman_make_directory(...)
+switchman_move_path(...)
+switchman_remove_path(...)
+```
+
+These tools validate your active lease and claimed paths before changing the filesystem. Use native file writes only when the Switchman write tools are unavailable and you have already claimed the path.
+
 ### 4. End of session — mark complete or failed
 
 **On success:**
