@@ -2964,6 +2964,10 @@ taskCmd
         console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} was already marked done — no new changes were recorded`);
         return;
       }
+      if (result?.status === 'failed') {
+        console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} is currently failed — retry it before marking it done again`);
+        return;
+      }
       console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
     } catch (err) {
       console.error(chalk.red(err.message));

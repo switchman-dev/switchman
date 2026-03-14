@@ -3062,6 +3062,34 @@ test('Fix 1d: CLI task done warns clearly when the task was already completed', 
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 1e: CLI task done warns clearly when the task is failed', () => {
+  const repoDir = join(tmpdir(), `sw-task-done-failed-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Fail once' });
+  assignTask(db, taskId, 'main');
+  failTask(db, taskId, 'fixture failure');
+  db.close();
+
+  const output = execFileSync(process.execPath, [cliPath, 'task', 'done', taskId], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('currently failed'), 'task done warns when the task is failed instead of silently reporting success');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 2: SWITCHMAN_DIR constant (no stale AGENTQ_DIR)', () => {
   // Verify the database is created at the correct path using the renamed constant
   const fixDir = join(tmpdir(), `sw-const-${Date.now()}`);

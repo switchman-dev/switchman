@@ -1726,6 +1726,13 @@ export function completeTask(db, taskId) {
         task: getTaskTx(db, taskId),
       };
     }
+    if (task.status === 'failed') {
+      return {
+        ok: false,
+        status: 'failed',
+        task: getTaskTx(db, taskId),
+      };
+    }
     const activeLease = getActiveLeaseForTaskTx(db, taskId);
     finalizeTaskWithLeaseTx(db, taskId, activeLease, {
       taskStatus: 'done',
