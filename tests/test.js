@@ -208,6 +208,21 @@ test('Plan command infers repo context and can create planned tasks', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Root help keeps the front door small and points advanced users deeper', () => {
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    '--help',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('switchman plan --apply'), 'Root help includes the new planning-first start path');
+  assert(output.includes('switchman merge'), 'Root help includes the one-command merge front door');
+  assert(!output.includes('queue|land'), 'Root help hides lower-level queue commands from the day-one command list');
+  assert(output.includes('switchman advanced --help'), 'Root help points power users at advanced help');
+});
+
 test('Task assignment and status flow', () => {
   const next = getNextPendingTask(db);
   assert(next.title === 'Fix authentication bug', 'Next task is highest priority');

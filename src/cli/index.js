@@ -2839,30 +2839,41 @@ program
   .version('0.1.0');
 
 program.showHelpAfterError('(run with --help for usage examples)');
+const ROOT_HELP_COMMANDS = new Set([
+  'advanced',
+  'demo',
+  'setup',
+  'verify-setup',
+  'upgrade',
+  'plan',
+  'task',
+  'status',
+  'merge',
+  'repair',
+  'help',
+]);
 program.configureHelp({
   visibleCommands(cmd) {
     const commands = Help.prototype.visibleCommands.call(this, cmd);
     if (cmd.parent) return commands;
-    return commands.filter((command) => !command._switchmanAdvanced);
+    return commands.filter((command) => ROOT_HELP_COMMANDS.has(command.name()) && !command._switchmanAdvanced);
   },
 });
 program.addHelpText('after', `
 Start here:
   switchman demo
   switchman setup --agents 3
-  switchman task add "Your task" --priority 8
+  switchman plan --apply
   switchman status --watch
-  switchman gate ci
-  switchman queue run
+  switchman merge
 
 For you (the operator):
   switchman demo
   switchman setup
+  switchman plan
   switchman status
+  switchman merge
   switchman repair
-  switchman scan
-  switchman queue run
-  switchman gate ci
 
 For your agents (via CLAUDE.md or MCP):
   switchman lease next
