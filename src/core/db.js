@@ -1694,20 +1694,27 @@ export function createTask(db, { id, title, description, priority = 5 }) {
 }
 
 export function startTaskLease(db, taskId, worktree, agent) {
-  return withImmediateTransaction(db, () => {
-    const task = getTaskTx(db, taskId);
-    if (!task || task.status !== 'pending') {
+  try {
+    return withImmediateTransaction(db, () => {
+      const task = getTaskTx(db, taskId);
+      if (!task || task.status !== 'pending') {
+        return null;
+      }
+
+      db.prepare(`
+        UPDATE tasks
+        SET status='in_progress', worktree=?, agent=?, updated_at=datetime('now')
+        WHERE id=? AND status='pending'
+      `).run(worktree, agent || null, taskId);
+
+      return createLeaseTx(db, { taskId, worktree, agent });
+    });
+  } catch (err) {
+    if (String(err?.message || '').startsWith('Scope ownership conflict:')) {
       return null;
     }
-
-    db.prepare(`
-      UPDATE tasks
-      SET status='in_progress', worktree=?, agent=?, updated_at=datetime('now')
-      WHERE id=? AND status='pending'
-    `).run(worktree, agent || null, taskId);
-
-    return createLeaseTx(db, { taskId, worktree, agent });
-  });
+    throw err;
+  }
 }
 
 export function assignTask(db, taskId, worktree, agent) {
@@ -1815,7 +1822,13 @@ export function failLeaseTask(db, leaseId, reason) {
 export function retryTask(db, taskId, reason = null) {
   return withImmediateTransaction(db, () => {
     const task = getTaskTx(db, taskId);
-    if (!task || !['failed', 'done'].includes(task.status)) {
+    if (!task) {
+      return null;
+    }
+    const activeLease = getActiveLeaseForTaskTx(db, taskId);
+    const retryable = ['failed', 'done'].includes(task.status)
+      || (task.status === 'in_progress' && !activeLease);
+    if (!retryable) {
       return null;
     }
 
@@ -1826,7 +1839,7 @@ export function retryTask(db, taskId, reason = null) {
           agent=NULL,
           completed_at=NULL,
           updated_at=datetime('now')
-      WHERE id=? AND status IN ('failed', 'done')
+      WHERE id=? AND status IN ('failed', 'done', 'in_progress')
     `).run(taskId);
 
     logAuditEventTx(db, {

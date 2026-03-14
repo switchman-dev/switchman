@@ -4225,6 +4225,37 @@ test('Fix 10: commit gate rejects unclaimed files', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 10a: commit gate resolves the registered worktree name in linked worktrees', () => {
+  const repoDir = join(tmpdir(), `sw-gate-linked-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const linkedPath = join(tmpdir(), `sw-gate-linked-agent-${Date.now()}`);
+  execSync(`git worktree add -b feature/gate-linked "${linkedPath}"`, { cwd: repoDir });
+
+  const gateDb = initDb(repoDir);
+  registerWorktree(gateDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(gateDb, { name: 'agent1', path: linkedPath, branch: 'feature/gate-linked' });
+  const taskId = createTask(gateDb, { title: 'Linked gate' });
+  assignTask(gateDb, taskId, 'agent1');
+  mkdirSync(join(linkedPath, 'src'), { recursive: true });
+  writeFileSync(join(linkedPath, 'src', 'claimed.js'), 'ok\n');
+  claimFiles(gateDb, taskId, 'agent1', ['src/claimed.js']);
+
+  const result = runCommitGate(gateDb, repoDir, { cwd: linkedPath });
+  assert(result.ok, 'Commit gate passes for a claimed change in a linked registered worktree');
+  assert(result.worktree === 'agent1', 'Commit gate reports the registered Switchman worktree name');
+
+  gateDb.close();
+  execSync(`git worktree remove "${linkedPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 11: commit hook installer writes a pre-commit hook', () => {
   const repoDir = join(tmpdir(), `sw-hook-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -4512,17 +4543,12 @@ test('Fix 13b: overlapping scope reservations are blocked when the second lease 
     subsystem_tags: ['auth'],
   });
 
-  let threw = false;
-  try {
-    startTaskLease(scopeDb, taskB, 'agent2', 'codex');
-  } catch (err) {
-    threw = String(err.message).includes('Scope reservation conflict');
-  }
+  const leaseB = startTaskLease(scopeDb, taskB, 'agent2', 'codex');
 
   const reservations = listScopeReservations(scopeDb, { activeOnly: true });
   const taskBAfter = getTask(scopeDb, taskB);
   assert(Boolean(leaseA), 'First lease acquires its reserved scope normally');
-  assert(threw, 'Second overlapping lease is blocked at reservation time');
+  assert(!leaseB, 'Second overlapping lease is blocked at reservation time');
   assert(taskBAfter.status === 'pending', 'Task stays pending when scope reservation fails');
   assert(reservations.length >= 1 && reservations.every((reservation) => reservation.lease_id === leaseA.id), 'Only the first lease keeps active scope reservations after the conflict');
   scopeDb.close();
@@ -5635,6 +5661,42 @@ test('Fix 25db: task retry CLI resets stale completed work back to pending', () 
   const task = getTask(verifyDb, taskId);
   assert(output.includes('Reset'), 'task retry CLI reports that the task was reset');
   assert(task.status === 'pending', 'task retry CLI resets the task to pending');
+  verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 25db1: task retry can recover a stranded in-progress task with no active lease', () => {
+  const repoDir = join(tmpdir(), `sw-task-retry-in-progress-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Retry stranded in-progress task' });
+  assignTask(db, taskId, 'main');
+  const lease = getActiveLeaseForTask(db, taskId);
+  db.prepare(`UPDATE leases SET status='expired', finished_at=datetime('now') WHERE id=?`).run(lease.id);
+  db.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'task',
+    'retry',
+    taskId,
+    '--reason',
+    'recover stranded task',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const verifyDb = openDb(repoDir);
+  const task = getTask(verifyDb, taskId);
+  assert(output.includes('Reset'), 'task retry reports that the stranded in-progress task was reset');
+  assert(task.status === 'pending', 'task retry resets a stranded in-progress task to pending');
   verifyDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });

@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
 import { dirname, join, posix, relative, resolve } from 'path';
 import { execFileSync, spawnSync } from 'child_process';
 
@@ -10,6 +10,7 @@ import {
   listTasks,
   getTaskSpec,
   getWorktree,
+  listWorktrees,
   getWorktreeSnapshotState,
   replaceWorktreeSnapshotState,
   getStaleLeases,
@@ -31,6 +32,14 @@ export const COMPLIANCE_STATES = {
 const DEFAULT_ENFORCEMENT_POLICY = {
   allowed_generated_paths: [],
 };
+
+function normalizeFsPath(filePath) {
+  try {
+    return realpathSync(filePath);
+  } catch {
+    return resolve(filePath);
+  }
+}
 
 function getEnforcementPolicyPath(repoRoot) {
   return join(repoRoot, '.switchman', 'enforcement.json');
@@ -947,9 +956,16 @@ export function runCommitGate(db, repoRoot, { cwd = process.cwd(), worktreeName 
   const currentWorktree = worktreeName
     ? null
     : getCurrentWorktree(repoRoot, cwd);
+  const registeredWorktree = worktreeName
+    ? getWorktree(db, worktreeName)
+    : listWorktrees(db).find((entry) => normalizeFsPath(entry.path) === normalizeFsPath(cwd))
+      || (currentWorktree
+        ? listWorktrees(db).find((entry) => normalizeFsPath(entry.path) === normalizeFsPath(currentWorktree.path))
+        : null)
+      || null;
   const resolvedWorktree = worktreeName
-    ? { name: worktreeName, path: cwd }
-    : currentWorktree;
+    ? { name: worktreeName, path: registeredWorktree?.path || cwd }
+    : registeredWorktree || currentWorktree;
 
   if (!resolvedWorktree) {
     const result = {

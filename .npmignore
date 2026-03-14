@@ -6,3 +6,5 @@ landing/
 logo/
 *.md
 !README.md
+!CHANGELOG.md
+!CLAUDE.md
