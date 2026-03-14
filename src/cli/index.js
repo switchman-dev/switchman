@@ -24,7 +24,7 @@ import { tmpdir } from 'os';
 import { dirname, join, posix } from 'path';
 import { execSync, spawn } from 'child_process';
 
-import { cleanupCrashedLandingTempWorktrees, findRepoRoot, listGitWorktrees, createGitWorktree } from '../core/git.js';
+import { cleanupCrashedLandingTempWorktrees, createGitWorktree, findRepoRoot, getWorktreeChangedFiles, gitAssessBranchFreshness, gitBranchExists, listGitWorktrees } from '../core/git.js';
 import { matchesPathPatterns } from '../core/ignore.js';
 import {
   initDb, openDb,
@@ -47,7 +47,7 @@ import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorSt
 import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, evaluatePipelinePolicyGate, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, inferPipelineIdFromBranch, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, repairPipelineState, resumePipelineLandingRecovery, runPipeline, startPipeline, summarizePipelinePolicyState, syncPipelinePr } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus, writeGitHubPipelineLandingStatus } from '../core/ci.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
-import { buildQueueStatusSummary, resolveQueueSource, runMergeQueue } from '../core/queue.js';
+import { buildQueueStatusSummary, evaluateQueueRepoGate, resolveQueueSource, runMergeQueue } from '../core/queue.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, getChangePolicyPath, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../core/policy.js';
 import {
   captureTelemetryEvent,
@@ -2544,6 +2544,123 @@ function resolveMonitoredWorktrees(db, repoRoot) {
   });
 }
 
+function discoverMergeCandidates(db, repoRoot, { targetBranch = 'main' } = {}) {
+  const worktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
+  const activeLeases = new Set(listLeases(db, 'active').map((lease) => lease.worktree));
+  const tasks = listTasks(db);
+  const queueItems = listMergeQueue(db).filter((item) => item.status !== 'merged');
+  const alreadyQueued = new Set(queueItems.map((item) => item.source_worktree).filter(Boolean));
+
+  const eligible = [];
+  const blocked = [];
+  const skipped = [];
+
+  for (const worktree of worktrees) {
+    const doneTasks = tasks.filter((task) => task.worktree === worktree.name && task.status === 'done');
+    if (doneTasks.length === 0) {
+      skipped.push({
+        worktree: worktree.name,
+        branch: worktree.branch,
+        reason: 'no_completed_tasks',
+        summary: 'no completed tasks are assigned to this worktree yet',
+        command: `switchman task list --status done`,
+      });
+      continue;
+    }
+
+    if (!worktree.branch || worktree.branch === targetBranch) {
+      skipped.push({
+        worktree: worktree.name,
+        branch: worktree.branch || null,
+        reason: 'no_merge_branch',
+        summary: `worktree is on ${targetBranch} already`,
+        command: `switchman worktree list`,
+      });
+      continue;
+    }
+
+    if (!gitBranchExists(repoRoot, worktree.branch)) {
+      blocked.push({
+        worktree: worktree.name,
+        branch: worktree.branch,
+        reason: 'missing_branch',
+        summary: `branch ${worktree.branch} is not available in git`,
+        command: `switchman worktree sync`,
+      });
+      continue;
+    }
+
+    if (activeLeases.has(worktree.name)) {
+      blocked.push({
+        worktree: worktree.name,
+        branch: worktree.branch,
+        reason: 'active_lease',
+        summary: 'an active lease is still running in this worktree',
+        command: `switchman status`,
+      });
+      continue;
+    }
+
+    if (alreadyQueued.has(worktree.name)) {
+      skipped.push({
+        worktree: worktree.name,
+        branch: worktree.branch,
+        reason: 'already_queued',
+        summary: 'worktree is already in the landing queue',
+        command: `switchman queue status`,
+      });
+      continue;
+    }
+
+    const dirtyFiles = getWorktreeChangedFiles(worktree.path, repoRoot);
+    if (dirtyFiles.length > 0) {
+      blocked.push({
+        worktree: worktree.name,
+        branch: worktree.branch,
+        path: worktree.path,
+        files: dirtyFiles,
+        reason: 'dirty_worktree',
+        summary: `worktree has uncommitted changes: ${dirtyFiles.slice(0, 5).join(', ')}${dirtyFiles.length > 5 ? ` +${dirtyFiles.length - 5} more` : ''}`,
+        command: `cd ${JSON.stringify(worktree.path)} && git status`,
+      });
+      continue;
+    }
+
+    const freshness = gitAssessBranchFreshness(repoRoot, targetBranch, worktree.branch);
+    eligible.push({
+      worktree: worktree.name,
+      branch: worktree.branch,
+      path: worktree.path,
+      done_task_count: doneTasks.length,
+      done_task_titles: doneTasks.slice(0, 3).map((task) => task.title),
+      freshness,
+    });
+  }
+
+  return { eligible, blocked, skipped, queue_items: queueItems };
+}
+
+function printMergeDiscovery(discovery) {
+  console.log('');
+  console.log(chalk.bold(`Checking ${discovery.eligible.length + discovery.blocked.length + discovery.skipped.length} worktree(s)...`));
+
+  for (const entry of discovery.eligible) {
+    const freshness = entry.freshness?.state && entry.freshness.state !== 'unknown'
+      ? ` ${chalk.dim(`(${entry.freshness.state})`)}`
+      : '';
+    console.log(`  ${chalk.green('✓')} ${chalk.cyan(entry.worktree)}  ${chalk.dim(entry.branch)}${freshness}`);
+  }
+
+  for (const entry of discovery.blocked) {
+    console.log(`  ${chalk.yellow('!')} ${chalk.cyan(entry.worktree)}  ${chalk.dim(entry.branch || 'no branch')}  ${chalk.dim(`— ${entry.summary}`)}`);
+  }
+
+  for (const entry of discovery.skipped) {
+    if (entry.reason === 'no_completed_tasks') continue;
+    console.log(`  ${chalk.dim('·')} ${chalk.cyan(entry.worktree)}  ${chalk.dim(entry.branch || 'no branch')}  ${chalk.dim(`— ${entry.summary}`)}`);
+  }
+}
+
 // ─── Program ──────────────────────────────────────────────────────────────────
 
 program
@@ -3642,6 +3759,142 @@ Examples:
         blocked_count: aggregate.processed.filter((entry) => entry.status !== 'merged').length,
       });
     } catch (err) {
+      console.error(chalk.red(err.message));
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command('merge')
+  .description('Queue finished worktrees and land safe work through one guided front door')
+  .option('--target <branch>', 'Target branch to merge into', 'main')
+  .option('--dry-run', 'Preview mergeable work without queueing or landing anything')
+  .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Examples:
+  switchman merge
+  switchman merge --dry-run
+  switchman merge --target release
+`)
+  .action(async (opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const discovery = discoverMergeCandidates(db, repoRoot, { targetBranch: opts.target || 'main' });
+      const queued = [];
+
+      for (const entry of discovery.eligible) {
+        queued.push(enqueueMergeItem(db, {
+          sourceType: 'worktree',
+          sourceRef: entry.branch,
+          sourceWorktree: entry.worktree,
+          targetBranch: opts.target || 'main',
+          submittedBy: 'switchman merge',
+        }));
+      }
+
+      const queueItems = listMergeQueue(db);
+      const summary = buildQueueStatusSummary(queueItems, { db, repoRoot });
+      const mergeOrder = summary.recommended_sequence
+        .filter((item) => ['land_now', 'prepare_next'].includes(item.lane))
+        .map((item) => item.source_ref);
+
+      if (opts.json) {
+        if (opts.dryRun) {
+          console.log(JSON.stringify({ discovery, queued, summary, merge_order: mergeOrder, dry_run: true }, null, 2));
+          db.close();
+          return;
+        }
+
+        const gate = await evaluateQueueRepoGate(db, repoRoot);
+        const runnableCount = listMergeQueue(db).filter((item) => ['queued', 'retrying'].includes(item.status)).length;
+        const result = gate.ok
+          ? await runMergeQueue(db, repoRoot, {
+            targetBranch: opts.target || 'main',
+            maxItems: Math.max(1, runnableCount),
+            mergeBudget: Math.max(1, runnableCount),
+            followPlan: false,
+          })
+          : null;
+        console.log(JSON.stringify({ discovery, queued, summary, merge_order: mergeOrder, gate, result }, null, 2));
+        db.close();
+        return;
+      }
+
+      printMergeDiscovery(discovery);
+
+      if (discovery.blocked.length > 0) {
+        console.log('');
+        console.log(chalk.bold('Needs attention before landing:'));
+        for (const entry of discovery.blocked) {
+          console.log(`  ${chalk.yellow(entry.worktree)}: ${entry.summary}`);
+          console.log(`    ${chalk.dim('run:')} ${chalk.cyan(entry.command)}`);
+        }
+      }
+
+      if (mergeOrder.length > 0) {
+        console.log('');
+        console.log(`${chalk.bold('Merge order:')} ${mergeOrder.join(' → ')}`);
+      }
+
+      if (opts.dryRun) {
+        console.log('');
+        console.log(chalk.dim('Dry run only — nothing was landed.'));
+        db.close();
+        return;
+      }
+
+      if (discovery.eligible.length === 0) {
+        console.log('');
+        console.log(chalk.dim('No finished worktrees are ready to land yet.'));
+        console.log(`${chalk.yellow('next:')} ${chalk.cyan('switchman status')}`);
+        db.close();
+        return;
+      }
+
+      const gate = await evaluateQueueRepoGate(db, repoRoot);
+      if (!gate.ok) {
+        console.log('');
+        console.log(`${chalk.red('✗')} Merge gate blocked landing`);
+        console.log(`  ${chalk.dim(gate.summary)}`);
+        console.log(`  ${chalk.yellow('next:')} ${chalk.cyan('switchman gate ci')}`);
+        db.close();
+        return;
+      }
+
+      console.log('');
+      const runnableCount = listMergeQueue(db).filter((item) => ['queued', 'retrying'].includes(item.status)).length;
+      const result = await runMergeQueue(db, repoRoot, {
+        targetBranch: opts.target || 'main',
+        maxItems: Math.max(1, runnableCount),
+        mergeBudget: Math.max(1, runnableCount),
+        followPlan: false,
+      });
+
+      const merged = result.processed.filter((item) => item.status === 'merged');
+      for (const mergedItem of merged) {
+        console.log(`  ${chalk.green('✓')} Landed ${chalk.cyan(mergedItem.item.source_ref)} into ${chalk.bold(mergedItem.item.target_branch)}`);
+      }
+
+      if (merged.length > 0 && !result.deferred && result.processed.every((item) => item.status === 'merged')) {
+        console.log('');
+        console.log(`${chalk.green('✓')} Done. ${merged.length} worktree(s) landed cleanly.`);
+        db.close();
+        return;
+      }
+
+      const blocked = result.processed.find((item) => item.status !== 'merged')?.item || result.deferred || null;
+      if (blocked) {
+        console.log('');
+        console.log(`${chalk.yellow('!')} Landing stopped at ${chalk.cyan(blocked.source_ref)}`);
+        if (blocked.last_error_summary) console.log(`  ${chalk.dim(blocked.last_error_summary)}`);
+        if (blocked.next_action) console.log(`  ${chalk.yellow('next:')} ${blocked.next_action}`);
+      }
+
+      db.close();
+    } catch (err) {
+      db.close();
       console.error(chalk.red(err.message));
       process.exitCode = 1;
     }

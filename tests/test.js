@@ -372,6 +372,59 @@ test('Merge queue add stores a queued worktree merge item', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Merge front door queues finished worktrees and lands them cleanly', () => {
+  const repoDir = join(tmpdir(), `sw-merge-front-door-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const agent1Path = join(tmpdir(), `sw-merge-agent1-${Date.now()}`);
+  const agent2Path = join(tmpdir(), `sw-merge-agent2-${Date.now()}`);
+  execSync(`git worktree add -b feature/merge-a "${agent1Path}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature/merge-b "${agent2Path}"`, { cwd: repoDir });
+
+  execSync('mkdir -p src && printf "a\\n" > src/a.js', { cwd: agent1Path, shell: '/bin/sh' });
+  execSync('git add src/a.js', { cwd: agent1Path });
+  execSync('git commit -m "add a"', { cwd: agent1Path });
+
+  execSync('mkdir -p docs && printf "b\\n" > docs/b.md', { cwd: agent2Path, shell: '/bin/sh' });
+  execSync('git add docs/b.md', { cwd: agent2Path });
+  execSync('git commit -m "add b"', { cwd: agent2Path });
+
+  const mergeDb = initDb(repoDir);
+  registerWorktree(mergeDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(mergeDb, { name: 'agent1', path: agent1Path, branch: 'feature/merge-a' });
+  registerWorktree(mergeDb, { name: 'agent2', path: agent2Path, branch: 'feature/merge-b' });
+  const taskA = createTask(mergeDb, { title: 'Ship source file' });
+  assignTask(mergeDb, taskA, 'agent1');
+  completeTask(mergeDb, taskA);
+  const taskB = createTask(mergeDb, { title: 'Ship docs file' });
+  assignTask(mergeDb, taskB, 'agent2');
+  completeTask(mergeDb, taskB);
+  mergeDb.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'merge',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('Merge order:'), 'Merge front door previews the merge order');
+  assert(output.includes('Done. 2 worktree(s) landed cleanly.'), 'Merge front door reports a clean landing summary');
+  assert(existsSync(join(repoDir, 'src', 'a.js')), 'Merge front door lands the first worktree change onto main');
+  assert(existsSync(join(repoDir, 'docs', 'b.md')), 'Merge front door lands the second worktree change onto main');
+
+  execSync(`git worktree remove "${agent1Path}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${agent2Path}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Merge queue add materializes a synthetic landing branch for multi-branch pipelines', () => {
   const repoDir = join(tmpdir(), `sw-queue-add-pipeline-validate-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });

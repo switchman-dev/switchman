@@ -87,7 +87,7 @@ function scheduleRetryOrBlock(db, item, failure) {
   };
 }
 
-async function evaluateQueueRepoGate(db, repoRoot) {
+export async function evaluateQueueRepoGate(db, repoRoot) {
   const report = await scanAllWorktrees(db, repoRoot);
   const aiGate = await runAiMergeGate(db, repoRoot);
   const ok = report.conflicts.length === 0
