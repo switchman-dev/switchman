@@ -22,6 +22,7 @@ const BUSY_TIMEOUT_MS = 10000;
 const CLAIM_RETRY_DELAY_MS = 200;
 const CLAIM_RETRY_ATTEMPTS = 20;
 export const DEFAULT_STALE_LEASE_MINUTES = 15;
+const DB_PRUNE_RETENTION_DAYS = 30;
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -847,8 +848,8 @@ function reserveLeaseScopesTx(db, lease) {
   const conflicts = findScopeReservationConflicts(reservations, activeReservations);
   if (conflicts.length > 0) {
     const summary = conflicts[0].type === 'subsystem'
-      ? `subsystem:${conflicts[0].subsystem_tag}`
-      : `${conflicts[0].scope_pattern} overlaps ${conflicts[0].conflicting_scope_pattern}`;
+      ? `${conflicts[0].worktree} already owns subsystem:${conflicts[0].subsystem_tag}`
+      : `${conflicts[0].worktree} already owns ${conflicts[0].conflicting_scope_pattern} (requested ${conflicts[0].scope_pattern})`;
     logAuditEventTx(db, {
       eventType: 'scope_reservation_denied',
       status: 'denied',
@@ -858,7 +859,7 @@ function reserveLeaseScopesTx(db, lease) {
       leaseId: lease.id,
       details: JSON.stringify({ conflicts, summary }),
     });
-    throw new Error(`Scope reservation conflict: ${summary}`);
+    throw new Error(`Scope ownership conflict: ${summary}`);
   }
 
   const insert = db.prepare(`
@@ -1733,6 +1734,13 @@ export function completeTask(db, taskId) {
         task: getTaskTx(db, taskId),
       };
     }
+    if (task.status !== 'in_progress') {
+      return {
+        ok: false,
+        status: 'not_in_progress',
+        task: getTaskTx(db, taskId),
+      };
+    }
     const activeLease = getActiveLeaseForTaskTx(db, taskId);
     finalizeTaskWithLeaseTx(db, taskId, activeLease, {
       taskStatus: 'done',
@@ -1742,7 +1750,8 @@ export function completeTask(db, taskId) {
     });
     return {
       ok: true,
-      status: 'completed',
+      status: activeLease ? 'completed' : 'completed_without_lease',
+      had_active_lease: Boolean(activeLease),
       task: getTaskTx(db, taskId),
     };
   });
@@ -2740,6 +2749,44 @@ export function reapStaleLeases(db, staleAfterMinutes = DEFAULT_STALE_LEASE_MINU
       status: 'expired',
       failure_reason: lease.failure_reason || 'stale lease reaped',
     }));
+  });
+}
+
+export function pruneDatabaseMaintenance(db, { retentionDays = DB_PRUNE_RETENTION_DAYS } = {}) {
+  const retentionWindow = `-${Math.max(1, Number.parseInt(retentionDays, 10) || DB_PRUNE_RETENTION_DAYS)} days`;
+  return withImmediateTransaction(db, () => {
+    const releasedClaims = db.prepare(`
+      DELETE FROM file_claims
+      WHERE released_at IS NOT NULL
+        AND released_at <= datetime('now', ?)
+    `).run(retentionWindow).changes;
+
+    const releasedReservations = db.prepare(`
+      DELETE FROM scope_reservations
+      WHERE released_at IS NOT NULL
+        AND released_at <= datetime('now', ?)
+    `).run(retentionWindow).changes;
+
+    const finishedLeases = db.prepare(`
+      DELETE FROM leases
+      WHERE status != 'active'
+        AND finished_at IS NOT NULL
+        AND finished_at <= datetime('now', ?)
+    `).run(retentionWindow).changes;
+
+    const orphanedSnapshots = db.prepare(`
+      DELETE FROM worktree_snapshots
+      WHERE worktree NOT IN (
+        SELECT name FROM worktrees
+      )
+    `).run().changes;
+
+    return {
+      released_claims_pruned: releasedClaims,
+      finished_leases_pruned: finishedLeases,
+      released_scope_reservations_pruned: releasedReservations,
+      orphaned_snapshots_pruned: orphanedSnapshots,
+    };
   });
 }
 

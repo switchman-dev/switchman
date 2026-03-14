@@ -13,7 +13,7 @@ import { findRepoRoot } from '../src/core/git.js';
 import { getWorktreeChangedFiles } from '../src/core/git.js';
 import { filterIgnoredPaths, isIgnoredPath, matchesPathPatterns } from '../src/core/ignore.js';
 import { getWindsurfMcpConfigPath, upsertCursorProjectMcpConfig, upsertProjectMcpConfig, upsertWindsurfMcpConfig } from '../src/core/mcp.js';
-import { evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
+import { evaluateRepoCompliance, evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
@@ -72,6 +72,7 @@ import {
   getActiveFileClaims,
   listAuditEvents,
   logAuditEvent,
+  pruneDatabaseMaintenance,
   revokePolicyOverride,
   verifyAuditTrail,
   retryMergeQueueItem,
@@ -1213,6 +1214,27 @@ test('Fix 54h: repo repair prunes missing temporary landing worktree metadata le
   assert(repair.actions.some((action) => action.kind === 'stale_temp_worktree_pruned' && action.path.endsWith('/' + tempWorktreePath.split('/').pop())), 'Repo repair reports the pruned temp landing metadata');
   assert(!listed.includes(tempWorktreePath), 'Repo repair prunes missing temp landing worktree metadata from git');
 
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 54i: database maintenance pruning removes old released coordination rows', () => {
+  const repoDir = join(tmpdir(), `sw-prune-db-${Date.now()}`);
+  const db = initDb(repoDir);
+  const oldTimestamp = '2000-01-01 00:00:00';
+
+  db.prepare(`INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES ('task-old', 'Old task', 'done', ?, ?)`).run(oldTimestamp, oldTimestamp);
+  db.prepare(`INSERT INTO file_claims (task_id, lease_id, file_path, worktree, claimed_at, released_at) VALUES ('task-old', NULL, 'src/old.js', 'main', ?, ?)`).run(oldTimestamp, oldTimestamp);
+  db.prepare(`INSERT INTO leases (id, task_id, worktree, status, started_at, heartbeat_at, finished_at, failure_reason) VALUES ('lease-old', 'task-old', 'main', 'expired', ?, ?, ?, 'old')`).run(oldTimestamp, oldTimestamp, oldTimestamp);
+  db.prepare(`INSERT INTO scope_reservations (lease_id, task_id, worktree, ownership_level, scope_pattern, subsystem_tag, reserved_at, released_at) VALUES ('lease-old', 'task-old', 'main', 'path', 'src/**', NULL, ?, ?)`).run(oldTimestamp, oldTimestamp);
+  db.prepare(`INSERT INTO worktree_snapshots (worktree, file_path, fingerprint, observed_at) VALUES ('missing-worktree', 'src/a.js', 'fp', ?)`).run(oldTimestamp);
+
+  const result = pruneDatabaseMaintenance(db);
+
+  assert(result.released_claims_pruned === 1, 'Pruning removes old released file claims');
+  assert(result.finished_leases_pruned === 1, 'Pruning removes old finished leases');
+  assert(result.released_scope_reservations_pruned === 1, 'Pruning removes old released scope reservations');
+  assert(result.orphaned_snapshots_pruned === 1, 'Pruning removes snapshots for missing worktrees');
+  db.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -3098,6 +3120,46 @@ test('Fix 1e: CLI task done warns clearly when the task is failed', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 1ea: CLI task done warns when no active lease exists for the in-progress task', () => {
+  const repoDir = join(tmpdir(), `sw-task-done-no-lease-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Lease disappeared' });
+  assignTask(db, taskId, 'main');
+  const lease = listLeases(db, 'active')[0];
+  db.prepare(`UPDATE leases SET status='expired', finished_at=datetime('now') WHERE id=?`).run(lease.id);
+  db.close();
+
+  const output = execFileSync(process.execPath, [cliPath, 'task', 'done', taskId], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('no active lease was present'), 'task done warns when it completes an in-progress task without an active lease');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 1eb: completeTask refuses to complete a task that is not in progress', () => {
+  const repoDir = join(tmpdir(), `sw-complete-guard-${Date.now()}`);
+  const db = initDb(repoDir);
+  const taskId = createTask(db, { title: 'Still pending' });
+  const result = completeTask(db, taskId);
+
+  assert(result.status === 'not_in_progress', 'completeTask returns not_in_progress for a pending task');
+  assert(getTask(db, taskId).status === 'pending', 'Pending tasks remain pending when completeTask is called too early');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 2: SWITCHMAN_DIR constant (no stale AGENTQ_DIR)', () => {
   // Verify the database is created at the correct path using the renamed constant
   const fixDir = join(tmpdir(), `sw-const-${Date.now()}`);
@@ -3364,6 +3426,7 @@ test('Lease policy defaults load when no repo policy file exists', () => {
 
   assert(policy.stale_after_minutes === DEFAULT_LEASE_POLICY.stale_after_minutes, 'Missing lease policy falls back to the default stale timeout');
   assert(policy.reap_on_status_check === DEFAULT_LEASE_POLICY.reap_on_status_check, 'Missing lease policy falls back to the default auto-reap behavior');
+  assert(policy.reap_on_status_check === true, 'Status auto-reaping is enabled by default');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -3862,6 +3925,48 @@ test('Fix 8: worktree compliance marks unmanaged changes as non-compliant', () =
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 8d: repo compliance carries exact unclaimed files into status consumers', () => {
+  const repoDir = join(tmpdir(), `sw-enforce-status-files-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  execSync('mkdir -p src && printf "x\\n" > src/unclaimed-a.js && printf "y\\n" > src/unclaimed-b.js', { cwd: repoDir, shell: '/bin/sh' });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const report = evaluateRepoCompliance(db, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+
+  assert(report.unclaimedChanges[0].files.includes('src/unclaimed-a.js'), 'Repo compliance carries the first unclaimed file');
+  assert(report.unclaimedChanges[0].files.includes('src/unclaimed-b.js'), 'Repo compliance carries the second unclaimed file');
+  db.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 8e: worktree list shows exact non-compliant files for dirty worktrees', () => {
+  const repoDir = join(tmpdir(), `sw-worktree-list-files-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+  execSync('mkdir -p src && printf "x\\n" > src/unclaimed.js', { cwd: repoDir, shell: '/bin/sh' });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  db.close();
+
+  const output = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'worktree', 'list'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('files:'), 'Worktree list includes a files line for non-compliant worktrees');
+  assert(output.includes('src/unclaimed.js'), 'Worktree list names the exact unclaimed file');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 8b: completed claimed work remains governed for compliance checks', () => {
   const repoDir = join(tmpdir(), `sw-enforce-completed-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -4197,7 +4302,7 @@ test('Fix 13a: attaching a conflicting task scope to an active lease is rejected
       required_deliverables: ['source'],
     });
   } catch (err) {
-    threw = String(err.message).includes('Scope reservation conflict');
+    threw = String(err.message).includes('Scope ownership conflict: agent2 already owns');
   }
 
   const ownReservations = listScopeReservations(scopeDb, { taskId: ownTaskId });

@@ -37,11 +37,11 @@ import {
   createPolicyOverride, listPolicyOverrides, revokePolicyOverride,
   finishOperationJournalEntry, listOperationJournal, listTempResources, updateTempResource,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts, retryTask,
-  listAuditEvents, verifyAuditTrail,
+  listAuditEvents, pruneDatabaseMaintenance, verifyAuditTrail,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcpConfig } from '../core/mcp.js';
-import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
+import { evaluateRepoCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
 import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, evaluatePipelinePolicyGate, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, inferPipelineIdFromBranch, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, repairPipelineState, resumePipelineLandingRecovery, runPipeline, startPipeline, summarizePipelinePolicyState, syncPipelinePr } from '../core/pipeline.js';
@@ -1850,7 +1850,7 @@ function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeases, sca
     ...blockedWorktrees.map((entry) => ({
       kind: 'unmanaged_changes',
       title: `${entry.worktree} has unmanaged changed files`,
-      detail: `${entry.files.slice(0, 3).join(', ')}${entry.files.length > 3 ? ` +${entry.files.length - 3} more` : ''}${entry.path ? ` • ${entry.path}` : ''}`,
+      detail: `${entry.files.slice(0, 5).join(', ')}${entry.files.length > 5 ? ` +${entry.files.length - 5} more` : ''}${entry.path ? ` • ${entry.path}` : ''}`,
       next_step: entry.next_step,
       command: entry.command,
       severity: 'block',
@@ -2120,6 +2120,7 @@ async function collectStatusSnapshot(repoRoot) {
   const db = getDb(repoRoot);
   try {
     const leasePolicy = loadLeasePolicy(repoRoot);
+    pruneDatabaseMaintenance(db);
 
     if (leasePolicy.reap_on_status_check) {
       reapStaleLeases(db, leasePolicy.stale_after_minutes, {
@@ -3158,6 +3159,14 @@ taskCmd
       }
       if (result?.status === 'failed') {
         console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} is currently failed — retry it before marking it done again`);
+        return;
+      }
+      if (result?.status === 'not_in_progress') {
+        console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} is not currently in progress — start a lease before marking it done`);
+        return;
+      }
+      if (result?.status === 'completed_without_lease') {
+        console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} was marked done, but no active lease was present — claims were released, but inspect the worktree state`);
         return;
       }
       console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
@@ -5027,25 +5036,31 @@ wtCmd
     const db = getDb(repoRoot);
     const worktrees = listWorktrees(db);
     const gitWorktrees = listGitWorktrees(repoRoot);
-    db.close();
 
     if (!worktrees.length && !gitWorktrees.length) {
+      db.close();
       console.log(chalk.dim('No workspaces found. Run `switchman setup --agents 3` or `switchman worktree sync`.'));
       return;
     }
 
     // Show git worktrees (source of truth) annotated with db info
+    const complianceReport = evaluateRepoCompliance(db, repoRoot, gitWorktrees);
     console.log('');
     console.log(chalk.bold('Git Worktrees:'));
     for (const wt of gitWorktrees) {
       const dbInfo = worktrees.find(d => d.path === wt.path);
+      const complianceInfo = complianceReport.worktreeCompliance.find((entry) => entry.worktree === wt.name) || null;
       const agent = dbInfo?.agent ? chalk.cyan(dbInfo.agent) : chalk.dim('no agent');
       const status = dbInfo?.status ? statusBadge(dbInfo.status) : chalk.dim('unregistered');
-      const compliance = dbInfo?.compliance_state ? statusBadge(dbInfo.compliance_state) : chalk.dim('unknown');
+      const compliance = complianceInfo?.compliance_state ? statusBadge(complianceInfo.compliance_state) : dbInfo?.compliance_state ? statusBadge(dbInfo.compliance_state) : chalk.dim('unknown');
       console.log(`  ${chalk.bold(wt.name.padEnd(20))} ${status} ${compliance} branch: ${chalk.cyan(wt.branch || 'unknown')}  agent: ${agent}`);
       console.log(`    ${chalk.dim(wt.path)}`);
+      if ((complianceInfo?.unclaimed_changed_files || []).length > 0) {
+        console.log(`    ${chalk.red('files:')} ${complianceInfo.unclaimed_changed_files.slice(0, 5).join(', ')}${complianceInfo.unclaimed_changed_files.length > 5 ? ` ${chalk.dim(`+${complianceInfo.unclaimed_changed_files.length - 5} more`)}` : ''}`);
+      }
     }
     console.log('');
+    db.close();
   });
 
 wtCmd

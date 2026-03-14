@@ -4,7 +4,7 @@ import { dirname, join } from 'path';
 export const DEFAULT_LEASE_POLICY = {
   heartbeat_interval_seconds: 60,
   stale_after_minutes: 15,
-  reap_on_status_check: false,
+  reap_on_status_check: true,
   requeue_task_on_reap: true,
 };
 
