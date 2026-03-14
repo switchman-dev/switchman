@@ -223,9 +223,9 @@ test('Planner keeps API documentation updates docs-only and treats payments work
     priority: 5,
     repoRoot: repoDir,
   });
-  assert(docsPlan.tasks.length === 1, 'Docs-only planning stays as a single docs task');
-  assert(docsPlan.tasks[0].task_spec.task_type === 'docs', 'Docs-only planning creates a docs task');
-  assert(docsPlan.tasks[0].task_spec.risk_level === 'low', 'Docs-only API documentation work stays low risk');
+  assert(docsPlan.length === 1, 'Docs-only planning stays as a single docs task');
+  assert(docsPlan[0].task_spec.task_type === 'docs', 'Docs-only planning creates a docs task');
+  assert(docsPlan[0].task_spec.risk_level === 'low', 'Docs-only API documentation work stays low risk');
 
   const paymentsPlan = planPipelineTasks({
     title: 'Harden payments retries',
@@ -234,7 +234,7 @@ test('Planner keeps API documentation updates docs-only and treats payments work
     priority: 8,
     repoRoot: repoDir,
   });
-  const paymentsImplementation = paymentsPlan.tasks.find((task) => task.task_spec?.task_type === 'implementation');
+  const paymentsImplementation = paymentsPlan.find((task) => task.task_spec?.task_type === 'implementation');
   assert(paymentsImplementation, 'Payments planning creates an implementation task');
   assert(paymentsImplementation.task_spec.risk_level === 'high', 'Payments planning is treated as high risk');
   assert(paymentsImplementation.task_spec.subsystem_tags.includes('payments'), 'Payments planning tags the payments subsystem');
@@ -6520,7 +6520,7 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
   assert(helpOutput.includes('For you (the operator):'), 'Top-level help includes an operator section');
   assert(helpOutput.includes('For your agents (via CLAUDE.md or MCP):'), 'Top-level help includes an agent section');
-  assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the missing add-task first-run step');
+  assert(helpOutput.includes('switchman plan --apply'), 'Top-level help includes the planning-first first-run step');
   assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
 });
 
