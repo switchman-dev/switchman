@@ -2435,6 +2435,93 @@ function completeTaskWithRetries(repoRoot, taskId, attempts = 20) {
   throw lastError;
 }
 
+function startBackgroundMonitor(repoRoot, { intervalMs = 2000, quarantine = false } = {}) {
+  const existingState = readMonitorState(repoRoot);
+  if (existingState && isProcessRunning(existingState.pid)) {
+    return {
+      already_running: true,
+      state: existingState,
+      state_path: getMonitorStatePath(repoRoot),
+    };
+  }
+
+  const logPath = join(repoRoot, '.switchman', 'monitor.log');
+  const child = spawn(process.execPath, [
+    process.argv[1],
+    'monitor',
+    'watch',
+    '--interval-ms',
+    String(intervalMs),
+    ...(quarantine ? ['--quarantine'] : []),
+    '--daemonized',
+  ], {
+    cwd: repoRoot,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const statePath = writeMonitorState(repoRoot, {
+    pid: child.pid,
+    interval_ms: intervalMs,
+    quarantine: Boolean(quarantine),
+    log_path: logPath,
+    started_at: new Date().toISOString(),
+  });
+
+  return {
+    already_running: false,
+    state: readMonitorState(repoRoot),
+    state_path: statePath,
+  };
+}
+
+function renderMonitorEvent(event) {
+  const ownerText = event.owner_worktree
+    ? `${event.owner_worktree}${event.owner_task_id ? ` (${event.owner_task_id})` : ''}`
+    : null;
+  const claimCommand = event.task_id
+    ? `switchman claim ${event.task_id} ${event.worktree} ${event.file_path}`
+    : null;
+
+  if (event.status === 'denied') {
+    console.log(`${chalk.yellow('⚠')} ${chalk.cyan(event.worktree)} modified ${chalk.yellow(event.file_path)} without governed ownership`);
+    if (ownerText) {
+      console.log(`   ${chalk.dim('Owned by:')} ${chalk.cyan(ownerText)}${event.owner_task_title ? ` ${chalk.dim(`— ${event.owner_task_title}`)}` : ''}`);
+    }
+    if (claimCommand) {
+      console.log(`   ${chalk.dim('Run:')} ${chalk.cyan(claimCommand)}`);
+    }
+    console.log(`   ${chalk.dim('Or:')} ${chalk.cyan('switchman status')}  ${chalk.dim('to inspect current claims and blockers')}`);
+    if (event.enforcement_action) {
+      console.log(`   ${chalk.dim('Action:')} ${event.enforcement_action}`);
+    }
+    return;
+  }
+
+  const ownerSuffix = ownerText ? ` ${chalk.dim(`(${ownerText})`)}` : '';
+  console.log(`${chalk.green('✓')} ${chalk.cyan(event.worktree)} ${chalk.yellow(event.file_path)} ${chalk.dim(event.change_type)}${ownerSuffix}`);
+}
+
+function resolveMonitoredWorktrees(db, repoRoot) {
+  const registeredByPath = new Map(
+    listWorktrees(db)
+      .filter((worktree) => worktree.path)
+      .map((worktree) => [worktree.path, worktree])
+  );
+
+  return listGitWorktrees(repoRoot).map((worktree) => {
+    const registered = registeredByPath.get(worktree.path);
+    if (!registered) return worktree;
+    return {
+      ...worktree,
+      name: registered.name,
+      path: registered.path || worktree.path,
+      branch: registered.branch || worktree.branch,
+    };
+  });
+}
+
 // ─── Program ──────────────────────────────────────────────────────────────────
 
 program
@@ -2547,6 +2634,8 @@ program
   .description('One-command setup: create agent workspaces and initialise Switchman')
   .option('-a, --agents <n>', 'Number of agent workspaces to create (default: 3)', '3')
   .option('--prefix <prefix>', 'Branch prefix (default: switchman)', 'switchman')
+  .option('--no-monitor', 'Do not start the background rogue-edit monitor')
+  .option('--monitor-interval-ms <ms>', 'Polling interval for the background monitor', '2000')
   .addHelpText('after', `
 Examples:
   switchman setup --agents 5
@@ -2606,6 +2695,11 @@ Examples:
 
       const mcpConfigWrites = installMcpConfig([...new Set([repoRoot, ...created.map((wt) => wt.path)])]);
 
+      const monitorIntervalMs = Math.max(100, Number.parseInt(opts.monitorIntervalMs, 10) || 2000);
+      const monitorState = opts.monitor
+        ? startBackgroundMonitor(repoRoot, { intervalMs: monitorIntervalMs, quarantine: false })
+        : null;
+
       db.close();
 
       const label = agentCount === 1 ? 'workspace' : 'workspaces';
@@ -2625,6 +2719,17 @@ Examples:
         console.log(`  ${chalk.green('✓')} ${chalk.cyan(result.path)} ${chalk.dim(`(${status})`)}`);
       }
 
+      if (opts.monitor) {
+        console.log('');
+        console.log(chalk.bold('Monitor:'));
+        if (monitorState?.already_running) {
+          console.log(`  ${chalk.green('✓')} Background rogue-edit monitor already running ${chalk.dim(`(pid ${monitorState.state.pid})`)}`);
+        } else {
+          console.log(`  ${chalk.green('✓')} Started background rogue-edit monitor ${chalk.dim(`(pid ${monitorState?.state?.pid ?? 'unknown'})`)}`);
+        }
+        console.log(`    ${chalk.dim('interval:')} ${monitorIntervalMs}ms`);
+      }
+
       console.log('');
       console.log(chalk.bold('Next steps:'));
       console.log(`  1. Add a first task:`);
@@ -2632,6 +2737,10 @@ Examples:
       console.log(`  2. Open Claude Code or Cursor in the workspaces above — the local MCP config will attach Switchman automatically`);
       console.log(`  3. Keep the repo dashboard open while work starts:`);
       console.log(`     ${chalk.cyan('switchman status --watch')}`);
+      if (opts.monitor) {
+        console.log(`  4. Watch for rogue edits or direct writes in real time:`);
+        console.log(`     ${chalk.cyan('switchman monitor status')}`);
+      }
       console.log('');
 
       const verification = collectSetupVerification(repoRoot);
@@ -5858,7 +5967,7 @@ monitorCmd
   .action((opts) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
-    const worktrees = listGitWorktrees(repoRoot);
+    const worktrees = resolveMonitoredWorktrees(db, repoRoot);
     const result = monitorWorktreesOnce(db, repoRoot, worktrees, { quarantine: opts.quarantine });
     db.close();
 
@@ -5874,9 +5983,7 @@ monitorCmd
 
     console.log(`${chalk.green('✓')} Observed ${result.summary.total} file change(s)`);
     for (const event of result.events) {
-      const badge = event.status === 'allowed' ? chalk.green('ALLOWED') : chalk.red('DENIED ');
-      const action = event.enforcement_action ? ` ${chalk.dim(event.enforcement_action)}` : '';
-      console.log(`  ${badge} ${chalk.cyan(event.worktree)} ${chalk.yellow(event.file_path)} ${chalk.dim(event.change_type)}${event.reason_code ? ` ${chalk.dim(event.reason_code)}` : ''}${action}`);
+      renderMonitorEvent(event);
     }
   });
 
@@ -5910,14 +6017,12 @@ monitorCmd
 
     while (!stopped) {
       const db = getDb(repoRoot);
-      const worktrees = listGitWorktrees(repoRoot);
+      const worktrees = resolveMonitoredWorktrees(db, repoRoot);
       const result = monitorWorktreesOnce(db, repoRoot, worktrees, { quarantine: opts.quarantine });
       db.close();
 
       for (const event of result.events) {
-        const badge = event.status === 'allowed' ? chalk.green('ALLOWED') : chalk.red('DENIED ');
-        const action = event.enforcement_action ? ` ${chalk.dim(event.enforcement_action)}` : '';
-        console.log(`  ${badge} ${chalk.cyan(event.worktree)} ${chalk.yellow(event.file_path)} ${chalk.dim(event.change_type)}${event.reason_code ? ` ${chalk.dim(event.reason_code)}` : ''}${action}`);
+        renderMonitorEvent(event);
       }
 
       if (stopped) break;
@@ -5935,39 +6040,18 @@ monitorCmd
   .action((opts) => {
     const repoRoot = getRepo();
     const intervalMs = Number.parseInt(opts.intervalMs, 10);
-    const existingState = readMonitorState(repoRoot);
+    const state = startBackgroundMonitor(repoRoot, {
+      intervalMs,
+      quarantine: Boolean(opts.quarantine),
+    });
 
-    if (existingState && isProcessRunning(existingState.pid)) {
-      console.log(chalk.yellow(`Monitor already running with pid ${existingState.pid}`));
+    if (state.already_running) {
+      console.log(chalk.yellow(`Monitor already running with pid ${state.state.pid}`));
       return;
     }
 
-    const logPath = join(repoRoot, '.switchman', 'monitor.log');
-    const child = spawn(process.execPath, [
-      process.argv[1],
-      'monitor',
-      'watch',
-      '--interval-ms',
-      String(intervalMs),
-      ...(opts.quarantine ? ['--quarantine'] : []),
-      '--daemonized',
-    ], {
-      cwd: repoRoot,
-      detached: true,
-      stdio: 'ignore',
-    });
-    child.unref();
-
-    const statePath = writeMonitorState(repoRoot, {
-      pid: child.pid,
-      interval_ms: intervalMs,
-      quarantine: Boolean(opts.quarantine),
-      log_path: logPath,
-      started_at: new Date().toISOString(),
-    });
-
-    console.log(`${chalk.green('✓')} Started monitor pid ${chalk.cyan(String(child.pid))}`);
-    console.log(`${chalk.dim('State:')} ${statePath}`);
+    console.log(`${chalk.green('✓')} Started monitor pid ${chalk.cyan(String(state.state.pid))}`);
+    console.log(`${chalk.dim('State:')} ${state.state_path}`);
   });
 
 monitorCmd
@@ -6017,6 +6101,34 @@ monitorCmd
     console.log(`  ${chalk.dim('interval_ms')} ${state.interval_ms}`);
     console.log(`  ${chalk.dim('quarantine')} ${state.quarantine ? 'true' : 'false'}`);
     console.log(`  ${chalk.dim('started_at')} ${state.started_at}`);
+  });
+
+program
+  .command('watch')
+  .description('Watch worktrees for direct writes and rogue edits in real time')
+  .option('--interval-ms <ms>', 'Polling interval in milliseconds', '2000')
+  .option('--quarantine', 'Move or restore denied runtime changes immediately after detection')
+  .action(async (opts) => {
+    const repoRoot = getRepo();
+    const child = spawn(process.execPath, [
+      process.argv[1],
+      'monitor',
+      'watch',
+      '--interval-ms',
+      String(opts.intervalMs || '2000'),
+      ...(opts.quarantine ? ['--quarantine'] : []),
+    ], {
+      cwd: repoRoot,
+      stdio: 'inherit',
+    });
+
+    await new Promise((resolve, reject) => {
+      child.on('exit', (code) => {
+        process.exitCode = code ?? 0;
+        resolve();
+      });
+      child.on('error', reject);
+    });
   });
 
 // ── policy ───────────────────────────────────────────────────────────────────

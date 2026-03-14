@@ -6,6 +6,7 @@ import {
   getActiveFileClaims,
   getCompletedFileClaims,
   getLease,
+  getTask,
   listTasks,
   getTaskSpec,
   getWorktree,
@@ -200,12 +201,28 @@ function classifyObservedPath(db, repoRoot, worktree, filePath, options = {}) {
 
   const activeLease = activeLeases.find((lease) => lease.worktree === worktree.name) || null;
   const claim = activeClaims.find((item) => item.file_path === filePath && item.worktree === worktree.name) || null;
+  const foreignClaim = activeClaims.find((item) => item.file_path === filePath && item.worktree !== worktree.name) || null;
+  const foreignScopeOwner = findScopedLeaseOwner(db, activeLeases, filePath, activeLease?.id || null);
 
   if (!activeLease) {
-    return { status: 'denied', reason_code: 'no_active_lease', lease: null, claim };
+    return {
+      status: 'denied',
+      reason_code: 'no_active_lease',
+      lease: null,
+      claim,
+      owner_claim: foreignClaim,
+      owner_lease: foreignScopeOwner,
+    };
   }
   if (staleLeaseIds.has(activeLease.id)) {
-    return { status: 'denied', reason_code: 'lease_expired', lease: activeLease, claim };
+    return {
+      status: 'denied',
+      reason_code: 'lease_expired',
+      lease: activeLease,
+      claim,
+      owner_claim: foreignClaim,
+      owner_lease: foreignScopeOwner,
+    };
   }
   const ownership = resolveLeasePathOwnership(db, activeLease, filePath, activeClaims, activeLeases);
   if (ownership.ok) {
@@ -215,12 +232,30 @@ function classifyObservedPath(db, repoRoot, worktree, filePath, options = {}) {
       lease: activeLease,
       claim: ownership.claim ?? claim,
       ownership_type: ownership.ownership_type,
+      owner_claim: null,
+      owner_lease: null,
     };
   }
   if (matchesPathPatterns(filePath, policy.allowed_generated_paths || [])) {
-    return { status: 'allowed', reason_code: 'policy_exception_allowed', lease: activeLease, claim: null, ownership_type: 'policy' };
+    return {
+      status: 'allowed',
+      reason_code: 'policy_exception_allowed',
+      lease: activeLease,
+      claim: null,
+      ownership_type: 'policy',
+      owner_claim: null,
+      owner_lease: null,
+    };
   }
-  return { status: 'denied', reason_code: ownership.reason_code, lease: activeLease, claim: ownership.claim ?? claim, ownership_type: null };
+  return {
+    status: 'denied',
+    reason_code: ownership.reason_code,
+    lease: activeLease,
+    claim: ownership.claim ?? claim,
+    ownership_type: null,
+    owner_claim: ownership.claim ?? foreignClaim,
+    owner_lease: foreignScopeOwner,
+  };
 }
 
 function normalizeRepoPath(repoRoot, targetPath) {
@@ -853,6 +888,9 @@ export function monitorWorktreesOnce(db, repoRoot, worktrees, options = {}) {
         reason_code: classification.reason_code,
         lease_id: classification.lease?.id ?? null,
         task_id: classification.lease?.task_id ?? null,
+        owner_worktree: classification.owner_claim?.worktree || classification.owner_lease?.worktree || null,
+        owner_task_id: classification.owner_claim?.task_id || classification.owner_lease?.task_id || null,
+        owner_task_title: classification.owner_claim?.task_title || getTask(db, classification.owner_lease?.task_id || '')?.title || null,
         enforcement_action: null,
         quarantine_path: null,
       };

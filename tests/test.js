@@ -2982,9 +2982,17 @@ test('Setup prints a first-run verification summary', () => {
   assert(output.includes('First-run check:'), 'Setup prints a first-run verification section');
   assert(output.includes('Project database'), 'Setup verification checks the project database');
   assert(output.includes('Cursor MCP'), 'Setup verification checks local editor config');
+  assert(output.includes('Monitor:'), 'Setup reports the background monitor status');
   assert(output.includes('Try next:'), 'Setup verification suggests exact next commands');
   assert(output.includes('switchman status --watch'), 'Setup points the operator at the live status dashboard');
+  assert(output.includes('switchman monitor status'), 'Setup points the operator at monitor follow-up commands');
   assert(!output.includes('ExperimentalWarning'), 'Setup hides the SQLite experimental warning from first-run output');
+  const monitorState = readMonitorState(repoDir);
+  assert(Boolean(monitorState?.pid), 'Setup starts the background monitor by default');
+  if (monitorState?.pid && isProcessRunning(monitorState.pid)) {
+    process.kill(monitorState.pid, 'SIGTERM');
+    clearMonitorState(repoDir);
+  }
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -4444,6 +4452,43 @@ test('Fix 15: runtime monitor logs denied direct writes immediately', () => {
   assert(result.events[0].reason_code === 'no_active_lease', 'Denied direct write is classified correctly');
   assert(audit.some((event) => event.file_path === 'src/drift.js'), 'Denied observed write is written to the audit log');
   monitorDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 15b: monitor once explains rogue edits with ownership and exact next commands', () => {
+  const repoDir = join(tmpdir(), `sw-monitor-denied-cli-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const roguePath = join(tmpdir(), `sw-monitor-denied-cli-agent2-${Date.now()}`);
+  execSync(`git worktree add -b rogue-watch "${roguePath}"`, { cwd: repoDir });
+  const monitorDb = initDb(repoDir);
+  registerWorktree(monitorDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(monitorDb, { name: 'agent2', path: roguePath, branch: 'rogue-watch' });
+  const taskId = createTask(monitorDb, { title: 'Own auth middleware' });
+  assignTask(monitorDb, taskId, 'main');
+  claimFiles(monitorDb, taskId, 'main', ['src/auth.js']);
+  monitorWorktreesOnce(monitorDb, repoDir, [
+    { name: 'main', path: repoDir, branch: 'main' },
+    { name: 'agent2', path: roguePath, branch: 'rogue-watch' },
+  ]);
+  monitorDb.close();
+
+  execSync('mkdir -p src && printf "rogue\\n" > src/auth.js', { cwd: roguePath, shell: '/bin/sh' });
+  const output = execFileSync(process.execPath, [cliPath, 'monitor', 'once'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('agent2 modified src/auth.js without governed ownership'), 'Monitor explains the rogue edit plainly');
+  assert(output.includes(`Owned by: main (${taskId})`), 'Monitor shows the current owner of the file');
+  assert(output.includes(`switchman status`), 'Monitor suggests the status dashboard as a recovery path');
+
+  execSync(`git worktree remove "${roguePath}" --force`, { cwd: repoDir });
   rmSync(repoDir, { recursive: true, force: true });
 });
 
