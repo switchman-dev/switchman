@@ -1742,6 +1742,13 @@ export function completeTask(db, taskId) {
       };
     }
     const activeLease = getActiveLeaseForTaskTx(db, taskId);
+    if (!activeLease) {
+      return {
+        ok: false,
+        status: 'no_active_lease',
+        task: getTaskTx(db, taskId),
+      };
+    }
     finalizeTaskWithLeaseTx(db, taskId, activeLease, {
       taskStatus: 'done',
       leaseStatus: 'completed',
@@ -1750,8 +1757,8 @@ export function completeTask(db, taskId) {
     });
     return {
       ok: true,
-      status: activeLease ? 'completed' : 'completed_without_lease',
-      had_active_lease: Boolean(activeLease),
+      status: 'completed',
+      had_active_lease: true,
       task: getTaskTx(db, taskId),
     };
   });

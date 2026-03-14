@@ -17,6 +17,9 @@
     "mcp": "node src/mcp/server.js",
     "test": "NODE_NO_WARNINGS=1 node tests/test.js"
   },
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "chalk": "^5.3.0",

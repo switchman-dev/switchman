@@ -41,7 +41,7 @@ import {
   listAuditEvents, pruneDatabaseMaintenance, verifyAuditTrail,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
-import { getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcpConfig } from '../core/mcp.js';
+import { ensureProjectLocalMcpGitExcludes, getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcpConfig } from '../core/mcp.js';
 import { evaluateRepoCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, writeEnforcementPolicy } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
@@ -2978,12 +2978,16 @@ program
       }
 
       const mcpConfigWrites = installMcpConfig([...new Set([repoRoot, ...gitWorktrees.map((wt) => wt.path)])]);
+      const mcpExclude = ensureProjectLocalMcpGitExcludes(repoRoot);
 
       db.close();
       spinner.succeed(`Initialized in ${chalk.cyan(repoRoot)}`);
       console.log(chalk.dim(`  Found and registered ${gitWorktrees.length} git worktree(s)`));
       console.log(chalk.dim(`  Database: .switchman/switchman.db`));
       console.log(chalk.dim(`  MCP config: ${mcpConfigWrites.filter((result) => result.changed).length} file(s) written`));
+      if (mcpExclude.managed) {
+        console.log(chalk.dim(`  MCP excludes: ${mcpExclude.changed ? 'updated' : 'already set'} in .git/info/exclude`));
+      }
       console.log('');
       console.log(`Next steps:`);
       console.log(`  ${chalk.cyan('switchman task add "Fix the login bug"')}  — add a task`);
@@ -3063,6 +3067,7 @@ Examples:
       }
 
       const mcpConfigWrites = installMcpConfig([...new Set([repoRoot, ...created.map((wt) => wt.path)])]);
+      const mcpExclude = ensureProjectLocalMcpGitExcludes(repoRoot);
 
       const monitorIntervalMs = Math.max(100, Number.parseInt(opts.monitorIntervalMs, 10) || 2000);
       const monitorState = opts.monitor
@@ -3086,6 +3091,9 @@ Examples:
       for (const result of mcpConfigWrites) {
         const status = result.created ? 'created' : result.changed ? 'updated' : 'unchanged';
         console.log(`  ${chalk.green('✓')} ${chalk.cyan(result.path)} ${chalk.dim(`(${status})`)}`);
+      }
+      if (mcpExclude.managed) {
+        console.log(`  ${chalk.green('✓')} ${chalk.cyan(mcpExclude.path)} ${chalk.dim(`(${mcpExclude.changed ? 'updated' : 'unchanged'})`)}`);
       }
 
       if (opts.monitor) {
@@ -3569,8 +3577,8 @@ taskCmd
         console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} is not currently in progress — start a lease before marking it done`);
         return;
       }
-      if (result?.status === 'completed_without_lease') {
-        console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} was marked done, but no active lease was present — claims were released, but inspect the worktree state`);
+      if (result?.status === 'no_active_lease') {
+        console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} has no active lease — reacquire the task before marking it done`);
         return;
       }
       console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);

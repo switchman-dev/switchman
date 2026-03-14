@@ -12,7 +12,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { findRepoRoot } from '../src/core/git.js';
 import { getWorktreeChangedFiles } from '../src/core/git.js';
 import { filterIgnoredPaths, isIgnoredPath, matchesPathPatterns } from '../src/core/ignore.js';
-import { getWindsurfMcpConfigPath, upsertCursorProjectMcpConfig, upsertProjectMcpConfig, upsertWindsurfMcpConfig } from '../src/core/mcp.js';
+import { ensureProjectLocalMcpGitExcludes, getWindsurfMcpConfigPath, upsertCursorProjectMcpConfig, upsertProjectMcpConfig, upsertWindsurfMcpConfig } from '../src/core/mcp.js';
 import { evaluateRepoCompliance, evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
@@ -3238,7 +3238,7 @@ test('Fix 1e: CLI task done warns clearly when the task is failed', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Fix 1ea: CLI task done warns when no active lease exists for the in-progress task', () => {
+test('Fix 1ea: CLI task done blocks completion when no active lease exists for the in-progress task', () => {
   const repoDir = join(tmpdir(), `sw-task-done-no-lease-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   execSync('git init', { cwd: repoDir });
@@ -3261,8 +3261,11 @@ test('Fix 1ea: CLI task done warns when no active lease exists for the in-progre
     cwd: repoDir,
     encoding: 'utf8',
   });
+  const verifyDb = openDb(repoDir);
 
-  assert(output.includes('no active lease was present'), 'task done warns when it completes an in-progress task without an active lease');
+  assert(output.includes('has no active lease'), 'task done warns when the task has no active lease');
+  assert(getTask(verifyDb, taskId).status === 'in_progress', 'task done does not complete the task without an active lease');
+  verifyDb.close();
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -3954,6 +3957,24 @@ test('Fix 7: setup MCP config can be written locally without clobbering other se
 
   assert(secondConfig.mcpServers.other.command === 'other-mcp', 'Existing MCP servers are preserved');
   assert(secondConfig.mcpServers.switchman.command === 'switchman-mcp', 'Switchman MCP server is merged into existing config');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Fix 7a: setup can keep project-local MCP files out of merge paths via git excludes', () => {
+  const repoDir = join(tmpdir(), `sw-mcp-exclude-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+
+  const first = ensureProjectLocalMcpGitExcludes(repoDir);
+  const excludePath = join(repoDir, '.git', 'info', 'exclude');
+  const excludeBody = readFileSync(excludePath, 'utf8');
+  const second = ensureProjectLocalMcpGitExcludes(repoDir);
+
+  assert(first.changed, 'First MCP exclude write updates the repo-local git exclude file');
+  assert(excludeBody.includes('.mcp.json'), 'Repo-local git exclude ignores the Claude MCP config');
+  assert(excludeBody.includes('.cursor/mcp.json'), 'Repo-local git exclude ignores the Cursor MCP config');
+  assert(!second.changed, 'Second MCP exclude write is idempotent');
 
   rmSync(repoDir, { recursive: true, force: true });
 });

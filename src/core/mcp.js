@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 
 export function getSwitchmanMcpServers() {
   return {
@@ -26,7 +26,7 @@ function upsertMcpConfigFile(configPath) {
     const raw = readFileSync(configPath, 'utf8').trim();
     config = raw ? JSON.parse(raw) : {};
   } else {
-    mkdirSync(join(configPath, '..'), { recursive: true });
+    mkdirSync(dirname(configPath), { recursive: true });
   }
 
   const nextConfig = {
@@ -49,6 +49,45 @@ function upsertMcpConfigFile(configPath) {
     path: configPath,
     created,
     changed,
+  };
+}
+
+export function ensureProjectLocalMcpGitExcludes(repoRoot) {
+  const excludePath = join(repoRoot, '.git', 'info', 'exclude');
+  const requiredEntries = ['.mcp.json', '.cursor/mcp.json'];
+  let existing = '';
+
+  try {
+    if (existsSync(excludePath)) {
+      existing = readFileSync(excludePath, 'utf8');
+    } else {
+      mkdirSync(dirname(excludePath), { recursive: true });
+    }
+  } catch {
+    return {
+      path: excludePath,
+      changed: false,
+      managed: false,
+    };
+  }
+
+  const lines = existing.split('\n').map((line) => line.trim());
+  const missing = requiredEntries.filter((entry) => !lines.includes(entry));
+  if (missing.length === 0) {
+    return {
+      path: excludePath,
+      changed: false,
+      managed: true,
+    };
+  }
+
+  const prefix = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+  const next = `${existing}${prefix}${missing.join('\n')}\n`;
+  writeFileSync(excludePath, next);
+  return {
+    path: excludePath,
+    changed: true,
+    managed: true,
   };
 }
 
