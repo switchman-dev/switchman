@@ -30,7 +30,7 @@ function computeQueueRetryBackoff(item) {
   };
 }
 
-function describeQueueError(err) {
+export function describeQueueError(err) {
   const message = String(err?.stderr || err?.message || err || '').trim();
   if (/conflict/i.test(message)) {
     return {
@@ -47,6 +47,15 @@ function describeQueueError(err) {
       summary: message || 'The queued source branch no longer exists.',
       nextAction: 'Recreate the source branch or remove the queue item.',
       retryable: false,
+    };
+  }
+
+  if (/untracked working tree files would be overwritten by merge/i.test(message)) {
+    return {
+      code: 'untracked_worktree_files',
+      summary: message || 'Untracked local files would be overwritten by merge.',
+      nextAction: 'Remove or ignore the untracked files in the target worktree, then run `switchman queue retry <itemId>`. Project-local MCP files should be excluded via `.git/info/exclude` after `switchman setup`.',
+      retryable: true,
     };
   }
 

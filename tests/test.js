@@ -17,9 +17,9 @@ import { evaluateRepoCompliance, evaluateWorktreeCompliance, gatewayAppendFile, 
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
-import { buildTaskSpec } from '../src/core/planner.js';
+import { buildTaskSpec, planPipelineTasks } from '../src/core/planner.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../src/core/policy.js';
-import { resolveQueueSource, runMergeQueue } from '../src/core/queue.js';
+import { describeQueueError, resolveQueueSource, runMergeQueue } from '../src/core/queue.js';
 import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
@@ -205,6 +205,39 @@ test('Plan command infers repo context and can create planned tasks', () => {
   assert(plannedTasks.length >= 2, 'Plan apply creates multiple planned tasks');
   assert(getTaskSpec(appliedDb, plannedTasks[0].id)?.pipeline_id?.startsWith('plan-add-auth-'), 'Plan apply stores a structured task spec for created tasks');
   appliedDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Planner keeps API documentation updates docs-only and treats payments work as high risk', () => {
+  const repoDir = join(tmpdir(), `sw-plan-heuristics-${Date.now()}`);
+  mkdirSync(join(repoDir, 'docs'), { recursive: true });
+  mkdirSync(join(repoDir, 'src', 'payments'), { recursive: true });
+  writeFileSync(join(repoDir, 'README.md'), '# Planner heuristics\n');
+  writeFileSync(join(repoDir, 'docs', 'api.md'), '# API docs\n');
+  writeFileSync(join(repoDir, 'src', 'payments', 'charge.js'), 'export function charge() {}\n');
+
+  const docsPlan = planPipelineTasks({
+    title: 'Update API docs',
+    description: 'Refresh the public API documentation and README examples',
+    pipelineId: 'pipe-docs-only',
+    priority: 5,
+    repoRoot: repoDir,
+  });
+  assert(docsPlan.tasks.length === 1, 'Docs-only planning stays as a single docs task');
+  assert(docsPlan.tasks[0].task_spec.task_type === 'docs', 'Docs-only planning creates a docs task');
+  assert(docsPlan.tasks[0].task_spec.risk_level === 'low', 'Docs-only API documentation work stays low risk');
+
+  const paymentsPlan = planPipelineTasks({
+    title: 'Harden payments retries',
+    description: 'Improve payments webhook retries and billing safety checks',
+    pipelineId: 'pipe-payments-risk',
+    priority: 8,
+    repoRoot: repoDir,
+  });
+  const paymentsImplementation = paymentsPlan.tasks.find((task) => task.task_spec?.task_type === 'implementation');
+  assert(paymentsImplementation, 'Payments planning creates an implementation task');
+  assert(paymentsImplementation.task_spec.risk_level === 'high', 'Payments planning is treated as high risk');
+  assert(paymentsImplementation.task_spec.subsystem_tags.includes('payments'), 'Payments planning tags the payments subsystem');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -435,6 +468,17 @@ test('Merge queue add stores a queued worktree merge item', () => {
   assert(items[0].source_worktree === 'agent1', 'Queue item stores the queued worktree name');
   queueDb.close();
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Merge queue error classifier explains untracked local files during landing', () => {
+  const failure = describeQueueError({
+    stderr: 'error: The following untracked working tree files would be overwritten by merge:\n\t.mcp.json\nPlease move or remove them before you merge.',
+  });
+
+  assert(failure.code === 'untracked_worktree_files', 'Queue error classifier detects untracked-file merge failures');
+  assert(failure.retryable === true, 'Untracked-file merge failures are retryable after cleanup');
+  assert(failure.nextAction.includes('switchman queue retry <itemId>'), 'Queue error classifier points users at the retry command');
+  assert(failure.nextAction.includes('.git/info/exclude'), 'Queue error classifier explains the MCP exclude path');
 });
 
 test('Merge front door queues finished worktrees and lands them cleanly', () => {

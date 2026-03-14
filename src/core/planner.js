@@ -9,7 +9,7 @@ const DOMAIN_RULES = [
   { key: 'api', regex: /\b(api|endpoint|route|graphql|rest|handler)\b/i, source: ['src/api/**', 'app/api/**', 'server/api/**', 'routes/**'] },
   { key: 'schema', regex: /\b(schema|migration|database|db|sql|prisma)\b/i, source: ['db/**', 'database/**', 'migrations/**', 'prisma/**', 'schema/**', 'src/db/**'] },
   { key: 'config', regex: /\b(config|configuration|env|feature flag|settings?)\b/i, source: ['config/**', '.github/**', '.switchman/**', 'src/config/**'] },
-  { key: 'payments', regex: /\b(payment|billing|invoice|checkout|subscription|stripe)\b/i, source: ['src/payments/**', 'app/payments/**', 'lib/payments/**', 'server/payments/**'] },
+  { key: 'payments', regex: /\b(payments?|billing|invoice|checkout|subscription|stripe)\b/i, source: ['src/payments/**', 'app/payments/**', 'lib/payments/**', 'server/payments/**'] },
   { key: 'ui', regex: /\b(ui|ux|frontend|component|screen|page|layout)\b/i, source: ['src/components/**', 'src/ui/**', 'app/**', 'client/**'] },
   { key: 'infra', regex: /\b(deploy|infra|infrastructure|build|pipeline|docker|kubernetes|terraform)\b/i, source: ['infra/**', '.github/**', 'docker/**', 'scripts/**'] },
   { key: 'docs', regex: /\b(docs?|readme|documentation|integration notes)\b/i, source: ['docs/**', 'README.md'] },
@@ -154,10 +154,10 @@ function deriveSubtaskTitles(title, description) {
   const text = `${title}\n${description || ''}`.toLowerCase();
   const subtasks = [];
   const domains = detectDomains(text);
-  const highRisk = /\b(auth|payment|schema|migration|security|permission|billing)\b/.test(text);
+  const highRisk = /\b(auth|payments?|schema|migration|security|permission|billing)\b/.test(text);
 
   const docsOnly = /\b(docs?|readme|documentation)\b/.test(text)
-    && !/\b(api|auth|bug|feature|fix|refactor|schema|migration|config|build|test)\b/.test(text);
+    && !/\b(auth|bug|feature|fix|refactor|schema|migration|config|build|test|implement|route|handler|endpoint|model)\b/.test(text);
 
   if (docsOnly) {
     return [`Update docs for: ${title}`];
@@ -181,7 +181,7 @@ function deriveSubtaskTitles(title, description) {
 }
 
 function inferRiskLevel(text) {
-  if (/\b(auth|payment|schema|migration|security|permission|billing)\b/.test(text)) return 'high';
+  if (/\b(auth|payments?|schema|migration|security|permission|billing)\b/.test(text)) return 'high';
   if (/\b(api|config|deploy|build|infra)\b/.test(text)) return 'medium';
   return 'low';
 }

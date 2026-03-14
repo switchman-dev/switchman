@@ -2,6 +2,12 @@
 
 A real Express REST API used to test Switchman locally.
 
+This folder is the best place to go after `switchman demo` if you want to feel the fuller workflow:
+- multiple agents
+- one real repo
+- an intentional claim conflict
+- clean landing back through the queue
+
 ## What's in here
 
 ```
@@ -35,12 +41,23 @@ switchman demo
 
 Use the `examples/` scripts when you want a longer walkthrough you can customize or record.
 
-Make sure Switchman is installed globally first:
+Good rule of thumb:
+- want the 2-minute proof: `switchman demo`
+- want the 5-10 minute “how would a team actually use this?” version: use `examples/`
+
+Make sure Switchman is installed globally first.
+
+If you cloned the Switchman repo:
 ```bash
 npm install -g .   # from the switchman repo root
 ```
 
-Then from the switchman repo root:
+If you installed from npm instead:
+```bash
+cd "$(npm root -g)/switchman-dev"
+```
+
+Then from the Switchman package root:
 ```bash
 bash examples/setup.sh
 bash examples/demo.sh
@@ -51,6 +68,14 @@ If you want the shortest path:
 - `setup.sh` creates the repo, worktrees, and seed tasks
 - `demo.sh` is the 45-90 second recordable version
 - `walkthrough.sh` shows one complete 3-agent happy path, including a real claim conflict
+
+If you only want one script after setup, use:
+
+```bash
+bash examples/walkthrough.sh
+```
+
+That is the clearest “real workflow” version of Switchman in this repo.
 
 ## Recordable demo
 
@@ -88,6 +113,8 @@ At the end of the walkthrough, you want to see:
 - one agent blocked from claiming a file already owned by another
 - `switchman scan` showing no unclaimed changes
 - `switchman status` giving a clean overview of what happened
+
+If that all happens without confusion, the onboarding is doing its job.
 
 ## The taskapi project
 

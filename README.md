@@ -266,6 +266,25 @@ If you want to track what changed between versions:
 - [CHANGELOG.md](CHANGELOG.md)
 - [GitHub releases](https://github.com/switchman-dev/switchman/releases)
 
+## What's included today
+
+Today Switchman already includes:
+- agent worktree setup and repo verification
+- lease, claim, heartbeat, and stale-reap coordination
+- governed write gateways and a rogue-edit monitor
+- repo status, repair, queue planning, and safe landing
+- pipeline planning, execution, PR bundles, and GitHub sync
+- audit trail, change policy enforcement, and CI integration
+- MCP support for Claude Code, Cursor, and Windsurf
+
+## What's next
+
+The next product steps are:
+- a more magical zero-argument planning flow that can read richer repo and issue context
+- a clearer Pro tier with hosted team workflows and upgrade paths
+- a web dashboard for repo and landing visibility
+- a Homebrew install path for faster first-run setup
+
 ## Choose your setup
 
 Pick the guide that matches how you work:
