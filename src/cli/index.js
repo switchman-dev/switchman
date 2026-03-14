@@ -24,7 +24,7 @@ import { tmpdir } from 'os';
 import { dirname, join, posix } from 'path';
 import { execSync, spawn } from 'child_process';
 
-import { cleanupCrashedLandingTempWorktrees, createGitWorktree, findRepoRoot, getWorktreeChangedFiles, gitAssessBranchFreshness, gitBranchExists, listGitWorktrees } from '../core/git.js';
+import { cleanupCrashedLandingTempWorktrees, createGitWorktree, findRepoRoot, getWorktreeBranch, getWorktreeChangedFiles, gitAssessBranchFreshness, gitBranchExists, listGitWorktrees } from '../core/git.js';
 import { matchesPathPatterns } from '../core/ignore.js';
 import {
   initDb, openDb,
@@ -37,6 +37,7 @@ import {
   createPolicyOverride, listPolicyOverrides, revokePolicyOverride,
   finishOperationJournalEntry, listOperationJournal, listTempResources, updateTempResource,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts, retryTask,
+  upsertTaskSpec,
   listAuditEvents, pruneDatabaseMaintenance, verifyAuditTrail,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
@@ -49,6 +50,7 @@ import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCi
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, evaluateQueueRepoGate, resolveQueueSource, runMergeQueue } from '../core/queue.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, getChangePolicyPath, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../core/policy.js';
+import { planPipelineTasks } from '../core/planner.js';
 import {
   captureTelemetryEvent,
   disableTelemetry,
@@ -93,6 +95,174 @@ function getDb(repoRoot) {
     console.error(chalk.red(err.message));
     process.exit(1);
   }
+}
+
+function getOptionalDb(repoRoot) {
+  try {
+    return openDb(repoRoot);
+  } catch {
+    return null;
+  }
+}
+
+function slugifyValue(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40) || 'plan';
+}
+
+function capitalizeSentence(value) {
+  const text = String(value || '').trim();
+  if (!text) return text;
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function formatHumanList(values = []) {
+  if (values.length === 0) return '';
+  if (values.length === 1) return values[0];
+  if (values.length === 2) return `${values[0]} and ${values[1]}`;
+  return `${values.slice(0, -1).join(', ')}, and ${values[values.length - 1]}`;
+}
+
+function readPlanningFile(repoRoot, fileName, maxChars = 1200) {
+  const filePath = join(repoRoot, fileName);
+  if (!existsSync(filePath)) return null;
+  try {
+    const text = readFileSync(filePath, 'utf8').trim();
+    if (!text) return null;
+    return {
+      file: fileName,
+      text: text.slice(0, maxChars),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractMarkdownSignal(text) {
+  const lines = String(text || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const normalized = line.replace(/^#+\s*/, '').replace(/^[-*]\s+/, '').trim();
+    if (!normalized) continue;
+    if (/^switchman\b/i.test(normalized)) continue;
+    return normalized;
+  }
+  return null;
+}
+
+function deriveGoalFromBranch(branchName) {
+  const raw = String(branchName || '').replace(/^refs\/heads\//, '').trim();
+  if (!raw || ['main', 'master', 'trunk', 'develop', 'development'].includes(raw)) return null;
+  const tail = raw.split('/').pop() || raw;
+  const tokens = tail
+    .replace(/^\d+[-_]?/, '')
+    .split(/[-_]/)
+    .filter(Boolean)
+    .filter((token) => !['feature', 'feat', 'fix', 'bugfix', 'chore', 'task', 'issue', 'story', 'work'].includes(token.toLowerCase()));
+  if (tokens.length === 0) return null;
+  return capitalizeSentence(tokens.join(' '));
+}
+
+function getRecentCommitSubjects(repoRoot, limit = 6) {
+  try {
+    return execSync(`git log --pretty=%s -n ${limit}`, {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim().split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function summarizeRecentCommitContext(branchGoal, subjects) {
+  if (!subjects.length) return null;
+  const topicWords = String(branchGoal || '')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((word) => word.length >= 4);
+  const relatedCount = topicWords.length > 0
+    ? subjects.filter((subject) => {
+      const lower = subject.toLowerCase();
+      return topicWords.some((word) => lower.includes(word));
+    }).length
+    : 0;
+  const effectiveCount = relatedCount > 0 ? relatedCount : Math.min(subjects.length, 3);
+  const topicLabel = relatedCount > 0 && topicWords.length > 0 ? `${topicWords[0]}-related ` : '';
+  return `${effectiveCount} recent ${topicLabel}commit${effectiveCount === 1 ? '' : 's'}`;
+}
+
+function collectPlanContext(repoRoot, explicitGoal = null) {
+  const planningFiles = ['CLAUDE.md', 'ROADMAP.md', 'tasks.md', 'TASKS.md', 'TODO.md', 'README.md']
+    .map((fileName) => readPlanningFile(repoRoot, fileName))
+    .filter(Boolean);
+  const planningByName = new Map(planningFiles.map((entry) => [entry.file, entry]));
+  const branch = getWorktreeBranch(process.cwd()) || null;
+  const branchGoal = deriveGoalFromBranch(branch);
+  const recentCommitSubjects = getRecentCommitSubjects(repoRoot, 6);
+  const recentCommitSummary = summarizeRecentCommitContext(branchGoal, recentCommitSubjects);
+  const preferredPlanningFile = planningByName.get('CLAUDE.md')
+    || planningByName.get('tasks.md')
+    || planningByName.get('TASKS.md')
+    || planningByName.get('ROADMAP.md')
+    || planningByName.get('TODO.md')
+    || planningByName.get('README.md')
+    || null;
+  const planningSignal = preferredPlanningFile ? extractMarkdownSignal(preferredPlanningFile.text) : null;
+  const title = capitalizeSentence(explicitGoal || branchGoal || planningSignal || 'Plan the next coordinated change');
+  const descriptionParts = [];
+  if (preferredPlanningFile?.text) descriptionParts.push(preferredPlanningFile.text);
+  if (recentCommitSubjects.length > 0) descriptionParts.push(`Recent git history summary: ${recentCommitSubjects.slice(0, 3).join('; ')}.`);
+  const description = descriptionParts.join('\n\n').trim() || null;
+
+  const found = [];
+  const used = [];
+  if (branch) {
+    found.push(`branch ${branch}`);
+    if (!explicitGoal && branchGoal) used.push('branch name');
+  }
+  if (preferredPlanningFile?.file) {
+    found.push(preferredPlanningFile.file);
+    used.push(preferredPlanningFile.file);
+  }
+  if (recentCommitSummary) {
+    found.push(recentCommitSummary);
+    used.push('recent git history');
+  }
+
+  return {
+    branch,
+    title,
+    description,
+    found,
+    used: [...new Set(used)],
+  };
+}
+
+function resolvePlanningWorktrees(repoRoot, db = null) {
+  if (db) {
+    const registered = listWorktrees(db)
+      .filter((worktree) => worktree.name !== 'main' && worktree.status !== 'missing')
+      .map((worktree) => ({ name: worktree.name, path: worktree.path, branch: worktree.branch }));
+    if (registered.length > 0) return registered;
+  }
+  return listGitWorktrees(repoRoot)
+    .filter((worktree) => !worktree.isMain)
+    .map((worktree) => ({ name: worktree.name, path: worktree.path, branch: worktree.branch || null }));
+}
+
+function planTaskPriority(taskSpec = null) {
+  const taskType = taskSpec?.task_type || 'implementation';
+  if (taskType === 'implementation') return 8;
+  if (taskType === 'tests') return 7;
+  if (taskType === 'docs') return 6;
+  if (taskType === 'governance') return 6;
+  return 5;
 }
 
 function resolvePrNumberFromEnv(env = process.env) {
@@ -3121,6 +3291,112 @@ Examples:
     console.log(`  ${chalk.dim('path:')} ${chalk.cyan(result.path)}`);
     console.log(`  ${chalk.dim('open:')} Windsurf -> Settings -> Cascade -> MCP Servers`);
     console.log(`  ${chalk.dim('note:')} Windsurf reads the shared config from ${getWindsurfMcpConfigPath(opts.home)}`);
+  });
+
+
+// ── plan ──────────────────────────────────────────────────────────────────────
+
+program
+  .command('plan [goal]')
+  .description('Suggest a parallel task plan from repo context, or from an explicit goal')
+  .option('--apply', 'Create the suggested tasks in Switchman')
+  .option('--max-tasks <n>', 'Maximum number of suggested tasks', '6')
+  .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Examples:
+  switchman plan
+  switchman plan "Add authentication"
+  switchman plan --apply
+`)
+  .action((goal, opts) => {
+    const repoRoot = getRepo();
+    const db = getOptionalDb(repoRoot);
+
+    try {
+      const context = collectPlanContext(repoRoot, goal || null);
+      const planningWorktrees = resolvePlanningWorktrees(repoRoot, db);
+      const pipelineId = `plan-${slugifyValue(context.title)}-${Date.now().toString(36)}`;
+      const plannedTasks = planPipelineTasks({
+        pipelineId,
+        title: context.title,
+        description: context.description,
+        worktrees: planningWorktrees,
+        maxTasks: Math.max(1, parseInt(opts.maxTasks, 10) || 6),
+        repoRoot,
+      });
+
+      if (opts.json) {
+        const payload = {
+          title: context.title,
+          context: {
+            found: context.found,
+            used: context.used,
+            branch: context.branch,
+          },
+          planned_tasks: plannedTasks.map((task) => ({
+            id: task.id,
+            title: task.title,
+            suggested_worktree: task.suggested_worktree || null,
+            task_type: task.task_spec?.task_type || null,
+            dependencies: task.dependencies || [],
+          })),
+          apply_ready: Boolean(db),
+        };
+        console.log(JSON.stringify(payload, null, 2));
+        return;
+      }
+
+      console.log(chalk.bold('Reading repo context...'));
+      if (context.found.length > 0) {
+        console.log(`${chalk.dim('Found:')} ${context.found.join(', ')}`);
+      } else {
+        console.log(chalk.dim('Found: local repo context only'));
+      }
+      console.log('');
+      console.log(`${chalk.bold('Suggested plan based on:')} ${context.used.length > 0 ? formatHumanList(context.used) : 'available repo context'}`);
+      console.log('');
+
+      plannedTasks.forEach((task, index) => {
+        const worktreeLabel = task.suggested_worktree ? chalk.cyan(task.suggested_worktree) : chalk.dim('unassigned');
+        console.log(`  ${chalk.green('✓')} ${chalk.bold(`${index + 1}.`)} ${task.title}  ${chalk.dim('→')} ${worktreeLabel}`);
+      });
+
+      if (!opts.apply) {
+        console.log('');
+        if (!db) {
+          console.log(chalk.dim('Preview only — run `switchman setup --agents 3` first if you want Switchman to create and track these tasks.'));
+        } else {
+          console.log(chalk.dim('Preview only — rerun with `switchman plan --apply` to create these tasks.'));
+        }
+        return;
+      }
+
+      if (!db) {
+        console.log('');
+        console.log(`${chalk.red('✗')} Switchman is not set up in this repo yet.`);
+        console.log(`  ${chalk.yellow('next:')} ${chalk.cyan('switchman setup --agents 3')}`);
+        process.exitCode = 1;
+        return;
+      }
+
+      console.log('');
+      for (const task of plannedTasks) {
+        createTask(db, {
+          id: task.id,
+          title: task.title,
+          description: `Planned from: ${context.title}`,
+          priority: planTaskPriority(task.task_spec),
+        });
+        upsertTaskSpec(db, task.id, task.task_spec);
+        console.log(`  ${chalk.green('✓')} Created ${chalk.cyan(task.id)} ${chalk.dim(task.title)}`);
+      }
+
+      console.log('');
+      console.log(`${chalk.green('✓')} Planned ${plannedTasks.length} task(s) from repo context.`);
+      console.log(`  ${chalk.yellow('next:')} ${chalk.cyan('switchman status --watch')}`);
+    } finally {
+      db?.close();
+    }
   });
 
 

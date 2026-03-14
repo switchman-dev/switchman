@@ -158,6 +158,56 @@ test('Task creation', () => {
   assert(tasks[0].title === 'Fix authentication bug', 'Highest priority task is first');
 });
 
+test('Plan command infers repo context and can create planned tasks', () => {
+  const repoDir = join(tmpdir(), `sw-plan-context-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  writeFileSync(join(repoDir, 'CLAUDE.md'), 'Build authentication carefully.\nDocument the auth flow.\n');
+  execSync('git add README.md CLAUDE.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+  execSync('git checkout -b feature/47-add-auth', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "harden auth middleware"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "add auth tests"', { cwd: repoDir });
+
+  const planDb = initDb(repoDir);
+  registerWorktree(planDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(planDb, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
+  registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
+  planDb.close();
+
+  const previewOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'plan',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(previewOutput.includes('Reading repo context...'), 'Plan preview reads repo context first');
+  assert(previewOutput.includes('Found: branch feature/47-add-auth, CLAUDE.md'), 'Plan preview reports the branch and CLAUDE.md in the found context summary');
+  assert(previewOutput.includes('Suggested plan based on: branch name, CLAUDE.md, and recent git history'), 'Plan preview explains which context sources it used');
+  assert(previewOutput.includes('Implement: Add auth'), 'Plan preview suggests implementation work from inferred branch context');
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'plan',
+    '--apply',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const appliedDb = openDb(repoDir);
+  const plannedTasks = listTasks(appliedDb).filter((task) => task.id.startsWith('plan-add-auth-'));
+  assert(plannedTasks.length >= 2, 'Plan apply creates multiple planned tasks');
+  assert(getTaskSpec(appliedDb, plannedTasks[0].id)?.pipeline_id?.startsWith('plan-add-auth-'), 'Plan apply stores a structured task spec for created tasks');
+  appliedDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Task assignment and status flow', () => {
   const next = getNextPendingTask(db);
   assert(next.title === 'Fix authentication bug', 'Next task is highest priority');
