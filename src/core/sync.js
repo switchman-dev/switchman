@@ -190,16 +190,16 @@ export async function pullActiveTeamMembers() {
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
 
 /**
- * Delete sync events older than 7 days for this user.
+ * Delete sync events older than the configured retention window for this user.
  * Called occasionally to keep the table tidy.
  * Best effort — never fails.
  */
-export async function cleanupOldSyncEvents() {
+export async function cleanupOldSyncEvents({ retentionDays = 7 } = {}) {
   try {
     const creds = readCredentials();
     if (!creds?.access_token || !creds?.user_id) return;
 
-    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const cutoff = new Date(Date.now() - Math.max(1, Number.parseInt(retentionDays, 10) || 7) * 24 * 60 * 60 * 1000).toISOString();
 
     await fetchWithTimeout(
       `${SUPABASE_URL}/rest/v1/sync_state` +

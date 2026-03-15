@@ -31,6 +31,8 @@ const AUTH_URL          = `${SUPABASE_URL}/auth/v1`;
 const PRO_PAGE_URL      = 'https://switchman.dev/pro';
 
 const FREE_AGENT_LIMIT  = 3;
+const FREE_RETENTION_DAYS = 7;
+const PRO_RETENTION_DAYS = 90;
 const CACHE_TTL_MS      = 24 * 60 * 60 * 1000;   // 24 hours
 const OFFLINE_GRACE_MS  = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -173,6 +175,11 @@ export async function checkLicence() {
     }
     return { valid: false, reason: 'offline', cached: false, offline: true };
   }
+}
+
+export async function getRetentionDaysForCurrentPlan() {
+  const licence = await checkLicence();
+  return licence.valid ? PRO_RETENTION_DAYS : FREE_RETENTION_DAYS;
 }
 
 // ─── Token refresh ────────────────────────────────────────────────────────────
@@ -355,4 +362,4 @@ function saveSession(session) {
 
 // ─── Helpers for CLI commands ─────────────────────────────────────────────────
 
-export { FREE_AGENT_LIMIT, PRO_PAGE_URL };
+export { FREE_AGENT_LIMIT, FREE_RETENTION_DAYS, PRO_PAGE_URL, PRO_RETENTION_DAYS };

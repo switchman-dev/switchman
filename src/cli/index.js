@@ -61,9 +61,9 @@ import {
   maybePromptForTelemetry,
   sendTelemetryEvent,
 } from '../core/telemetry.js';
-import { checkLicence, clearCredentials, FREE_AGENT_LIMIT, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
+import { checkLicence, clearCredentials, FREE_AGENT_LIMIT, getRetentionDaysForCurrentPlan, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
 import { homedir } from 'os';
-import { cleanupOldSyncEvents, pullActiveTeamMembers, pushSyncEvent } from '../core/sync.js';
+import { cleanupOldSyncEvents, pullActiveTeamMembers, pullTeamState, pushSyncEvent } from '../core/sync.js';
 
 const originalProcessEmit = process.emit.bind(process);
 process.emit = function patchedProcessEmit(event, ...args) {
@@ -2182,6 +2182,7 @@ function buildUnifiedStatusReport({
   queueItems,
   queueSummary,
   recentQueueEvents,
+  retentionDays = 7,
 }) {
   const queueAttention = [
     ...queueItems
@@ -2286,6 +2287,7 @@ function buildUnifiedStatusReport({
       ...queueAttention.map((item) => item.next_step),
     ])].slice(0, 6),
     suggested_commands: [...new Set(attention.length > 0 ? suggestedCommands : defaultSuggestedCommands)].slice(0, 6),
+    retention_days: retentionDays,
   };
 }
 
@@ -2293,7 +2295,9 @@ async function collectStatusSnapshot(repoRoot) {
   const db = getDb(repoRoot);
   try {
     const leasePolicy = loadLeasePolicy(repoRoot);
-    pruneDatabaseMaintenance(db);
+    const retentionDays = await getRetentionDaysForCurrentPlan();
+    pruneDatabaseMaintenance(db, { retentionDays });
+    cleanupOldSyncEvents({ retentionDays }).catch(() => {});
 
     if (leasePolicy.reap_on_status_check) {
       reapStaleLeases(db, leasePolicy.stale_after_minutes, {
@@ -2333,13 +2337,40 @@ async function collectStatusSnapshot(repoRoot) {
       queueItems,
       queueSummary,
       recentQueueEvents,
+      retentionDays,
     });
   } finally {
     db.close();
   }
 }
 
-function renderUnifiedStatusReport(report, { teamActivity = [] } = {}) {
+function summarizeTeamCoordinationState(events = [], myUserId = null) {
+  const visibleEvents = events.filter((event) => event.user_id !== myUserId);
+  if (visibleEvents.length === 0) {
+    return {
+      members: 0,
+      queue_events: 0,
+      lease_events: 0,
+      claim_events: 0,
+      latest_queue_event: null,
+    };
+  }
+
+  const activeMembers = new Set(visibleEvents.map((event) => event.user_id || `${event.payload?.email || 'unknown'}:${event.worktree || 'unknown'}`));
+  const queueEvents = visibleEvents.filter((event) => ['queue_added', 'queue_merged', 'queue_blocked'].includes(event.event_type));
+  const leaseEvents = visibleEvents.filter((event) => ['lease_acquired', 'task_done', 'task_failed', 'task_retried'].includes(event.event_type));
+  const claimEvents = visibleEvents.filter((event) => ['claim_added', 'claim_released'].includes(event.event_type));
+
+  return {
+    members: activeMembers.size,
+    queue_events: queueEvents.length,
+    lease_events: leaseEvents.length,
+    claim_events: claimEvents.length,
+    latest_queue_event: queueEvents[0] || null,
+  };
+}
+
+function renderUnifiedStatusReport(report, { teamActivity = [], teamSummary = null } = {}) {
   const healthColor = colorForHealth(report.health);
   const badge = healthColor(healthLabel(report.health));
   const mergeColor = report.merge_readiness.ci_gate_ok ? chalk.green : chalk.red;
@@ -2398,11 +2429,20 @@ function renderUnifiedStatusReport(report, { teamActivity = [] } = {}) {
   console.log(`${chalk.bold('Run next:')} ${chalk.cyan(primaryCommand)}`);
   console.log(`${chalk.dim('why:')} ${nextStepLine}`);
   console.log(chalk.dim(`policy: ${formatRelativePolicy(report.lease_policy)} • requeue on reap ${report.lease_policy.requeue_task_on_reap ? 'on' : 'off'}`));
+  console.log(chalk.dim(`history retention: ${report.retention_days || 7} days`));
   if (report.merge_readiness.policy_state?.active) {
     console.log(chalk.dim(`change policy: ${report.merge_readiness.policy_state.domains.join(', ')} • ${report.merge_readiness.policy_state.enforcement} • missing ${report.merge_readiness.policy_state.missing_task_types.join(', ') || 'none'}`));
   }
 
   // ── Team activity (Pro cloud sync) ──────────────────────────────────────────
+  if (teamSummary && teamSummary.members > 0) {
+    console.log('');
+    console.log(chalk.bold('Shared cloud state:'));
+    console.log(`  ${chalk.dim('members:')} ${teamSummary.members}  ${chalk.dim('leases:')} ${teamSummary.lease_events}  ${chalk.dim('claims:')} ${teamSummary.claim_events}  ${chalk.dim('queue:')} ${teamSummary.queue_events}`);
+    if (teamSummary.latest_queue_event) {
+      console.log(`  ${chalk.dim('latest queue event:')} ${chalk.cyan(teamSummary.latest_queue_event.event_type)} ${chalk.dim(teamSummary.latest_queue_event.payload?.source_ref || teamSummary.latest_queue_event.payload?.item_id || '')}`.trim());
+    }
+  }
   if (teamActivity.length > 0) {
     console.log('');
     console.log(chalk.bold('Team activity:'));
@@ -2413,7 +2453,13 @@ function renderUnifiedStatusReport(report, { teamActivity = [] } = {}) {
         task_added:     'added a task',
         task_done:      'completed a task',
         task_failed:    'failed a task',
+        task_retried:   'retried a task',
         lease_acquired: `working on: ${chalk.dim(member.payload?.title ?? '')}`,
+        claim_added:    `claimed ${chalk.dim(member.payload?.file_count ?? 0)} file(s)`,
+        claim_released: 'released file claims',
+        queue_added:    `queued ${chalk.dim(member.payload?.source_ref ?? member.payload?.item_id ?? 'work')}`,
+        queue_merged:   `landed ${chalk.dim(member.payload?.source_ref ?? member.payload?.item_id ?? 'work')}`,
+        queue_blocked:  `blocked ${chalk.dim(member.payload?.source_ref ?? member.payload?.item_id ?? 'work')}`,
         status_ping:    'active',
       }[member.event_type] ?? member.event_type;
       console.log(`  ${chalk.dim('○')} ${email} · ${worktree} · ${eventLabel}`);
@@ -3550,6 +3596,7 @@ taskCmd
     }
 
     console.log(`${chalk.green('✓')} Reset ${chalk.cyan(task.id)} to pending`);
+    pushSyncEvent('task_retried', { task_id: task.id, title: task.title, reason: opts.reason || 'manual retry' }).catch(() => {});
     console.log(`  ${chalk.dim('title:')} ${task.title}`);
     console.log(`${chalk.yellow('next:')} switchman task assign ${task.id} <workspace>`);
   });
@@ -3581,6 +3628,12 @@ taskCmd
     }
 
     console.log(`${chalk.green('✓')} Reset ${result.retried.length} stale task(s) to pending`);
+    pushSyncEvent('task_retried', {
+      pipeline_id: result.pipeline_id || null,
+      task_count: result.retried.length,
+      task_ids: result.retried.map((task) => task.id),
+      reason: opts.reason,
+    }).catch(() => {});
     if (result.pipeline_id) {
       console.log(`  ${chalk.dim('pipeline:')} ${result.pipeline_id}`);
     }
@@ -3629,6 +3682,7 @@ taskCmd
     releaseFileClaims(db, taskId);
     db.close();
     console.log(`${chalk.red('✗')} Task ${chalk.cyan(taskId)} marked failed`);
+    pushSyncEvent('task_failed', { task_id: taskId, reason: reason || null }).catch(() => {});
   });
 
 taskCmd
@@ -3756,6 +3810,13 @@ Pipeline landing rule:
 
       const result = enqueueMergeItem(db, payload);
       db.close();
+      pushSyncEvent('queue_added', {
+        item_id: result.id,
+        source_type: result.source_type,
+        source_ref: result.source_ref,
+        source_worktree: result.source_worktree || null,
+        target_branch: result.target_branch,
+      }, { worktree: result.source_worktree || null }).catch(() => {});
 
       if (opts.json) {
         console.log(JSON.stringify(result, null, 2));
@@ -4064,9 +4125,26 @@ Examples:
       for (const entry of aggregate.processed) {
         const item = entry.item;
         if (entry.status === 'merged') {
+          pushSyncEvent('queue_merged', {
+            item_id: item.id,
+            source_type: item.source_type,
+            source_ref: item.source_ref,
+            source_worktree: item.source_worktree || null,
+            target_branch: item.target_branch,
+            merged_commit: item.merged_commit || null,
+          }, { worktree: item.source_worktree || null }).catch(() => {});
           console.log(`${chalk.green('✓')} Merged ${chalk.cyan(item.id)} into ${chalk.bold(item.target_branch)}`);
           console.log(`  ${chalk.dim('commit:')} ${item.merged_commit}`);
         } else {
+          pushSyncEvent('queue_blocked', {
+            item_id: item.id,
+            source_type: item.source_type,
+            source_ref: item.source_ref,
+            source_worktree: item.source_worktree || null,
+            target_branch: item.target_branch,
+            error_code: item.last_error_code || null,
+            error_summary: item.last_error_summary || null,
+          }, { worktree: item.source_worktree || null }).catch(() => {});
           console.log(`${chalk.red('✗')} Blocked ${chalk.cyan(item.id)}`);
           console.log(`  ${chalk.red('why:')} ${item.last_error_summary}`);
           if (item.next_action) console.log(`  ${chalk.yellow('next:')} ${item.next_action}`);
@@ -5698,6 +5776,12 @@ Only use --force for operator-led recovery after checking switchman status or sw
 
       const lease = claimFiles(db, taskId, worktree, files, opts.agent);
       console.log(`${chalk.green('✓')} Claimed ${files.length} file(s) for task ${chalk.cyan(taskId)} (${chalk.dim(lease.id)})`);
+      pushSyncEvent('claim_added', {
+        task_id: taskId,
+        lease_id: lease.id,
+        file_count: files.length,
+        files: files.slice(0, 10),
+      }, { worktree }).catch(() => {});
       files.forEach(f => console.log(`  ${chalk.dim(f)}`));
     } catch (err) {
       printErrorWithNext(err.message, 'switchman task list --status in_progress');
@@ -5713,9 +5797,11 @@ program
   .action((taskId) => {
     const repoRoot = getRepo();
     const db = getDb(repoRoot);
+    const task = getTask(db, taskId);
     releaseFileClaims(db, taskId);
     db.close();
     console.log(`${chalk.green('✓')} Released all claims for task ${chalk.cyan(taskId)}`);
+    pushSyncEvent('claim_released', { task_id: taskId }, { worktree: task?.worktree || null }).catch(() => {});
   });
 
 program
@@ -6027,14 +6113,19 @@ Use this first when the repo feels stuck.
       }
 
       const report = await collectStatusSnapshot(repoRoot);
-      const teamActivity = await pullActiveTeamMembers();
+      const [teamActivity, teamState] = await Promise.all([
+        pullActiveTeamMembers(),
+        pullTeamState(),
+      ]);
       const myUserId = readCredentials()?.user_id;
       const otherMembers = teamActivity.filter(e => e.user_id !== myUserId);
+      const teamSummary = summarizeTeamCoordinationState(teamState, myUserId);
       cycles += 1;
 
       if (opts.json) {
         const payload = watch ? { ...report, watch: true, cycles } : report;
-        console.log(JSON.stringify(opts.repair ? { ...payload, repair: repairResult } : payload, null, 2));
+        const withTeam = { ...payload, team_sync: { summary: teamSummary, recent_events: teamState.filter((event) => event.user_id !== myUserId).slice(0, 25) } };
+        console.log(JSON.stringify(opts.repair ? { ...withTeam, repair: repairResult } : withTeam, null, 2));
       } else {
         if (opts.repair && repairResult) {
           printRepairSummary(repairResult, {
@@ -6044,7 +6135,7 @@ Use this first when the repo feels stuck.
           });
           console.log('');
         }
-        renderUnifiedStatusReport(report, { teamActivity: otherMembers });
+        renderUnifiedStatusReport(report, { teamActivity: otherMembers, teamSummary });
         if (watch) {
           const signature = buildWatchSignature(report);
           const watchState = lastSignature === null
