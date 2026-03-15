@@ -1,4 +1,5 @@
 export const DEFAULT_SCAN_IGNORE_PATTERNS = [
+  '.mcp.json',
   'node_modules/**',
   '.git/**',
   '.mcp.json',

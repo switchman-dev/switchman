@@ -26,7 +26,9 @@ import {
   createTask,
   startTaskLease,
   completeTask,
+  completeLeaseTask,
   failTask,
+  failLeaseTask,
   listTasks,
   getNextPendingTask,
   listLeases,
@@ -631,11 +633,16 @@ Returns JSON:
         db.close();
         return toolError(`Task ${task_id} is active under lease ${activeLease.id}, not ${lease_id}.`);
       }
-      completeTask(db, task_id);
-      releaseFileClaims(db, task_id);
+      const effectiveLeaseId = activeLease?.id ?? lease_id ?? null;
+      if (effectiveLeaseId) {
+        completeLeaseTask(db, effectiveLeaseId);
+      } else {
+        completeTask(db, task_id);
+        releaseFileClaims(db, task_id);
+      }
       db.close();
 
-      const result = { task_id, lease_id: activeLease?.id ?? lease_id ?? null, status: 'done', files_released: true };
+      const result = { task_id, lease_id: effectiveLeaseId, status: 'done', files_released: true };
       return toolOk(JSON.stringify(result, null, 2), result);
     } catch (err) {
       return toolError(err.message);
@@ -686,11 +693,16 @@ Returns JSON:
         db.close();
         return toolError(`Task ${task_id} is active under lease ${activeLease.id}, not ${lease_id}.`);
       }
-      failTask(db, task_id, reason);
-      releaseFileClaims(db, task_id);
+      const effectiveLeaseId = activeLease?.id ?? lease_id ?? null;
+      if (effectiveLeaseId) {
+        failLeaseTask(db, effectiveLeaseId, reason);
+      } else {
+        failTask(db, task_id, reason);
+        releaseFileClaims(db, task_id);
+      }
       db.close();
 
-      const result = { task_id, lease_id: activeLease?.id ?? lease_id ?? null, status: 'failed', reason, files_released: true };
+      const result = { task_id, lease_id: effectiveLeaseId, status: 'failed', reason, files_released: true };
       return toolOk(JSON.stringify(result, null, 2), result);
     } catch (err) {
       return toolError(err.message);

@@ -4,18 +4,20 @@ import { execFileSync, spawnSync } from 'child_process';
 
 import {
   getActiveFileClaims,
+  touchBoundaryValidationState,
   getCompletedFileClaims,
   getLease,
-  getTask,
-  listTasks,
-  getTaskSpec,
   getWorktree,
   listWorktrees,
   getWorktreeSnapshotState,
   replaceWorktreeSnapshotState,
   getStaleLeases,
+  listScopeReservations,
   listAuditEvents,
   listLeases,
+  listTasks,
+  getTask,
+  getTaskSpec,
   logAuditEvent,
   updateWorktreeCompliance,
 } from './db.js';
@@ -136,7 +138,19 @@ function diffSnapshots(previousSnapshot, currentSnapshot) {
 }
 
 function getLeaseScopePatterns(db, lease) {
-  return getTaskSpec(db, lease.task_id)?.allowed_paths || [];
+  const reservations = listScopeReservations(db, { leaseId: lease.id });
+  const scopePatterns = reservations
+    .filter((reservation) => reservation.ownership_level === 'path_scope' && reservation.scope_pattern)
+    .map((reservation) => reservation.scope_pattern);
+  return [...new Set(scopePatterns)];
+}
+
+function getLeaseSubsystemTags(db, lease) {
+  const reservations = listScopeReservations(db, { leaseId: lease.id });
+  const subsystemTags = reservations
+    .filter((reservation) => reservation.ownership_level === 'subsystem' && reservation.subsystem_tag)
+    .map((reservation) => reservation.subsystem_tag);
+  return [...new Set(subsystemTags)];
 }
 
 function findScopedLeaseOwner(db, leases, filePath, excludeLeaseId = null) {
@@ -144,6 +158,18 @@ function findScopedLeaseOwner(db, leases, filePath, excludeLeaseId = null) {
     if (excludeLeaseId && lease.id === excludeLeaseId) continue;
     const patterns = getLeaseScopePatterns(db, lease);
     if (patterns.length > 0 && matchesPathPatterns(filePath, patterns)) {
+      return lease;
+    }
+  }
+  return null;
+}
+
+function findSubsystemLeaseOwner(db, leases, subsystemTags, excludeLeaseId = null) {
+  if (!subsystemTags.length) return null;
+  for (const lease of leases) {
+    if (excludeLeaseId && lease.id === excludeLeaseId) continue;
+    const leaseTags = getLeaseSubsystemTags(db, lease);
+    if (leaseTags.some((tag) => subsystemTags.includes(tag))) {
       return lease;
     }
   }
@@ -174,8 +200,13 @@ function resolveLeasePathOwnership(db, lease, filePath, activeClaims, activeLeas
   }
 
   const ownScopePatterns = getLeaseScopePatterns(db, lease);
+  const ownSubsystemTags = getLeaseSubsystemTags(db, lease);
   const ownScopeMatch = ownScopePatterns.length > 0 && matchesPathPatterns(filePath, ownScopePatterns);
   if (ownScopeMatch) {
+    const foreignSubsystemOwner = findSubsystemLeaseOwner(db, activeLeases, ownSubsystemTags, lease.id);
+    if (foreignSubsystemOwner) {
+      return { ok: false, reason_code: 'path_scoped_by_other_lease', claim: null, ownership_type: null };
+    }
     const foreignScopeOwner = findScopedLeaseOwner(db, activeLeases, filePath, lease.id);
     if (foreignScopeOwner) {
       return { ok: false, reason_code: 'path_scoped_by_other_lease', claim: null, ownership_type: null };
@@ -185,6 +216,11 @@ function resolveLeasePathOwnership(db, lease, filePath, activeClaims, activeLeas
 
   const foreignScopeOwner = findScopedLeaseOwner(db, activeLeases, filePath, lease.id);
   if (foreignScopeOwner) {
+    return { ok: false, reason_code: 'path_scoped_by_other_lease', claim: null, ownership_type: null };
+  }
+
+  const foreignSubsystemOwner = findSubsystemLeaseOwner(db, activeLeases, ownSubsystemTags, lease.id);
+  if (foreignSubsystemOwner) {
     return { ok: false, reason_code: 'path_scoped_by_other_lease', claim: null, ownership_type: null };
   }
 
@@ -417,6 +453,9 @@ export function validateLeaseAccess(db, { leaseId, worktree = null }) {
 }
 
 function logWriteEvent(db, status, reasonCode, validation, eventType, details = null) {
+  if (status === 'allowed' && validation.lease?.id) {
+    touchBoundaryValidationState(db, validation.lease.id, `write:${details?.operation || 'unknown'}`);
+  }
   logAuditEvent(db, {
     eventType,
     status,
@@ -914,6 +953,10 @@ export function monitorWorktreesOnce(db, repoRoot, worktrees, options = {}) {
         filePath: change.file_path,
         details: JSON.stringify({ change_type: change.change_type }),
       });
+
+      if (classification.status === 'allowed' && classification.lease?.id) {
+        touchBoundaryValidationState(db, classification.lease.id, `observed:${change.change_type}`);
+      }
 
       if (classification.status === 'denied') {
         updateWorktreeCompliance(db, worktree.name, COMPLIANCE_STATES.NON_COMPLIANT);

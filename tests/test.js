@@ -5383,6 +5383,12 @@ test('Fix 25c: accepted high-risk boundary work creates incremental validation s
   const pendingState = getBoundaryValidationState(db, lease.id);
 
   completeLeaseTask(db, lease.id);
+  assignTask(db, testsTask.id, 'main');
+  completeTask(db, testsTask.id);
+  assignTask(db, docsTask.id, 'main');
+  completeTask(db, docsTask.id);
+  assignTask(db, governanceTask.id, 'main');
+  completeTask(db, governanceTask.id);
   completeTask(db, testsTask.id);
   completeTask(db, docsTask.id);
   completeTask(db, governanceTask.id);
@@ -6062,9 +6068,12 @@ test('Fix 28p: pipeline PR summary includes active policy requirements', () => {
     pipelineId: 'pipe-pr-policy',
     priority: 5,
   });
-  completeTask(pipelineDb, 'pipe-pr-policy-01');
-  completeTask(pipelineDb, 'pipe-pr-policy-02');
-  completeTask(pipelineDb, 'pipe-pr-policy-04');
+assignTask(pipelineDb, 'pipe-pr-policy-01', 'main');
+completeTask(pipelineDb, 'pipe-pr-policy-01');
+assignTask(pipelineDb, 'pipe-pr-policy-02', 'main');
+completeTask(pipelineDb, 'pipe-pr-policy-02');
+assignTask(pipelineDb, 'pipe-pr-policy-04', 'main');
+completeTask(pipelineDb, 'pipe-pr-policy-04');
   pipelineDb.close();
 
   const result = JSON.parse(execFileSync(process.execPath, [
@@ -6162,7 +6171,9 @@ test('Fix 28a1: pipeline status surfaces policy state in JSON and text output', 
     pipelineId: 'pipe-status-policy',
     priority: 5,
   });
+ assignTask(pipelineDb, 'pipe-status-policy-02', 'main');
   completeTask(pipelineDb, 'pipe-status-policy-02');
+  assignTask(pipelineDb, 'pipe-status-policy-04', 'main');
   completeTask(pipelineDb, 'pipe-status-policy-04');
   pipelineDb.close();
 
@@ -7602,6 +7613,7 @@ test('Fix 28c: pipeline PR summary includes reviewer risk notes for high-risk wo
     pipelineId: 'pipe-pr-risk',
     priority: 9,
   });
+    assignTask(pipelineDb, 'pipe-pr-risk-01', 'main');
   completeTask(pipelineDb, 'pipe-pr-risk-01');
   pipelineDb.close();
 
@@ -7639,6 +7651,7 @@ test('Fix 28d: pipeline bundle exports reviewer-ready files to disk', () => {
     pipelineId: 'pipe-bundle',
     priority: 5,
   });
+  assignTask(pipelineDb, 'pipe-bundle-01', 'main');
   completeTask(pipelineDb, 'pipe-bundle-01');
   pipelineDb.close();
 
