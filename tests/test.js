@@ -101,6 +101,22 @@ function test(name, fn) {
   }
 }
 
+function writeProTestCredentials(homeDir, email = 'pro@test.com') {
+  const switchmanDir = join(homeDir, '.switchman');
+  mkdirSync(switchmanDir, { recursive: true });
+  writeFileSync(join(switchmanDir, 'credentials.json'), JSON.stringify({
+    access_token: 'test-access-token',
+    refresh_token: 'test-refresh-token',
+    email,
+  }, null, 2));
+  writeFileSync(join(switchmanDir, 'licence-cache.json'), JSON.stringify({
+    valid: true,
+    plan: 'pro',
+    email,
+    cached_at: Date.now(),
+  }, null, 2));
+}
+
 function setupPipelineExecRepo(prefix, branchName) {
   const repoDir = join(tmpdir(), `${prefix}-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -158,9 +174,11 @@ test('Task creation', () => {
   assert(tasks[0].title === 'Fix authentication bug', 'Highest priority task is first');
 });
 
-test('Plan command infers repo context and can create planned tasks', () => {
+test('Plan command requires Pro and an explicit goal before creating planned tasks', () => {
   const repoDir = join(tmpdir(), `sw-plan-context-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-plan-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
   execSync('git init -b main', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
@@ -178,34 +196,79 @@ test('Plan command infers repo context and can create planned tasks', () => {
   registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
   planDb.close();
 
+  let unpaidOutput = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'plan',
+      'Add authentication',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    unpaidOutput = err.stdout || '';
+  }
+
+  assert(unpaidOutput.includes('AI planning requires Switchman Pro'), 'Plan blocks unpaid usage behind the Pro gate');
+  assert(unpaidOutput.includes('switchman upgrade'), 'Plan points unpaid users at the upgrade command');
+
+  writeProTestCredentials(homeDir);
+
+  let missingGoalOutput = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'plan',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir },
+    });
+  } catch (err) {
+    missingGoalOutput = err.stdout || '';
+  }
+
+  assert(missingGoalOutput.includes('AI planning currently requires an explicit goal'), 'Plan requires an explicit goal even for Pro users');
+  assert(missingGoalOutput.includes('switchman plan "Add authentication"'), 'Plan shows the supported explicit-goal command');
+
   const previewOutput = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
     'plan',
+    'Add authentication',
   ], {
     cwd: repoDir,
     encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
   });
 
   assert(previewOutput.includes('Reading repo context...'), 'Plan preview reads repo context first');
   assert(previewOutput.includes('Found: branch feature/47-add-auth, CLAUDE.md'), 'Plan preview reports the branch and CLAUDE.md in the found context summary');
-  assert(previewOutput.includes('Suggested plan based on: branch name, CLAUDE.md, and recent git history'), 'Plan preview explains which context sources it used');
-  assert(previewOutput.includes('Implement: Add auth'), 'Plan preview suggests implementation work from inferred branch context');
+  assert(previewOutput.includes('Suggested plan based on:'), 'Plan preview explains which context sources it used');
+  assert(previewOutput.includes('explicit goal'), 'Plan preview lists the explicit goal as a planning source');
+  assert(previewOutput.includes('branch name'), 'Plan preview lists the branch name as a planning source');
+  assert(previewOutput.includes('CLAUDE.md'), 'Plan preview lists CLAUDE.md as a planning source');
+  assert(previewOutput.includes('recent git history'), 'Plan preview lists recent git history as a planning source');
+  assert(previewOutput.includes('Implement: Add authentication'), 'Plan preview suggests implementation work from the explicit goal');
 
   execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
     'plan',
+    'Add authentication',
     '--apply',
   ], {
     cwd: repoDir,
     encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
   });
 
   const appliedDb = openDb(repoDir);
-  const plannedTasks = listTasks(appliedDb).filter((task) => task.id.startsWith('plan-add-auth-'));
+  const plannedTasks = listTasks(appliedDb).filter((task) => task.id.startsWith('plan-add-authentication-'));
   assert(plannedTasks.length >= 2, 'Plan apply creates multiple planned tasks');
-  assert(getTaskSpec(appliedDb, plannedTasks[0].id)?.pipeline_id?.startsWith('plan-add-auth-'), 'Plan apply stores a structured task spec for created tasks');
+  assert(getTaskSpec(appliedDb, plannedTasks[0].id)?.pipeline_id?.startsWith('plan-add-authentication-'), 'Plan apply stores a structured task spec for created tasks');
   appliedDb.close();
   rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
 });
 
 test('Planner keeps API documentation updates docs-only and treats payments work as high risk', () => {
@@ -250,7 +313,7 @@ test('Root help keeps the front door small and points advanced users deeper', ()
     encoding: 'utf8',
   });
 
-  assert(output.includes('switchman plan --apply'), 'Root help includes the new planning-first start path');
+  assert(output.includes('switchman task add "Your task" --priority 8'), 'Root help includes the task-first start path');
   assert(output.includes('switchman merge'), 'Root help includes the one-command merge front door');
   assert(!output.includes('queue|land'), 'Root help hides lower-level queue commands from the day-one command list');
   assert(output.includes('switchman advanced --help'), 'Root help points power users at advanced help');
@@ -6531,7 +6594,8 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
   assert(helpOutput.includes('For you (the operator):'), 'Top-level help includes an operator section');
   assert(helpOutput.includes('For your agents (via CLAUDE.md or MCP):'), 'Top-level help includes an agent section');
-  assert(helpOutput.includes('switchman plan --apply'), 'Top-level help includes the planning-first first-run step');
+  assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the explicit first task step');
+  assert(helpOutput.includes('switchman plan "Add authentication"   (Pro)'), 'Top-level help marks planning as a Pro operator command');
   assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
 });
 

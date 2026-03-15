@@ -293,7 +293,7 @@ switchman login --status  # check your current plan
 - Unlimited concurrent agents (free tier: up to 3)
 - Cloud-synced task queues and lease state across your team
 - Team invites — `switchman team invite alice@example.com`
-- AI task planning — `switchman plan` reads your repo context and proposes parallel tasks
+- AI task planning — `switchman plan "Add authentication"` proposes parallel tasks from an explicit goal
 - 90-day audit trail (free tier: 7 days)
 - Email support within 48 hours
 
@@ -309,9 +309,24 @@ switchman setup --agents 10
 # Pro removes the 3-agent limit
 ```
 
+### Pro planning launch order
+
+Switchman Pro planning ships in this order:
+- `switchman plan "goal"` first
+- `switchman plan --issue 47` next
+- zero-argument `switchman plan` later, once real usage data makes that inference trustworthy
+
+Today, the supported Pro planning flow is:
+
+```bash
+switchman plan "Add authentication"
+switchman plan "Add authentication" --apply
+```
+
 ## What's next
 
 The next product steps are:
+- `switchman plan --issue 47`
 - a more magical zero-argument planning flow that can read richer repo and issue context
 - a web dashboard for repo and landing visibility
 - a Homebrew install path for faster first-run setup

@@ -225,9 +225,12 @@ function collectPlanContext(repoRoot, explicitGoal = null) {
 
   const found = [];
   const used = [];
+  if (explicitGoal) {
+    used.push('explicit goal');
+  }
   if (branch) {
     found.push(`branch ${branch}`);
-    if (!explicitGoal && branchGoal) used.push('branch name');
+    if (branchGoal) used.push('branch name');
   }
   if (preferredPlanningFile?.file) {
     found.push(preferredPlanningFile.file);
@@ -2911,6 +2914,7 @@ const ROOT_HELP_COMMANDS = new Set([
   'demo',
   'setup',
   'verify-setup',
+  'login',
   'upgrade',
   'plan',
   'task',
@@ -2930,17 +2934,20 @@ program.addHelpText('after', `
 Start here:
   switchman demo
   switchman setup --agents 3
-  switchman plan --apply
+  switchman task add "Your task" --priority 8
   switchman status --watch
-  switchman merge
+  switchman gate ci && switchman queue run
 
 For you (the operator):
   switchman demo
   switchman setup
-  switchman plan
+  switchman task add
   switchman status
   switchman merge
   switchman repair
+  switchman upgrade
+  switchman login
+  switchman plan "Add authentication"   (Pro)
 
 For your agents (via CLAUDE.md or MCP):
   switchman lease next
@@ -3392,21 +3399,41 @@ Examples:
 
 program
   .command('plan [goal]')
-  .description('Suggest a parallel task plan from repo context, or from an explicit goal')
+  .description('Pro: suggest a parallel task plan from an explicit goal')
   .option('--apply', 'Create the suggested tasks in Switchman')
   .option('--max-tasks <n>', 'Maximum number of suggested tasks', '6')
   .option('--json', 'Output raw JSON')
   .addHelpText('after', `
 Examples:
-  switchman plan
   switchman plan "Add authentication"
-  switchman plan --apply
+  switchman plan "Add authentication" --apply
 `)
   .action(async (goal, opts) => {
     const repoRoot = getRepo();
     const db = getOptionalDb(repoRoot);
 
     try {
+      const licence = await checkLicence();
+      if (!licence.valid) {
+        console.log('');
+        console.log(chalk.yellow('  ⚠  AI planning requires Switchman Pro.'));
+        console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman upgrade')}`);
+        console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+
+      if (!goal || !goal.trim()) {
+        console.log('');
+        console.log(chalk.yellow('  ⚠  AI planning currently requires an explicit goal.'));
+        console.log(`  ${chalk.dim('Try:')} ${chalk.cyan('switchman plan "Add authentication"')}`);
+        console.log(`  ${chalk.dim('Then:')} ${chalk.cyan('switchman plan "Add authentication" --apply')}`);
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+
       const context = collectPlanContext(repoRoot, goal || null);
       const planningWorktrees = resolvePlanningWorktrees(repoRoot, db);
       const pipelineId = `plan-${slugifyValue(context.title)}-${Date.now().toString(36)}`;
