@@ -133,6 +133,8 @@ If you want the recommended editor setup guide, start here:
 If you want a guided demo, see [examples/README.md](examples/README.md).
 If you want the deeper multi-task planning and PR workflow, see [docs/pipelines.md](docs/pipelines.md).
 
+> Free tier supports up to 3 agents. Run `switchman upgrade` for unlimited.
+
 ## What good looks like
 
 You know the first run is working when:
@@ -277,11 +279,40 @@ Today Switchman already includes:
 - audit trail, change policy enforcement, and CI integration
 - MCP support for Claude Code, Cursor, and Windsurf
 
+## Switchman Pro
+
+Pro gives you unlimited agents, cloud-synced team coordination, and 90-day history.
+
+```bash
+switchman upgrade       # open switchman.dev/pro in your browser
+switchman login         # activate Pro after subscribing
+switchman login --status  # check your current plan
+```
+
+**What's included in Pro:**
+- Unlimited concurrent agents (free tier: up to 3)
+- Cloud-synced task queues and lease state across your team
+- Team invites — `switchman team invite alice@example.com`
+- AI task planning — `switchman plan` reads your repo context and proposes parallel tasks
+- 90-day audit trail (free tier: 7 days)
+- Email support within 48 hours
+
+**Pricing:** $25/month or $250/year per seat · [switchman.dev/pro](https://switchman.dev/pro)
+
+After subscribing, activate in your terminal:
+```bash
+switchman login
+# Opens GitHub sign-in, saves credentials locally
+# Credentials cached 24h · works offline for 7 days
+
+switchman setup --agents 10
+# Pro removes the 3-agent limit
+```
+
 ## What's next
 
 The next product steps are:
 - a more magical zero-argument planning flow that can read richer repo and issue context
-- a clearer Pro tier with hosted team workflows and upgrade paths
 - a web dashboard for repo and landing visibility
 - a Homebrew install path for faster first-run setup
 

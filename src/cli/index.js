@@ -3365,7 +3365,7 @@ Examples:
       console.log('');
       process.exit(1);
     }
-    
+
     const repoRoot = getRepo();
     const db = getOptionalDb(repoRoot);
 
@@ -6037,7 +6037,7 @@ Use this first when the repo feels stuck.
 
       const report = await collectStatusSnapshot(repoRoot);
       const teamActivity = await pullActiveTeamMembers();
-          const myUserId = readCredentials()?.user_id;
+      const myUserId = readCredentials()?.user_id;
       const otherMembers = teamActivity.filter(e => e.user_id !== myUserId);
       cycles += 1;
 
