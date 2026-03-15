@@ -6068,12 +6068,12 @@ test('Fix 28p: pipeline PR summary includes active policy requirements', () => {
     pipelineId: 'pipe-pr-policy',
     priority: 5,
   });
-assignTask(pipelineDb, 'pipe-pr-policy-01', 'main');
-completeTask(pipelineDb, 'pipe-pr-policy-01');
-assignTask(pipelineDb, 'pipe-pr-policy-02', 'main');
-completeTask(pipelineDb, 'pipe-pr-policy-02');
-assignTask(pipelineDb, 'pipe-pr-policy-04', 'main');
-completeTask(pipelineDb, 'pipe-pr-policy-04');
+  const implementationLease = startTaskLease(pipelineDb, 'pipe-pr-policy-01', 'main', 'pipeline-reviewer');
+  completeLeaseTask(pipelineDb, implementationLease.id);
+  const testsLease = startTaskLease(pipelineDb, 'pipe-pr-policy-02', 'main', 'pipeline-reviewer');
+  completeLeaseTask(pipelineDb, testsLease.id);
+  const governanceLease = startTaskLease(pipelineDb, 'pipe-pr-policy-04', 'main', 'pipeline-reviewer');
+  completeLeaseTask(pipelineDb, governanceLease.id);
   pipelineDb.close();
 
   const result = JSON.parse(execFileSync(process.execPath, [
@@ -6171,10 +6171,10 @@ test('Fix 28a1: pipeline status surfaces policy state in JSON and text output', 
     pipelineId: 'pipe-status-policy',
     priority: 5,
   });
- assignTask(pipelineDb, 'pipe-status-policy-02', 'main');
-  completeTask(pipelineDb, 'pipe-status-policy-02');
-  assignTask(pipelineDb, 'pipe-status-policy-04', 'main');
-  completeTask(pipelineDb, 'pipe-status-policy-04');
+  const testsLease = startTaskLease(pipelineDb, 'pipe-status-policy-02', 'main', 'pipeline-reviewer');
+  completeLeaseTask(pipelineDb, testsLease.id);
+  const governanceLease = startTaskLease(pipelineDb, 'pipe-status-policy-04', 'main', 'pipeline-reviewer');
+  completeLeaseTask(pipelineDb, governanceLease.id);
   pipelineDb.close();
 
   const jsonOutput = JSON.parse(execFileSync(process.execPath, [
@@ -7613,8 +7613,8 @@ test('Fix 28c: pipeline PR summary includes reviewer risk notes for high-risk wo
     pipelineId: 'pipe-pr-risk',
     priority: 9,
   });
-    assignTask(pipelineDb, 'pipe-pr-risk-01', 'main');
-  completeTask(pipelineDb, 'pipe-pr-risk-01');
+  const implementationLease = startTaskLease(pipelineDb, 'pipe-pr-risk-01', 'main', 'pipeline-reviewer');
+  completeLeaseTask(pipelineDb, implementationLease.id);
   pipelineDb.close();
 
   const result = JSON.parse(execFileSync(process.execPath, [
@@ -7651,8 +7651,8 @@ test('Fix 28d: pipeline bundle exports reviewer-ready files to disk', () => {
     pipelineId: 'pipe-bundle',
     priority: 5,
   });
-  assignTask(pipelineDb, 'pipe-bundle-01', 'main');
-  completeTask(pipelineDb, 'pipe-bundle-01');
+  const bundleLease = startTaskLease(pipelineDb, 'pipe-bundle-01', 'main', 'pipeline-reviewer');
+  completeLeaseTask(pipelineDb, bundleLease.id);
   pipelineDb.close();
 
   const outputDir = join(repoDir, 'artifacts', 'pipe-bundle');

@@ -3357,15 +3357,6 @@ Examples:
   switchman plan --apply
 `)
   .action(async (goal, opts) => {
-    const licence = await checkLicence();
-    if (!licence.valid) {
-      console.log('');
-      console.log(chalk.yellow('  ⚠  AI planning requires Switchman Pro.'));
-      console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman upgrade')}`);
-      console.log('');
-      process.exit(1);
-    }
-
     const repoRoot = getRepo();
     const db = getOptionalDb(repoRoot);
 
