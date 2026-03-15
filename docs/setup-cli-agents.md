@@ -45,3 +45,9 @@ switchman status
 switchman scan
 switchman gate ci
 ```
+
+## 5. See one realistic multi-goal flow
+
+If you want to understand how a team uses Switchman across several goals at once, read the short walkthrough in the main README:
+
+- [Real-world walkthrough](../README.md#real-world-walkthrough)

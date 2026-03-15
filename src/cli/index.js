@@ -61,6 +61,8 @@ import {
   maybePromptForTelemetry,
   sendTelemetryEvent,
 } from '../core/telemetry.js';
+import { checkLicence, clearCredentials, FREE_AGENT_LIMIT, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
+import { homedir } from 'os';
 
 const originalProcessEmit = process.emit.bind(process);
 process.emit = function patchedProcessEmit(event, ...args) {
@@ -3022,6 +3024,24 @@ Examples:
       process.exit(1);
     }
 
+        if (agentCount > FREE_AGENT_LIMIT) {
+      const licence = await checkLicence();
+      if (!licence.valid) {
+        console.log('');
+        console.log(chalk.yellow(`  ⚠  Free tier supports up to ${FREE_AGENT_LIMIT} agents.`));
+        console.log('');
+        console.log(`  You requested ${chalk.cyan(agentCount)} agents — that requires ${chalk.bold('Switchman Pro')}.`);
+        console.log('');
+        console.log(`  ${chalk.dim('Upgrade at:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+        console.log(`  ${chalk.dim('Or run:   ')} ${chalk.cyan('switchman upgrade')}`);
+        console.log('');
+        process.exit(1);
+      }
+      if (licence.offline) {
+        console.log(chalk.dim(`  Pro licence verified (offline cache · ${Math.ceil((7 * 24 * 60 * 60 * 1000 - (Date.now() - (licence.cached_at ?? 0))) / (24 * 60 * 60 * 1000))}d remaining)`));
+      }
+    }
+
     const repoRoot = getRepo();
     const spinner = ora('Setting up Switchman...').start();
 
@@ -3164,16 +3184,6 @@ Use this after setup or whenever editor/config wiring feels off.
       next_step_count: report.next_steps.length,
     }, { homeDir: opts.home || null });
     if (!report.ok) process.exitCode = 1;
-  });
-
-program
-  .command('upgrade')
-  .description('See Switchman upgrade options and paid plan details')
-  .action(() => {
-    console.log(chalk.bold('Switchman upgrade'));
-    console.log('');
-    console.log('Explore paid plans and team features at:');
-    console.log(`  ${chalk.cyan('https://switchman.dev/pro')}`);
   });
 
 
@@ -6962,5 +6972,131 @@ policyCmd
       console.log(`    ${chalk.dim('reason:')} ${entry.reason}`);
     }
   });
+
+
+ 
+// ── login ──────────────────────────────────────────────────────────────────────
+ 
+program
+  .command('login')
+  .description('Sign in with GitHub to activate Switchman Pro')
+  .option('--invite <token>', 'Join a team with an invite token')
+  .option('--status', 'Show current login status')
+  .addHelpText('after', `
+Examples:
+  switchman login
+  switchman login --status
+  switchman login --invite tk_8f3a2c
+`)
+  .action(async (opts) => {
+    // Show current status
+    if (opts.status) {
+      const creds = readCredentials();
+      if (!creds?.access_token) {
+        console.log('');
+        console.log(`  ${chalk.dim('Status:')} Not logged in`);
+        console.log(`  ${chalk.dim('Run:   ')} ${chalk.cyan('switchman login')}`);
+        console.log('');
+        return;
+      }
+ 
+      const licence = await checkLicence();
+      console.log('');
+      if (licence.valid) {
+        console.log(`  ${chalk.green('✓')} Logged in as ${chalk.cyan(creds.email ?? 'unknown')}`);
+        console.log(`  ${chalk.dim('Plan:')} ${licence.plan ?? 'Pro'}`);
+        if (licence.current_period_end) {
+          console.log(`  ${chalk.dim('Renews:')} ${new Date(licence.current_period_end).toLocaleDateString()}`);
+        }
+        if (licence.offline) {
+          console.log(`  ${chalk.dim('(offline cache)')}`);
+        }
+      } else {
+        console.log(`  ${chalk.yellow('⚠')} Logged in as ${chalk.cyan(creds.email ?? 'unknown')} but no active Pro licence`);
+        console.log(`  ${chalk.dim('Upgrade at:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+      }
+      console.log('');
+      return;
+    }
+ 
+    // Already logged in?
+    const existing = readCredentials();
+    if (existing?.access_token) {
+      const licence = await checkLicence();
+      if (licence.valid) {
+        console.log('');
+        console.log(`  ${chalk.green('✓')} Already logged in as ${chalk.cyan(existing.email ?? 'unknown')}`);
+        console.log(`  ${chalk.dim('Plan:')} ${licence.plan ?? 'Pro'}`);
+        console.log(`  ${chalk.dim('Run')} ${chalk.cyan('switchman login --status')} ${chalk.dim('to see full details')}`);
+        console.log('');
+        return;
+      }
+    }
+ 
+    console.log('');
+    console.log(chalk.bold('  Switchman Pro — sign in with GitHub'));
+    console.log('');
+ 
+    const spinner = ora('Waiting for GitHub sign-in...').start();
+    spinner.stop();
+ 
+    const result = await loginWithGitHub();
+ 
+    if (!result.success) {
+      console.log(`  ${chalk.red('✗')} Sign in failed: ${result.error ?? 'unknown error'}`);
+      console.log(`  ${chalk.dim('Try again or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+      console.log('');
+      process.exit(1);
+    }
+ 
+    // Verify the licence
+    const licence = await checkLicence();
+ 
+    console.log(`  ${chalk.green('✓')} Signed in as ${chalk.cyan(result.email ?? 'unknown')}`);
+ 
+    if (licence.valid) {
+      console.log(`  ${chalk.green('✓')} Switchman Pro active`);
+      console.log(`  ${chalk.dim('Plan:')} ${licence.plan ?? 'Pro'}`);
+      console.log('');
+      console.log(`  ${chalk.dim('Credentials saved · valid 24h · 7-day offline grace')}`);
+      console.log('');
+      console.log(`  Run ${chalk.cyan('switchman setup --agents 10')} to use unlimited agents.`);
+    } else {
+      console.log(`  ${chalk.yellow('⚠')} No active Pro licence found`);
+      console.log('');
+      console.log(`  If you just paid, it may take a moment to activate.`);
+      console.log(`  ${chalk.dim('Upgrade at:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+    }
+ 
+    console.log('');
+  });
+ 
+ 
+// ── logout ─────────────────────────────────────────────────────────────────────
+ 
+program
+  .command('logout')
+  .description('Sign out and remove saved credentials')
+  .action(() => {
+    clearCredentials();
+    console.log('');
+    console.log(`  ${chalk.green('✓')} Signed out — credentials removed`);
+    console.log('');
+  });
+ 
+ 
+// ── upgrade ────────────────────────────────────────────────────────────────────
+ 
+program
+  .command('upgrade')
+  .description('Open the Switchman Pro page in your browser')
+  .action(async () => {
+    console.log('');
+    console.log(`  Opening ${chalk.cyan(PRO_PAGE_URL)}...`);
+    console.log('');
+    const { default: open } = await import('open');
+    await open(PRO_PAGE_URL);
+  });
+ 
 
 program.parse();

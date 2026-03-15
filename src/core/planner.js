@@ -155,9 +155,7 @@ function deriveSubtaskTitles(title, description) {
   const subtasks = [];
   const domains = detectDomains(text);
   const highRisk = /\b(auth|payments?|schema|migration|security|permission|billing)\b/.test(text);
-
-  const docsOnly = /\b(docs?|readme|documentation)\b/.test(text)
-    && !/\b(auth|bug|feature|fix|refactor|schema|migration|config|build|test|implement|route|handler|endpoint|model)\b/.test(text);
+  const docsOnly = isDocsOnlyRequest(text);
 
   if (docsOnly) {
     return [`Update docs for: ${title}`];
@@ -180,7 +178,13 @@ function deriveSubtaskTitles(title, description) {
   return subtasks;
 }
 
+function isDocsOnlyRequest(text) {
+  return /\b(docs?|readme|documentation)\b/.test(text)
+    && !/\b(auth|bug|feature|fix|refactor|schema|migration|config|build|test|implement|route|handler|endpoint|model)\b/.test(text);
+}
+
 function inferRiskLevel(text) {
+  if (isDocsOnlyRequest(text)) return 'low';
   if (/\b(auth|payments?|schema|migration|security|permission|billing)\b/.test(text)) return 'high';
   if (/\b(api|config|deploy|build|infra)\b/.test(text)) return 'medium';
   return 'low';
