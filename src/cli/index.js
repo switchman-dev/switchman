@@ -63,6 +63,7 @@ import {
 } from '../core/telemetry.js';
 import { checkLicence, clearCredentials, FREE_AGENT_LIMIT, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
 import { homedir } from 'os';
+import { cleanupOldSyncEvents, pullActiveTeamMembers, pushSyncEvent } from '../core/sync.js';
 
 const originalProcessEmit = process.emit.bind(process);
 process.emit = function patchedProcessEmit(event, ...args) {
@@ -2338,7 +2339,7 @@ async function collectStatusSnapshot(repoRoot) {
   }
 }
 
-function renderUnifiedStatusReport(report) {
+function renderUnifiedStatusReport(report, { teamActivity = [] } = {}) {
   const healthColor = colorForHealth(report.health);
   const badge = healthColor(healthLabel(report.health));
   const mergeColor = report.merge_readiness.ci_gate_ok ? chalk.green : chalk.red;
@@ -2399,6 +2400,24 @@ function renderUnifiedStatusReport(report) {
   console.log(chalk.dim(`policy: ${formatRelativePolicy(report.lease_policy)} • requeue on reap ${report.lease_policy.requeue_task_on_reap ? 'on' : 'off'}`));
   if (report.merge_readiness.policy_state?.active) {
     console.log(chalk.dim(`change policy: ${report.merge_readiness.policy_state.domains.join(', ')} • ${report.merge_readiness.policy_state.enforcement} • missing ${report.merge_readiness.policy_state.missing_task_types.join(', ') || 'none'}`));
+  }
+
+  // ── Team activity (Pro cloud sync) ──────────────────────────────────────────
+  if (teamActivity.length > 0) {
+    console.log('');
+    console.log(chalk.bold('Team activity:'));
+    for (const member of teamActivity) {
+      const email = member.payload?.email ?? chalk.dim(member.user_id?.slice(0, 8) ?? 'unknown');
+      const worktree = chalk.cyan(member.worktree ?? 'unknown');
+      const eventLabel = {
+        task_added:     'added a task',
+        task_done:      'completed a task',
+        task_failed:    'failed a task',
+        lease_acquired: `working on: ${chalk.dim(member.payload?.title ?? '')}`,
+        status_ping:    'active',
+      }[member.event_type] ?? member.event_type;
+      console.log(`  ${chalk.dim('○')} ${email} · ${worktree} · ${eventLabel}`);
+    }
   }
 
   const runningLines = report.active_work.length > 0
@@ -3337,7 +3356,16 @@ Examples:
   switchman plan "Add authentication"
   switchman plan --apply
 `)
-  .action((goal, opts) => {
+  .action(async (goal, opts) => {
+    const licence = await checkLicence();
+    if (!licence.valid) {
+      console.log('');
+      console.log(chalk.yellow('  ⚠  AI planning requires Switchman Pro.'));
+      console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman upgrade')}`);
+      console.log('');
+      process.exit(1);
+    }
+    
     const repoRoot = getRepo();
     const db = getOptionalDb(repoRoot);
 
@@ -3457,6 +3485,7 @@ taskCmd
     db.close();
     const scopeWarning = analyzeTaskScope(title, opts.description || '');
     console.log(`${chalk.green('✓')} Task created: ${chalk.cyan(taskId)}`);
+    pushSyncEvent('task_added', { task_id: taskId, title, priority: parseInt(opts.priority) }).catch(() => {});
     console.log(`  ${chalk.dim(title)}`);
     if (scopeWarning) {
       console.log(chalk.yellow(`  warning: ${scopeWarning.summary}`));
@@ -3592,6 +3621,7 @@ taskCmd
         return;
       }
       console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
+      pushSyncEvent('task_done', { task_id: taskId }).catch(() => {});
     } catch (err) {
       console.error(chalk.red(err.message));
       process.exitCode = 1;
@@ -5412,6 +5442,7 @@ Examples:
     }
 
     console.log(`${chalk.green('✓')} Lease acquired: ${chalk.bold(task.title)}`);
+    pushSyncEvent('lease_acquired', { task_id: task.id, title: task.title }, { worktree: worktreeName }).catch(() => {});
     console.log(`  ${chalk.dim('task:')} ${task.id}  ${chalk.dim('lease:')} ${lease.id}`);
     console.log(`  ${chalk.dim('worktree:')} ${chalk.cyan(worktreeName)}  ${chalk.dim('priority:')} ${task.priority}`);
   });
@@ -6005,6 +6036,9 @@ Use this first when the repo feels stuck.
       }
 
       const report = await collectStatusSnapshot(repoRoot);
+      const teamActivity = await pullActiveTeamMembers();
+          const myUserId = readCredentials()?.user_id;
+      const otherMembers = teamActivity.filter(e => e.user_id !== myUserId);
       cycles += 1;
 
       if (opts.json) {
@@ -6019,7 +6053,7 @@ Use this first when the repo feels stuck.
           });
           console.log('');
         }
-        renderUnifiedStatusReport(report);
+        renderUnifiedStatusReport(report, { teamActivity: otherMembers });
         if (watch) {
           const signature = buildWatchSignature(report);
           const watchState = lastSignature === null
@@ -7018,6 +7052,79 @@ Examples:
       console.log('');
       return;
     }
+
+    // Handle --invite token
+    if (opts.invite) {
+      const SUPABASE_URL  = process.env.SWITCHMAN_SUPABASE_URL
+        ?? 'https://afilbolhlkiingnsupgr.supabase.co';
+      const SUPABASE_ANON = process.env.SWITCHMAN_SUPABASE_ANON
+        ?? 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFmaWxib2xobGtpaW5nbnN1cGdyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1OTIzOTIsImV4cCI6MjA4OTE2ODM5Mn0.8TBfHfRB0vEyKPMWBd6i1DNwx1nS9UqprIAsJf35n88';
+
+      const creds = readCredentials();
+      if (!creds?.access_token) {
+        console.log('');
+        console.log(chalk.yellow('  You need to sign in first before accepting an invite.'));
+        console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman login')} ${chalk.dim('then try again with --invite')}`);
+        console.log('');
+        process.exit(1);
+      }
+
+      const { createClient } = await import('@supabase/supabase-js');
+      const sb = createClient(SUPABASE_URL, SUPABASE_ANON, {
+        global: { headers: { Authorization: `Bearer ${creds.access_token}` } }
+      });
+
+      const { data: { user } } = await sb.auth.getUser();
+      if (!user) {
+        console.log(chalk.red('  ✗  Could not verify your account. Run: switchman login'));
+        process.exit(1);
+      }
+
+      // Look up the invite
+      const { data: invite, error: inviteError } = await sb
+        .from('team_invites')
+        .select('id, team_id, email, accepted')
+        .eq('token', opts.invite)
+        .maybeSingle();
+
+      if (inviteError || !invite) {
+        console.log('');
+        console.log(chalk.red('  ✗  Invite token not found or already used.'));
+        console.log(`  ${chalk.dim('Ask your teammate to send a new invite.')}`);
+        console.log('');
+        process.exit(1);
+      }
+
+      if (invite.accepted) {
+        console.log('');
+        console.log(chalk.yellow('  ⚠  This invite has already been accepted.'));
+        console.log('');
+        process.exit(1);
+      }
+
+      // Add user to the team
+      const { error: memberError } = await sb
+        .from('team_members')
+        .insert({ team_id: invite.team_id, user_id: user.id, role: 'member' });
+
+      if (memberError && !memberError.message.includes('duplicate')) {
+        console.log(chalk.red(`  ✗  Could not join team: ${memberError.message}`));
+        process.exit(1);
+      }
+
+      // Mark invite as accepted
+      await sb
+        .from('team_invites')
+        .update({ accepted: true })
+        .eq('id', invite.id);
+
+      console.log('');
+      console.log(`  ${chalk.green('✓')}  Joined the team successfully`);
+      console.log(`  ${chalk.dim('Your agents now share coordination with your teammates.')}`);
+      console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman status')} ${chalk.dim('to see the shared view.')}`);
+      console.log('');
+      return;
+    }
  
     // Already logged in?
     const existing = readCredentials();
@@ -7098,5 +7205,174 @@ program
     await open(PRO_PAGE_URL);
   });
  
+  // ── team ───────────────────────────────────────────────────────────────────────
+
+const teamCmd = program
+  .command('team')
+  .description('Manage your Switchman Pro team');
+
+teamCmd
+  .command('invite <email>')
+  .description('Invite a teammate to your shared coordination')
+  .addHelpText('after', `
+Examples:
+  switchman team invite alice@example.com
+`)
+  .action(async (email) => {
+    const licence = await checkLicence();
+    if (!licence.valid) {
+      console.log('');
+      console.log(chalk.yellow('  ⚠  Team invites require Switchman Pro.'));
+      console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman upgrade')}`);
+      console.log('');
+      process.exit(1);
+    }
+
+    const repoRoot = getRepo();
+    const creds = readCredentials();
+    if (!creds?.access_token) {
+      console.log('');
+      console.log(chalk.yellow('  ⚠  You need to be logged in.'));
+      console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman login')}`);
+      console.log('');
+      process.exit(1);
+    }
+
+    const SUPABASE_URL  = process.env.SWITCHMAN_SUPABASE_URL
+      ?? 'https://afilbolhlkiingnsupgr.supabase.co';
+    const SUPABASE_ANON = process.env.SWITCHMAN_SUPABASE_ANON
+      ?? 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFmaWxib2xobGtpaW5nbnN1cGdyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1OTIzOTIsImV4cCI6MjA4OTE2ODM5Mn0.8TBfHfRB0vEyKPMWBd6i1DNwx1nS9UqprIAsJf35n88';
+
+    const { createClient } = await import('@supabase/supabase-js');
+    const sb = createClient(SUPABASE_URL, SUPABASE_ANON, {
+      global: { headers: { Authorization: `Bearer ${creds.access_token}` } }
+    });
+
+    const { data: { user } } = await sb.auth.getUser();
+    if (!user) {
+      console.log(chalk.red('  ✗  Could not verify your account. Run: switchman login'));
+      process.exit(1);
+    }
+
+    // Get or create team
+    let teamId;
+    const { data: membership } = await sb
+      .from('team_members')
+      .select('team_id')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (membership?.team_id) {
+      teamId = membership.team_id;
+    } else {
+      // Create a new team
+      const { data: team, error: teamError } = await sb
+        .from('teams')
+        .insert({ owner_id: user.id, name: 'My Team' })
+        .select('id')
+        .single();
+
+      if (teamError) {
+        console.log(chalk.red(`  ✗  Could not create team: ${teamError.message}`));
+        process.exit(1);
+      }
+
+      teamId = team.id;
+
+      // Add the owner as a member
+      await sb.from('team_members').insert({
+        team_id: teamId,
+        user_id: user.id,
+        role: 'owner',
+      });
+    }
+
+    // Create the invite
+    const { data: invite, error: inviteError } = await sb
+      .from('team_invites')
+      .insert({
+        team_id: teamId,
+        invited_by: user.id,
+        email,
+      })
+      .select('token')
+      .single();
+
+    if (inviteError) {
+      console.log(chalk.red(`  ✗  Could not create invite: ${inviteError.message}`));
+      process.exit(1);
+    }
+
+    console.log('');
+    console.log(`  ${chalk.green('✓')}  Invite created for ${chalk.cyan(email)}`);
+    console.log('');
+    console.log(`  They can join with:`);
+    console.log(`  ${chalk.cyan(`switchman login --invite ${invite.token}`)}`);
+    console.log('');
+  });
+
+teamCmd
+  .command('list')
+  .description('List your team members')
+  .action(async () => {
+    const licence = await checkLicence();
+    if (!licence.valid) {
+      console.log('');
+      console.log(chalk.yellow('  ⚠  Team features require Switchman Pro.'));
+      console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman upgrade')}`);
+      console.log('');
+      process.exit(1);
+    }
+
+    const creds = readCredentials();
+    if (!creds?.access_token) {
+      console.log(chalk.red('  ✗  Not logged in. Run: switchman login'));
+      process.exit(1);
+    }
+
+    const SUPABASE_URL  = process.env.SWITCHMAN_SUPABASE_URL
+      ?? 'https://afilbolhlkiingnsupgr.supabase.co';
+    const SUPABASE_ANON = process.env.SWITCHMAN_SUPABASE_ANON
+      ?? 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFmaWxib2xobGtpaW5nbnN1cGdyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1OTIzOTIsImV4cCI6MjA4OTE2ODM5Mn0.8TBfHfRB0vEyKPMWBd6i1DNwx1nS9UqprIAsJf35n88';
+
+    const { createClient } = await import('@supabase/supabase-js');
+    const sb = createClient(SUPABASE_URL, SUPABASE_ANON, {
+      global: { headers: { Authorization: `Bearer ${creds.access_token}` } }
+    });
+
+    const { data: membership } = await sb
+      .from('team_members')
+      .select('team_id')
+      .eq('user_id', (await sb.auth.getUser()).data.user?.id)
+      .maybeSingle();
+
+    if (!membership?.team_id) {
+      console.log('');
+      console.log(`  ${chalk.dim('No team yet. Invite someone with:')} ${chalk.cyan('switchman team invite <email>')}`);
+      console.log('');
+      return;
+    }
+
+    const { data: members } = await sb
+      .from('team_members')
+      .select('user_id, role, joined_at')
+      .eq('team_id', membership.team_id);
+
+    const { data: invites } = await sb
+      .from('team_invites')
+      .select('email, token, accepted, created_at')
+      .eq('team_id', membership.team_id)
+      .eq('accepted', false);
+
+    console.log('');
+    for (const m of members ?? []) {
+      const roleLabel = m.role === 'owner' ? chalk.dim('(owner)') : chalk.dim('(member)');
+      console.log(`  ${chalk.green('✓')} ${chalk.cyan(m.user_id.slice(0, 8))}  ${roleLabel}`);
+    }
+    for (const inv of invites ?? []) {
+      console.log(`  ${chalk.dim('○')} ${chalk.cyan(inv.email)}  ${chalk.dim('(invited)')}`);
+    }
+    console.log('');
+  });
 
 program.parse();
