@@ -10508,10 +10508,10 @@ test('Fix 36: task outcome evaluator flags successful no-op executions', () => {
   const db = initDb(repoDir);
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
   const taskId = createTask(db, { title: 'Implement: no-op task' });
-  assignTask(db, taskId, 'main');
+  const lease = startTaskLease(db, taskId, 'main', 'codex');
   claimFiles(db, taskId, 'main', ['src/example.js']);
 
-  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  const result = evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
   assert(result.status === 'needs_followup', 'Outcome evaluator flags no-op command results');
   assert(result.reason_code === 'no_changes_detected', 'Outcome evaluator reports no_changes_detected for no-op results');
   db.close();
@@ -10531,11 +10531,11 @@ test('Fix 37: task outcome evaluator accepts in-scope claimed source changes', (
   const db = initDb(repoDir);
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
   const taskId = createTask(db, { title: 'Implement: update source' });
-  assignTask(db, taskId, 'main');
+  const lease = startTaskLease(db, taskId, 'main', 'codex');
   claimFiles(db, taskId, 'main', ['src/example.js']);
   execSync('mkdir -p src && printf "ok\\n" > src/example.js', { cwd: repoDir, shell: '/bin/sh' });
 
-  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  const result = evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
   assert(result.status === 'accepted', 'Outcome evaluator accepts claimed source changes for implementation tasks');
   db.close();
   rmSync(repoDir, { recursive: true, force: true });
@@ -10587,7 +10587,7 @@ test('Fix 37b: task outcome evaluator enforces structured task scope', () => {
   const db = initDb(repoDir);
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
   const taskId = createTask(db, { title: 'Update docs for release notes' });
-  assignTask(db, taskId, 'main');
+  const lease = startTaskLease(db, taskId, 'main', 'codex');
   claimFiles(db, taskId, 'main', ['src/example.js']);
   upsertTaskSpec(db, taskId, {
     task_type: 'docs',
@@ -10597,7 +10597,7 @@ test('Fix 37b: task outcome evaluator enforces structured task scope', () => {
   });
   execSync('mkdir -p src && printf "oops\\n" > src/example.js', { cwd: repoDir, shell: '/bin/sh' });
 
-  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  const result = evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
   assert(result.status === 'needs_followup', 'Outcome evaluator flags changes outside the structured task scope');
   assert(result.reason_code === 'changes_outside_task_scope', 'Outcome evaluator reports changes_outside_task_scope for out-of-scope edits');
   db.close();
@@ -10617,7 +10617,7 @@ test('Fix 37c: task outcome evaluator allows implementation work when follow-up 
   const db = initDb(repoDir);
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
   const taskId = createTask(db, { title: 'Implement: Harden auth API permissions' });
-  assignTask(db, taskId, 'main');
+  const lease = startTaskLease(db, taskId, 'main', 'codex');
   claimFiles(db, taskId, 'main', ['src/auth/login.js']);
   upsertTaskSpec(db, taskId, {
     task_type: 'implementation',
@@ -10631,7 +10631,7 @@ test('Fix 37c: task outcome evaluator allows implementation work when follow-up 
   });
   execSync('mkdir -p src/auth && printf "ok\\n" > src/auth/login.js', { cwd: repoDir, shell: '/bin/sh' });
 
-  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  const result = evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
   assert(result.status === 'accepted', 'Outcome evaluator accepts implementation work when only source is required for the current task');
   assert(result.reason_code === null, 'Outcome evaluator does not force tests/docs onto the implementation task when they are follow-up deliverables');
   db.close();
@@ -10651,7 +10651,7 @@ test('Fix 37d: task outcome evaluator checks objective evidence beyond scope', (
   const db = initDb(repoDir);
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
   const taskId = createTask(db, { title: 'Implement: auth permissions flow' });
-  assignTask(db, taskId, 'main');
+  const lease = startTaskLease(db, taskId, 'main', 'codex');
   claimFiles(db, taskId, 'main', ['src/auth/login.js']);
   upsertTaskSpec(db, taskId, {
     task_type: 'implementation',
@@ -10666,7 +10666,7 @@ test('Fix 37d: task outcome evaluator checks objective evidence beyond scope', (
   claimFiles(db, taskId, 'main', ['src/general/handler.js']);
   execSync('mkdir -p src/general && printf "ok\\n" > src/general/handler.js', { cwd: repoDir, shell: '/bin/sh' });
 
-  const result = evaluateTaskOutcome(db, repoDir, { taskId });
+  const result = evaluateTaskOutcome(db, repoDir, { leaseId: lease.id });
   assert(result.status === 'needs_followup', 'Outcome evaluator rejects in-scope changes that do not evidence the task objective strongly enough');
   assert(result.reason_code === 'objective_not_evidenced', 'Outcome evaluator reports objective_not_evidenced when keywords are not reflected in changed outputs');
   db.close();

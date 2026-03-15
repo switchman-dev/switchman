@@ -181,7 +181,9 @@ export function evaluateTaskOutcome(db, repoRoot, { taskId = null, leaseId = nul
     findings: changedInsideClaims.length > 0 ? ['changes stayed within claimed scope'] : [],
   };
   if (resolvedLeaseId) {
-    touchBoundaryValidationState(db, resolvedLeaseId, 'outcome:accepted');
+    touchBoundaryValidationState(db, resolvedLeaseId, 'outcome:accepted', {
+      changed_files: changedFiles,
+    });
   }
   return acceptedResult;
 }
