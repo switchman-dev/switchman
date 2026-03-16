@@ -6665,6 +6665,59 @@ test('Status on a fresh setup gives first-run guidance instead of generic health
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Recover command resets stale leases and stranded tasks while summarizing abandoned changes', () => {
+  const repoDir = join(tmpdir(), `sw-recover-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  mkdirSync(join(repoDir, 'src'), { recursive: true });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+
+  const staleTaskId = createTask(db, { title: 'Recover auth helper', priority: 8 });
+  const staleLease = startTaskLease(db, staleTaskId, 'main', 'claude');
+  claimFiles(db, staleTaskId, 'main', ['src/auth.js'], 'claude');
+  writeFileSync(join(repoDir, 'src', 'auth.js'), 'export const auth = true;\n');
+  db.prepare(`UPDATE leases SET heartbeat_at=datetime('now', '-20 minutes') WHERE id=?`).run(staleLease.id);
+
+  const strandedTaskId = createTask(db, { title: 'Recover docs task', priority: 6 });
+  db.prepare(`UPDATE tasks SET status='in_progress', worktree='main', updated_at=datetime('now') WHERE id=?`).run(strandedTaskId);
+  writeFileSync(join(repoDir, 'docs.md'), 'left behind\n');
+  db.close();
+
+  const report = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'recover',
+    '--stale-after-minutes',
+    '10',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  assert(report.recovered.stale_leases === 1, 'Recover reports one stale lease recovered');
+  assert(report.recovered.stranded_tasks === 1, 'Recover reports one stranded task recovered');
+  assert(report.stale_leases[0].changed_files.includes('src/auth.js'), 'Recover summarizes changed files left by the stale lease');
+  assert(report.stale_leases[0].claimed_files.includes('src/auth.js'), 'Recover summarizes the files claimed by the stale lease');
+  assert(report.stale_leases[0].recovered_to === 'pending', 'Recover reports the stale task was returned to pending');
+  assert(report.stranded_tasks[0].changed_files.includes('docs.md'), 'Recover summarizes changed files left by the stranded task');
+  assert(report.stranded_tasks[0].recovered_to === 'pending', 'Recover reports the stranded task was returned to pending');
+  assert(report.next_steps.includes('switchman status'), 'Recover points operators back to the main status view');
+
+  const verifyDb = openDb(repoDir);
+  assert(getTask(verifyDb, staleTaskId).status === 'pending', 'Recover resets the stale task to pending');
+  assert(getTask(verifyDb, strandedTaskId).status === 'pending', 'Recover resets the stranded task to pending');
+  assert(listLeases(verifyDb, 'active').length === 0, 'Recover leaves no active lease behind for the abandoned work');
+  verifyDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Queue status help explains when to use it', () => {
   const helpOutput = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),

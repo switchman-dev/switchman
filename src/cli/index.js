@@ -39,6 +39,7 @@ import {
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts, retryTask,
   upsertTaskSpec,
   listAuditEvents, pruneDatabaseMaintenance, verifyAuditTrail,
+  getLeaseExecutionContext, getActiveLeaseForTask,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { ensureProjectLocalMcpGitExcludes, getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcpConfig } from '../core/mcp.js';
@@ -1462,6 +1463,184 @@ function printRepairSummary(report, {
   console.log(`  ${chalk.dim('skipped:')} ${skipped.length}`);
   for (const item of limitedSkipped) {
     console.log(`    ${chalk.dim(JSON.stringify(item))}`);
+  }
+}
+
+function summarizeRecoveredTaskState({
+  task,
+  lease = null,
+  worktree = null,
+  changedFiles = [],
+  claims = [],
+  boundaryValidation = null,
+  auditEvents = [],
+  recoveryKind,
+  staleAfterMinutes = null,
+}) {
+  const observedWrites = auditEvents.filter((event) => event.event_type === 'write_observed');
+  const latestAuditEvent = auditEvents[0] || null;
+  const nextAction = worktree?.path
+    ? `cd "${worktree.path}" && git status`
+    : `switchman task retry ${task.id}`;
+
+  return {
+    kind: recoveryKind,
+    task_id: task.id,
+    task_title: task.title,
+    worktree: worktree?.name || lease?.worktree || task.worktree || null,
+    worktree_path: worktree?.path || null,
+    lease_id: lease?.id || null,
+    agent: lease?.agent || task.agent || null,
+    stale_after_minutes: staleAfterMinutes,
+    changed_files: changedFiles,
+    claimed_files: claims,
+    observed_write_count: observedWrites.length,
+    latest_audit_event: latestAuditEvent ? {
+      event_type: latestAuditEvent.event_type,
+      status: latestAuditEvent.status,
+      created_at: latestAuditEvent.created_at,
+      reason_code: latestAuditEvent.reason_code || null,
+    } : null,
+    boundary_validation: boundaryValidation ? {
+      status: boundaryValidation.status,
+      missing_task_types: boundaryValidation.missing_task_types || [],
+    } : null,
+    progress_summary: changedFiles.length > 0
+      ? `Observed uncommitted changes in ${changedFiles.length} file(s).`
+      : claims.length > 0
+        ? `Lease held ${claims.length} active claim(s) before recovery.`
+        : observedWrites.length > 0
+          ? `Observed ${observedWrites.length} governed write event(s) before recovery.`
+          : 'No uncommitted changes were detected at recovery time.',
+    next_action: nextAction,
+  };
+}
+
+function buildRecoverReport(db, repoRoot, { staleAfterMinutes = null, reason = 'operator recover' } = {}) {
+  const leasePolicy = loadLeasePolicy(repoRoot);
+  const staleMinutes = staleAfterMinutes
+    ? Number.parseInt(staleAfterMinutes, 10)
+    : leasePolicy.stale_after_minutes;
+  const worktreeMap = new Map(listWorktrees(db).map((worktree) => [worktree.name, worktree]));
+  const staleLeases = getStaleLeases(db, staleMinutes);
+  const staleTaskIds = new Set(staleLeases.map((lease) => lease.task_id));
+  const staleLeaseSummaries = staleLeases.map((lease) => {
+    const execution = getLeaseExecutionContext(db, lease.id);
+    const worktree = worktreeMap.get(lease.worktree) || execution?.worktree || null;
+    const changedFiles = worktree?.path ? getWorktreeChangedFiles(worktree.path, repoRoot) : [];
+    const claims = execution?.claims?.map((claim) => claim.file_path) || [];
+    const boundaryValidation = getBoundaryValidationState(db, lease.id);
+    const auditEvents = listAuditEvents(db, { taskId: lease.task_id, limit: 10 });
+    return summarizeRecoveredTaskState({
+      task: execution?.task || getTask(db, lease.task_id),
+      lease,
+      worktree,
+      changedFiles,
+      claims,
+      boundaryValidation,
+      auditEvents,
+      recoveryKind: 'stale_lease',
+      staleAfterMinutes: staleMinutes,
+    });
+  });
+
+  const strandedTasks = listTasks(db, 'in_progress')
+    .filter((task) => !staleTaskIds.has(task.id))
+    .filter((task) => !getActiveLeaseForTask(db, task.id));
+  const strandedTaskSummaries = strandedTasks.map((task) => {
+    const worktree = task.worktree ? worktreeMap.get(task.worktree) || null : null;
+    const changedFiles = worktree?.path ? getWorktreeChangedFiles(worktree.path, repoRoot) : [];
+    const auditEvents = listAuditEvents(db, { taskId: task.id, limit: 10 });
+    return summarizeRecoveredTaskState({
+      task,
+      worktree,
+      changedFiles,
+      claims: [],
+      boundaryValidation: null,
+      auditEvents,
+      recoveryKind: 'stranded_task',
+    });
+  });
+
+  const expiredLeases = staleLeases.length > 0
+    ? reapStaleLeases(db, staleMinutes, { requeueTask: leasePolicy.requeue_task_on_reap })
+    : [];
+  const retriedTasks = strandedTasks
+    .map((task) => retryTask(db, task.id, reason))
+    .filter(Boolean);
+  const repair = repairRepoState(db, repoRoot);
+
+  return {
+    stale_after_minutes: staleMinutes,
+    requeue_task_on_reap: leasePolicy.requeue_task_on_reap,
+    stale_leases: staleLeaseSummaries.map((item) => ({
+      ...item,
+      recovered_to: leasePolicy.requeue_task_on_reap ? 'pending' : 'failed',
+    })),
+    stranded_tasks: strandedTaskSummaries.map((item) => ({
+      ...item,
+      recovered_to: 'pending',
+    })),
+    repair,
+    recovered: {
+      stale_leases: expiredLeases.length,
+      stranded_tasks: retriedTasks.length,
+      repo_actions: repair.actions.length,
+    },
+    next_steps: [
+      ...(staleLeaseSummaries.length > 0 || strandedTaskSummaries.length > 0
+        ? ['switchman status', 'switchman task list --status pending']
+        : []),
+      ...(repair.next_action ? [repair.next_action] : []),
+    ].filter((value, index, all) => all.indexOf(value) === index),
+  };
+}
+
+function printRecoverSummary(report) {
+  const totalRecovered = report.recovered.stale_leases + report.recovered.stranded_tasks;
+  console.log(totalRecovered > 0 || report.repair.repaired
+    ? `${chalk.green('✓')} Recovered abandoned work and repaired safe interrupted state`
+    : `${chalk.green('✓')} No abandoned work needed recovery`);
+
+  console.log(`  ${chalk.dim('stale lease threshold:')} ${report.stale_after_minutes} minute(s)`);
+  console.log(`  ${chalk.dim('requeue on reap:')} ${report.requeue_task_on_reap ? 'on' : 'off'}`);
+  console.log(`  ${chalk.green('recovered stale leases:')} ${report.recovered.stale_leases}`);
+  console.log(`  ${chalk.green('recovered stranded tasks:')} ${report.recovered.stranded_tasks}`);
+  console.log(`  ${chalk.green('repo repair actions:')} ${report.recovered.repo_actions}`);
+
+  const recoveredItems = [...report.stale_leases, ...report.stranded_tasks];
+  if (recoveredItems.length > 0) {
+    console.log('');
+    console.log(chalk.bold('Recovered work:'));
+    for (const item of recoveredItems) {
+      console.log(`  ${chalk.cyan(item.worktree || 'unknown')} ${chalk.dim(item.task_id)} ${chalk.bold(item.task_title)}`);
+      console.log(`    ${chalk.dim('type:')} ${item.kind === 'stale_lease' ? 'stale lease' : 'stranded in-progress task'}${item.lease_id ? `  ${chalk.dim('lease:')} ${item.lease_id}` : ''}`);
+      console.log(`    ${chalk.dim('summary:')} ${item.progress_summary}`);
+      if (item.changed_files.length > 0) {
+        console.log(`    ${chalk.dim('changed:')} ${item.changed_files.slice(0, 5).join(', ')}${item.changed_files.length > 5 ? ` ${chalk.dim(`+${item.changed_files.length - 5} more`)}` : ''}`);
+      }
+      if (item.claimed_files.length > 0) {
+        console.log(`    ${chalk.dim('claimed:')} ${item.claimed_files.slice(0, 5).join(', ')}${item.claimed_files.length > 5 ? ` ${chalk.dim(`+${item.claimed_files.length - 5} more`)}` : ''}`);
+      }
+      if (item.boundary_validation) {
+        console.log(`    ${chalk.dim('validation:')} ${item.boundary_validation.status}${item.boundary_validation.missing_task_types.length > 0 ? ` ${chalk.dim(`missing ${item.boundary_validation.missing_task_types.join(', ')}`)}` : ''}`);
+      }
+      console.log(`    ${chalk.yellow('inspect:')} ${item.next_action}`);
+    }
+  }
+
+  console.log('');
+  printRepairSummary(report.repair, {
+    repairedHeading: `${chalk.green('✓')} Repaired safe interrupted repo state during recovery`,
+    noRepairHeading: `${chalk.green('✓')} No extra repo repair action was needed during recovery`,
+    limit: 6,
+  });
+  if (report.next_steps.length > 0) {
+    console.log('');
+    console.log(chalk.bold('Next steps:'));
+    for (const step of report.next_steps) {
+      console.log(`  ${chalk.cyan(step)}`);
+    }
   }
 }
 
@@ -2919,6 +3098,7 @@ const ROOT_HELP_COMMANDS = new Set([
   'plan',
   'task',
   'status',
+  'recover',
   'merge',
   'repair',
   'help',
@@ -2936,6 +3116,7 @@ Start here:
   switchman setup --agents 3
   switchman task add "Your task" --priority 8
   switchman status --watch
+  switchman recover
   switchman gate ci && switchman queue run
 
 For you (the operator):
@@ -2943,6 +3124,7 @@ For you (the operator):
   switchman setup
   switchman task add
   switchman status
+  switchman recover
   switchman merge
   switchman repair
   switchman upgrade
@@ -6188,6 +6370,42 @@ Use this first when the repo feels stuck.
         cycles,
         interval_ms: watchIntervalMs,
       });
+    }
+  });
+
+program
+  .command('recover')
+  .description('Recover abandoned agent work, repair safe interrupted state, and point at the right checkpoint')
+  .option('--stale-after-minutes <minutes>', 'Age threshold for stale lease recovery')
+  .option('--json', 'Output raw JSON')
+  .addHelpText('after', `
+Examples:
+  switchman recover
+  switchman recover --stale-after-minutes 20
+  switchman recover --json
+
+Use this when an agent crashed, a worktree was abandoned mid-task, or the repo feels stuck after interrupted work.
+`)
+  .action((opts) => {
+    const repoRoot = getRepo();
+    const db = getDb(repoRoot);
+
+    try {
+      const report = buildRecoverReport(db, repoRoot, {
+        staleAfterMinutes: opts.staleAfterMinutes || null,
+      });
+      db.close();
+
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      printRecoverSummary(report);
+    } catch (err) {
+      db.close();
+      printErrorWithNext(err.message, 'switchman status');
+      process.exitCode = 1;
     }
   });
 
