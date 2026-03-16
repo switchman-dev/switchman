@@ -231,6 +231,7 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
 
   assert(missingGoalOutput.includes('AI planning currently requires an explicit goal'), 'Plan requires an explicit goal even for Pro users');
   assert(missingGoalOutput.includes('switchman plan "Add authentication"'), 'Plan shows the supported explicit-goal command');
+  assert(missingGoalOutput.includes('switchman plan --issue 47'), 'Plan shows the supported GitHub issue command too');
 
   const previewOutput = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
@@ -266,6 +267,85 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
   const plannedTasks = listTasks(appliedDb).filter((task) => task.id.startsWith('plan-add-authentication-'));
   assert(plannedTasks.length >= 2, 'Plan apply creates multiple planned tasks');
   assert(getTaskSpec(appliedDb, plannedTasks[0].id)?.pipeline_id?.startsWith('plan-add-authentication-'), 'Plan apply stores a structured task spec for created tasks');
+  appliedDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
+test('Plan command can read a GitHub issue through gh and create planned tasks from it', () => {
+  const repoDir = join(tmpdir(), `sw-plan-issue-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-plan-issue-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  writeFileSync(join(repoDir, 'CLAUDE.md'), 'Keep auth work isolated and document API changes.\n');
+  execSync('git add README.md CLAUDE.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+
+  const planDb = initDb(repoDir);
+  registerWorktree(planDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(planDb, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
+  registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
+  planDb.close();
+
+  writeProTestCredentials(homeDir);
+
+  const ghCapturePath = join(repoDir, 'gh-issue-invocation.json');
+  const fakeGhPath = join(repoDir, 'fake-gh-issue');
+  writeFileSync(fakeGhPath, `#!/bin/sh
+printf '{"args":[' > ${JSON.stringify(ghCapturePath)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(ghCapturePath)}; fi
+  first=0
+  printf '%s' "$(printf '%s' "$arg" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/$/\"/; s/^/\"/')" >> ${JSON.stringify(ghCapturePath)}
+done
+printf ']}' >> ${JSON.stringify(ghCapturePath)}
+printf '{"title":"Add authentication","body":"Implement JWT login and logout routes","comments":[{"body":"Please include auth tests too."}]}\n'
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  const previewOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'plan',
+    '--issue',
+    '47',
+    '--gh-command',
+    fakeGhPath,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const invocation = JSON.parse(readFileSync(ghCapturePath, 'utf8'));
+  assert(invocation.args.includes('issue') && invocation.args.includes('view'), 'Plan issue mode invokes gh issue view');
+  assert(invocation.args.includes('47'), 'Plan issue mode requests the selected GitHub issue number');
+  assert(previewOutput.includes('Found: issue #47 "Add authentication"'), 'Plan issue mode reports the GitHub issue in the context summary');
+  assert(previewOutput.includes('Suggested plan based on:'), 'Plan issue mode explains its context sources');
+  assert(previewOutput.includes('GitHub issue #47'), 'Plan issue mode lists the GitHub issue as a planning source');
+  assert(previewOutput.includes('Implement: Add authentication'), 'Plan issue mode plans from the issue title');
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'plan',
+    '--issue',
+    '47',
+    '--gh-command',
+    fakeGhPath,
+    '--apply',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const appliedDb = openDb(repoDir);
+  const plannedTasks = listTasks(appliedDb).filter((task) => task.id.startsWith('plan-add-authentication-'));
+  assert(plannedTasks.length >= 2, 'Plan issue apply creates planned tasks from the GitHub issue');
   appliedDb.close();
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });

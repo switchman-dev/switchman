@@ -22,7 +22,7 @@ import ora from 'ora';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, posix } from 'path';
-import { execSync, spawn } from 'child_process';
+import { execSync, spawn, spawnSync } from 'child_process';
 
 import { cleanupCrashedLandingTempWorktrees, createGitWorktree, findRepoRoot, getWorktreeBranch, getWorktreeChangedFiles, gitAssessBranchFreshness, gitBranchExists, listGitWorktrees } from '../core/git.js';
 import { matchesPathPatterns } from '../core/ignore.js';
@@ -201,7 +201,7 @@ function summarizeRecentCommitContext(branchGoal, subjects) {
   return `${effectiveCount} recent ${topicLabel}commit${effectiveCount === 1 ? '' : 's'}`;
 }
 
-function collectPlanContext(repoRoot, explicitGoal = null) {
+function collectPlanContext(repoRoot, explicitGoal = null, issueContext = null) {
   const planningFiles = ['CLAUDE.md', 'ROADMAP.md', 'tasks.md', 'TASKS.md', 'TODO.md', 'README.md']
     .map((fileName) => readPlanningFile(repoRoot, fileName))
     .filter(Boolean);
@@ -218,14 +218,19 @@ function collectPlanContext(repoRoot, explicitGoal = null) {
     || planningByName.get('README.md')
     || null;
   const planningSignal = preferredPlanningFile ? extractMarkdownSignal(preferredPlanningFile.text) : null;
-  const title = capitalizeSentence(explicitGoal || branchGoal || planningSignal || 'Plan the next coordinated change');
+  const title = capitalizeSentence(issueContext?.title || explicitGoal || branchGoal || planningSignal || 'Plan the next coordinated change');
   const descriptionParts = [];
+  if (issueContext?.description) descriptionParts.push(issueContext.description);
   if (preferredPlanningFile?.text) descriptionParts.push(preferredPlanningFile.text);
   if (recentCommitSubjects.length > 0) descriptionParts.push(`Recent git history summary: ${recentCommitSubjects.slice(0, 3).join('; ')}.`);
   const description = descriptionParts.join('\n\n').trim() || null;
 
   const found = [];
   const used = [];
+  if (issueContext?.number) {
+    found.push(`issue #${issueContext.number} "${issueContext.title}"`);
+    used.push(`GitHub issue #${issueContext.number}`);
+  }
   if (explicitGoal) {
     used.push('explicit goal');
   }
@@ -248,6 +253,56 @@ function collectPlanContext(repoRoot, explicitGoal = null) {
     description,
     found,
     used: [...new Set(used)],
+  };
+}
+
+function fetchGitHubIssueContext(repoRoot, issueNumber, ghCommand = 'gh') {
+  const normalizedIssueNumber = String(issueNumber || '').trim();
+  if (!normalizedIssueNumber) {
+    throw new Error('A GitHub issue number is required.');
+  }
+
+  const result = spawnSync(ghCommand, [
+    'issue',
+    'view',
+    normalizedIssueNumber,
+    '--json',
+    'title,body,comments',
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+
+  if (result.error) {
+    throw new Error(`Could not run ${ghCommand} to read issue #${normalizedIssueNumber}. ${result.error.message}`);
+  }
+
+  if (result.status !== 0) {
+    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+    throw new Error(output || `gh issue view failed for issue #${normalizedIssueNumber}. Make sure gh is installed and authenticated.`);
+  }
+
+  let issue;
+  try {
+    issue = JSON.parse(result.stdout || '{}');
+  } catch {
+    throw new Error(`Could not parse GitHub issue #${normalizedIssueNumber}.`);
+  }
+
+  const comments = Array.isArray(issue.comments)
+    ? issue.comments.map((entry) => entry?.body || '').filter(Boolean)
+    : [];
+  const descriptionParts = [
+    `GitHub issue #${normalizedIssueNumber}: ${issue.title || 'Untitled issue'}`,
+    issue.body || '',
+    comments.length > 0 ? `Comments:\n${comments.join('\n---\n')}` : '',
+  ].filter(Boolean);
+
+  return {
+    number: normalizedIssueNumber,
+    title: issue.title || `Issue #${normalizedIssueNumber}`,
+    description: descriptionParts.join('\n\n'),
+    comment_count: comments.length,
   };
 }
 
@@ -3581,13 +3636,16 @@ Examples:
 
 program
   .command('plan [goal]')
-  .description('Pro: suggest a parallel task plan from an explicit goal')
+  .description('Pro: suggest a parallel task plan from an explicit goal or GitHub issue')
+  .option('--issue <number>', 'Read planning context from a GitHub issue via gh')
+  .option('--gh-command <command>', 'Executable to use for GitHub CLI', 'gh')
   .option('--apply', 'Create the suggested tasks in Switchman')
   .option('--max-tasks <n>', 'Maximum number of suggested tasks', '6')
   .option('--json', 'Output raw JSON')
   .addHelpText('after', `
 Examples:
   switchman plan "Add authentication"
+  switchman plan --issue 47
   switchman plan "Add authentication" --apply
 `)
   .action(async (goal, opts) => {
@@ -3606,17 +3664,29 @@ Examples:
         return;
       }
 
-      if (!goal || !goal.trim()) {
+      let issueContext = null;
+      if (opts.issue) {
+        try {
+          issueContext = fetchGitHubIssueContext(repoRoot, opts.issue, opts.ghCommand);
+        } catch (err) {
+          printErrorWithNext(err.message, 'switchman plan "Add authentication"');
+          process.exitCode = 1;
+          return;
+        }
+      }
+
+      if ((!goal || !goal.trim()) && !issueContext) {
         console.log('');
         console.log(chalk.yellow('  ⚠  AI planning currently requires an explicit goal.'));
         console.log(`  ${chalk.dim('Try:')} ${chalk.cyan('switchman plan "Add authentication"')}`);
+        console.log(`  ${chalk.dim('Or:  ')} ${chalk.cyan('switchman plan --issue 47')}`);
         console.log(`  ${chalk.dim('Then:')} ${chalk.cyan('switchman plan "Add authentication" --apply')}`);
         console.log('');
         process.exitCode = 1;
         return;
       }
 
-      const context = collectPlanContext(repoRoot, goal || null);
+      const context = collectPlanContext(repoRoot, goal || null, issueContext);
       const planningWorktrees = resolvePlanningWorktrees(repoRoot, db);
       const pipelineId = `plan-${slugifyValue(context.title)}-${Date.now().toString(36)}`;
       const plannedTasks = planPipelineTasks({

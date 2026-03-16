@@ -62,7 +62,7 @@ switchman login --status # check your plan
 - Unlimited concurrent agents (free: up to 3)
 - Cloud-synced team activity across machines
 - Team invites — `switchman team invite alice@example.com`
-- AI task planning — `switchman plan "Add authentication" --apply`
+- AI task planning — `switchman plan "Add authentication" --apply` or `switchman plan --issue 47`
 - 90-day audit trail (free: 7 days)
 - Email support within 48 hours
 
@@ -219,7 +219,6 @@ switchman policy show-change
 
 ## What's next
 
-- `switchman plan --issue 47` — plan from a GitHub issue
 - Zero-argument `switchman plan` — reads full repo context automatically
 - Live web dashboard for repo and agent visibility
 - Homebrew install path
