@@ -351,6 +351,127 @@ printf '{"title":"Add authentication","body":"Implement JWT login and logout rou
   rmSync(homeDir, { recursive: true, force: true });
 });
 
+test('Plan issue mode can post a summary comment back to the GitHub issue after apply', () => {
+  const repoDir = join(tmpdir(), `sw-plan-issue-comment-${Date.now()}`);
+  const homeDir = join(repoDir, '.home');
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+
+  const planDb = initDb(repoDir);
+  registerWorktree(planDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(planDb, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
+  registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
+  planDb.close();
+
+  writeProTestCredentials(homeDir);
+
+  const ghCapturePath = join(repoDir, 'gh-issue-comment-invocation.json');
+  const fakeGhPath = join(repoDir, 'fake-gh-issue-comment');
+  writeFileSync(fakeGhPath, `#!/bin/sh
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  printf '{"title":"Add authentication","body":"Implement JWT login and logout routes","comments":[{"body":"Please include auth tests too."}]}\n'
+  exit 0
+fi
+printf '{"args":[' > ${JSON.stringify(ghCapturePath)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(ghCapturePath)}; fi
+  first=0
+  printf '%s' "$(printf '%s' "$arg" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/$/\"/; s/^/\"/')" >> ${JSON.stringify(ghCapturePath)}
+done
+printf ']}' >> ${JSON.stringify(ghCapturePath)}
+printf 'commented\n'
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'plan',
+    '--issue',
+    '47',
+    '--gh-command',
+    fakeGhPath,
+    '--apply',
+    '--comment',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const invocation = JSON.parse(readFileSync(ghCapturePath, 'utf8'));
+  assert(invocation.args.includes('issue') && invocation.args.includes('comment'), 'Plan issue comment invokes gh issue comment');
+  assert(invocation.args.includes('47'), 'Plan issue comment targets the source issue');
+  assert(invocation.args.includes('--body-file'), 'Plan issue comment writes the summary through a body file');
+  assert(output.includes('Posted plan summary to issue #47'), 'Plan issue comment reports the posted issue summary');
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
+test('Plan apply can post a summary comment to a GitHub pull request', () => {
+  const repoDir = join(tmpdir(), `sw-plan-pr-comment-${Date.now()}`);
+  const homeDir = join(repoDir, '.home');
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+
+  const planDb = initDb(repoDir);
+  registerWorktree(planDb, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(planDb, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
+  registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
+  planDb.close();
+
+  writeProTestCredentials(homeDir);
+
+  const ghCapturePath = join(repoDir, 'gh-pr-comment-invocation.json');
+  const fakeGhPath = join(repoDir, 'fake-gh-pr-comment');
+  writeFileSync(fakeGhPath, `#!/bin/sh
+printf '{"args":[' > ${JSON.stringify(ghCapturePath)}
+first=1
+for arg in "$@"; do
+  if [ "$first" -eq 0 ]; then printf ',' >> ${JSON.stringify(ghCapturePath)}; fi
+  first=0
+  printf '%s' "$(printf '%s' "$arg" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g; s/$/\"/; s/^/\"/')" >> ${JSON.stringify(ghCapturePath)}
+done
+printf ']}' >> ${JSON.stringify(ghCapturePath)}
+printf 'commented\n'
+`);
+  chmodSync(fakeGhPath, 0o755);
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'plan',
+    'Add authentication',
+    '--gh-command',
+    fakeGhPath,
+    '--pr',
+    '123',
+    '--apply',
+    '--comment',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const invocation = JSON.parse(readFileSync(ghCapturePath, 'utf8'));
+  assert(invocation.args.includes('pr') && invocation.args.includes('comment'), 'Plan PR comment invokes gh pr comment');
+  assert(invocation.args.includes('123'), 'Plan PR comment targets the requested pull request');
+  assert(invocation.args.includes('--body-file'), 'Plan PR comment writes the summary through a body file');
+  assert(output.includes('Posted plan summary to PR #123'), 'Plan PR comment reports the posted PR summary');
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
 test('Planner keeps API documentation updates docs-only and treats payments work as high risk', () => {
   const repoDir = join(tmpdir(), `sw-plan-heuristics-${Date.now()}`);
   mkdirSync(join(repoDir, 'docs'), { recursive: true });

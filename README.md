@@ -62,7 +62,7 @@ switchman login --status # check your plan
 - Unlimited concurrent agents (free: up to 3)
 - Cloud-synced team activity across machines
 - Team invites — `switchman team invite alice@example.com`
-- AI task planning — `switchman plan "Add authentication" --apply` or `switchman plan --issue 47`
+- AI task planning — `switchman plan "Add authentication" --apply`, `switchman plan --issue 47`, and optionally `--comment` back to the issue or PR
 - 90-day audit trail (free: 7 days)
 - Email support within 48 hours
 
