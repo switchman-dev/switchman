@@ -223,15 +223,7 @@ async function refreshToken(refreshToken) {
  * Returns { success, email } or { success: false, error }
  */
 export async function loginWithGitHub() {
-  // Use Supabase's PKCE/implicit flow by opening the browser
-  // with a special device-style URL that redirects to a local callback
   const { default: open } = await import('open');
-
-  // We use a simple approach: direct the user to the Pro page sign-in
-  // which sets the session, then we poll Supabase for the session
-  // using a one-time code approach via the CLI callback server
-
-  // Start a tiny local HTTP server to catch the OAuth callback
   const { createServer } = await import('http');
 
   return new Promise((resolve) => {
@@ -239,59 +231,95 @@ export async function loginWithGitHub() {
     const timeout = setTimeout(() => {
       server?.close();
       resolve({ success: false, error: 'timeout' });
-    }, 5 * 60 * 1000); // 5 minute timeout
+    }, 5 * 60 * 1000);
 
     server = createServer(async (req, res) => {
       const url = new URL(req.url, 'http://localhost:7429');
 
       if (url.pathname === '/callback') {
-        const code = url.searchParams.get('code');
-        const error = url.searchParams.get('error');
+        const code         = url.searchParams.get('code');
+        const accessToken  = url.searchParams.get('access_token');
+        const refreshToken = url.searchParams.get('refresh_token');
+        const error        = url.searchParams.get('error');
 
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`
-          <!DOCTYPE html>
-          <html>
+          <!DOCTYPE html><html>
           <head><style>
-            body { background: #0b1020; color: #e6eef8; font-family: monospace;
-                   display: flex; align-items: center; justify-content: center;
-                   min-height: 100vh; margin: 0; }
-            .box { text-align: center; }
-            .ok { color: #4ade80; font-size: 48px; }
-            h2 { font-size: 24px; margin: 16px 0 8px; }
-            p { color: #5f7189; }
+            body { background:#0b1020; color:#e6eef8; font-family:monospace;
+                   display:flex; align-items:center; justify-content:center;
+                   min-height:100vh; margin:0; }
+            .box { text-align:center; }
+            .ok  { color:#4ade80; font-size:48px; }
+            .err { color:#f87171; font-size:48px; }
+            h2   { font-size:24px; margin:16px 0 8px; }
+            p    { color:#5f7189; }
           </style></head>
-          <body>
-            <div class="box">
-              <div class="ok">${error ? '✕' : '✓'}</div>
-              <h2>${error ? 'Sign in failed' : 'Signed in successfully'}</h2>
-              <p>${error ? 'You can close this tab.' : 'You can close this tab and return to your terminal.'}</p>
-            </div>
-          </body>
-          </html>
+          <body><div class="box">
+            <div class="${error ? 'err' : 'ok'}">${error ? '✕' : '✓'}</div>
+            <h2>${error ? 'Sign in failed' : 'Signed in successfully'}</h2>
+            <p>${error ? 'You can close this tab.' : 'You can close this tab and return to your terminal.'}</p>
+          </div></body></html>
         `);
 
         clearTimeout(timeout);
         server.close();
 
-        if (error || !code) {
-          resolve({ success: false, error: error || 'no_code' });
+        if (error) {
+          resolve({ success: false, error });
           return;
         }
 
-        // Exchange the code for a session via Supabase
-        try {
-          const tokenRes = await fetch(`${AUTH_URL}/token?grant_type=pkce`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'apikey': SUPABASE_ANON,
-            },
-            body: JSON.stringify({ auth_code: code }),
+        // If Supabase sent the token directly as query params
+        if (accessToken) {
+          saveSession({
+            access_token:  accessToken,
+            refresh_token: refreshToken ?? null,
+            expires_in:    3600,
+            user:          null, // will be fetched on next checkLicence
           });
+          // Fetch the user email from Supabase
+          try {
+            const userRes = await fetch(`${AUTH_URL}/user`, {
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'apikey': SUPABASE_ANON,
+              },
+            });
+            if (userRes.ok) {
+              const user = await userRes.json();
+              const creds = readCredentials() || {};
+              writeCredentials({ ...creds, email: user.email, user_id: user.id });
+              resolve({ success: true, email: user.email });
+            } else {
+              resolve({ success: true, email: null });
+            }
+          } catch {
+            resolve({ success: true, email: null });
+          }
+          return;
+        }
 
-          if (!tokenRes.ok) {
-            // Try the standard exchange endpoint
+        // Exchange the code for a session
+        if (code) {
+          try {
+            const tokenRes = await fetch(`${AUTH_URL}/token?grant_type=pkce`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'apikey': SUPABASE_ANON,
+              },
+              body: JSON.stringify({ auth_code: code }),
+            });
+
+            if (tokenRes.ok) {
+              const session = await tokenRes.json();
+              saveSession(session);
+              resolve({ success: true, email: session.user?.email ?? null });
+              return;
+            }
+
+            // Fallback exchange
             const exchangeRes = await fetch(`${AUTH_URL}/token?grant_type=authorization_code`, {
               method: 'POST',
               headers: {
@@ -301,32 +329,29 @@ export async function loginWithGitHub() {
               body: JSON.stringify({ code }),
             });
 
-            if (!exchangeRes.ok) {
-              resolve({ success: false, error: 'token_exchange_failed' });
+            if (exchangeRes.ok) {
+              const session = await exchangeRes.json();
+              saveSession(session);
+              resolve({ success: true, email: session.user?.email ?? null });
               return;
             }
 
-            const session = await exchangeRes.json();
-            saveSession(session);
-            resolve({ success: true, email: session.user?.email });
-            return;
+            resolve({ success: false, error: 'token_exchange_failed' });
+          } catch (err) {
+            resolve({ success: false, error: err.message });
           }
-
-          const session = await tokenRes.json();
-          saveSession(session);
-          resolve({ success: true, email: session.user?.email });
-        } catch (err) {
-          resolve({ success: false, error: err.message });
+          return;
         }
+
+        resolve({ success: false, error: 'no_code' });
       }
     });
 
     server.listen(7429, 'localhost', () => {
-      // Build the Supabase GitHub OAuth URL with our local callback
       const params = new URLSearchParams({
-        provider: 'github',
+        provider:    'github',
         redirect_to: 'http://localhost:7429/callback',
-        scopes: 'read:user user:email',
+        scopes:      'read:user user:email',
       });
 
       const loginUrl = `${AUTH_URL}/authorize?${params}`;
@@ -336,7 +361,7 @@ export async function loginWithGitHub() {
       console.log('');
 
       open(loginUrl).catch(() => {
-        console.log(`  Could not open browser automatically.`);
+        console.log('  Could not open browser automatically.');
         console.log(`  Please visit: ${loginUrl}`);
       });
     });
