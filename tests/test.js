@@ -6795,9 +6795,75 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
   assert(helpOutput.includes('For you (the operator):'), 'Top-level help includes an operator section');
   assert(helpOutput.includes('For your agents (via CLAUDE.md or MCP):'), 'Top-level help includes an agent section');
+  assert(helpOutput.includes('switchman claude refresh'), 'Top-level help includes the Claude guide refresh command');
   assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the explicit first task step');
   assert(helpOutput.includes('switchman plan "Add authentication"   (Pro)'), 'Top-level help marks planning as a Pro operator command');
   assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
+});
+
+test('Claude refresh writes a repo-aware CLAUDE.md from local repo signals', () => {
+  const repoDir = join(tmpdir(), `sw-claude-refresh-${Date.now()}`);
+  mkdirSync(join(repoDir, 'src'), { recursive: true });
+  mkdirSync(join(repoDir, 'tests'), { recursive: true });
+  mkdirSync(join(repoDir, 'docs'), { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'package.json'), JSON.stringify({
+    name: 'demo-app',
+    scripts: {
+      test: 'vitest run',
+      build: 'vite build',
+      lint: 'eslint .',
+    },
+  }, null, 2));
+  writeFileSync(join(repoDir, 'tsconfig.json'), '{}\n');
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md package.json tsconfig.json', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'claude',
+    'refresh',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const claudeGuide = readFileSync(join(repoDir, 'CLAUDE.md'), 'utf8');
+  assert(output.includes('Refreshed') || output.includes('Created'), 'Claude refresh reports the generated guide');
+  assert(claudeGuide.includes('Stack: Node.js + TypeScript'), 'Claude refresh detects the repo stack');
+  assert(claudeGuide.includes('Important paths: src/, tests/, docs/'), 'Claude refresh lists key repo paths');
+  assert(claudeGuide.includes('Tests: `npm run test`'), 'Claude refresh captures the repo test command');
+  assert(claudeGuide.includes('Lint: `npm run lint`'), 'Claude refresh captures the repo lint command');
+  assert(claudeGuide.includes('switchman_recover()'), 'Claude refresh includes recovery guidance');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Claude refresh can preview the generated guide without writing the file', () => {
+  const repoDir = join(tmpdir(), `sw-claude-refresh-print-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'claude',
+    'refresh',
+    '--print',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('# Switchman Agent Instructions'), 'Claude refresh --print renders the generated guide');
+  assert(!existsSync(join(repoDir, 'CLAUDE.md')), 'Claude refresh --print does not write CLAUDE.md');
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Fix 28k: demo command creates a self-contained proof repo with blocked overlap and safe landing', () => {
@@ -7107,6 +7173,7 @@ test('Verify-setup reports missing local editor config clearly', () => {
   assert(failed, 'verify-setup exits non-zero when required setup pieces are missing');
   assert(jsonOutput.checks.some((item) => item.key === 'cursor_mcp' && item.ok === false), 'verify-setup reports missing Cursor config');
   assert(jsonOutput.next_steps.some((step) => step.includes('`switchman setup --agents 3`')), 'verify-setup suggests how to restore local editor config');
+  assert(jsonOutput.next_steps.some((step) => step.includes('`switchman claude refresh`')), 'verify-setup suggests generating a repo-aware CLAUDE guide');
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(fakeHome, { recursive: true, force: true });
 });

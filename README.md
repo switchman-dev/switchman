@@ -89,10 +89,11 @@ What `switchman setup` gives you:
 Fastest path to success:
 1. Use Claude Code for the first run
 2. Run `switchman verify-setup` to confirm editor wiring
-3. Open one Claude Code window per generated workspace
-4. Add tasks before agents start
-5. Keep `switchman status --watch` open in a separate terminal
-6. Run `switchman gate ci && switchman queue run` when tasks finish
+3. Run `switchman claude refresh` to generate a repo-aware `CLAUDE.md`
+4. Open one Claude Code window per generated workspace
+5. Add tasks before agents start
+6. Keep `switchman status --watch` open in a separate terminal
+7. Run `switchman gate ci && switchman queue run` when tasks finish
 
 Editor setup guides:
 - [Claude Code](docs/setup-claude-code.md)

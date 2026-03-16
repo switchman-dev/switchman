@@ -33,13 +33,13 @@ If you prefer a global fallback, add this to `~/.claude/claude_desktop_config.js
 
 Project-local MCP config is still the preferred path because it travels with the repo and generated workspaces.
 
-## 3. Copy `CLAUDE.md` into your repo root
+## 3. Generate a repo-aware `CLAUDE.md`
 
 ```bash
-curl -O https://raw.githubusercontent.com/switchman-dev/switchman/main/CLAUDE.md
+switchman claude refresh
 ```
 
-This tells your agents how to use Switchman. Keep it in the repo root and do not let agents talk to `.switchman/switchman.db` directly.
+This generates a repo-aware guide in the repo root so your agents know how to use Switchman, which commands to prefer, and which repo conventions to follow. Keep it in the repo root and do not let agents talk to `.switchman/switchman.db` directly.
 
 ## 4. Add your tasks
 
