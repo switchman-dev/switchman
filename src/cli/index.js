@@ -65,6 +65,9 @@ import {
 import { checkLicence, clearCredentials, FREE_AGENT_LIMIT, getRetentionDaysForCurrentPlan, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
 import { homedir } from 'os';
 import { cleanupOldSyncEvents, pullActiveTeamMembers, pullTeamState, pushSyncEvent } from '../core/sync.js';
+import { registerClaudeCommands } from './commands/claude.js';
+import { registerMcpCommands } from './commands/mcp.js';
+import { registerTelemetryCommands } from './commands/telemetry.js';
 
 const originalProcessEmit = process.emit.bind(process);
 process.emit = function patchedProcessEmit(event, ...args) {
@@ -3795,169 +3798,33 @@ Use this after setup or whenever editor/config wiring feels off.
     }, { homeDir: opts.home || null });
     if (!report.ok) process.exitCode = 1;
   });
-
-const claudeCmd = program.command('claude').description('Generate or refresh Claude Code instructions for this repo');
-
-claudeCmd
-  .command('refresh')
-  .description('Generate a repo-aware CLAUDE.md for this repository')
-  .option('--print', 'Print the generated guide instead of writing CLAUDE.md')
-  .addHelpText('after', `
-Examples:
-  switchman claude refresh
-  switchman claude refresh --print
-`)
-  .action((opts) => {
-    const repoRoot = getRepo();
-    const claudeGuidePath = join(repoRoot, 'CLAUDE.md');
-    const content = renderClaudeGuide(repoRoot);
-
-    if (opts.print) {
-      process.stdout.write(content);
-      return;
-    }
-
-    const existed = existsSync(claudeGuidePath);
-    writeFileSync(claudeGuidePath, content, 'utf8');
-    console.log(`${chalk.green('✓')} ${existed ? 'Refreshed' : 'Created'} ${chalk.cyan(claudeGuidePath)}`);
-    console.log(`  ${chalk.dim('next:')} ${chalk.cyan('switchman verify-setup')}`);
-  });
+registerClaudeCommands(program, {
+  chalk,
+  existsSync,
+  getRepo,
+  join,
+  renderClaudeGuide,
+  writeFileSync,
+});
 
 
 // ── mcp ───────────────────────────────────────────────────────────────────────
 
-const mcpCmd = program.command('mcp').description('Manage editor connections for Switchman');
-const telemetryCmd = program.command('telemetry').description('Control anonymous opt-in telemetry for Switchman');
-
-telemetryCmd
-  .command('status')
-  .description('Show whether telemetry is enabled and where events would be sent')
-  .option('--home <path>', 'Override the home directory for telemetry config')
-  .option('--json', 'Output raw JSON')
-  .action((opts) => {
-    const config = loadTelemetryConfig(opts.home || undefined);
-    const runtime = getTelemetryRuntimeConfig();
-    const payload = {
-      enabled: config.telemetry_enabled === true,
-      configured: Boolean(runtime.apiKey) && !runtime.disabled,
-      install_id: config.telemetry_install_id,
-      destination: runtime.apiKey && !runtime.disabled ? runtime.host : null,
-      config_path: getTelemetryConfigPath(opts.home || undefined),
-    };
-
-    if (opts.json) {
-      console.log(JSON.stringify(payload, null, 2));
-      return;
-    }
-
-    console.log(`Telemetry: ${payload.enabled ? chalk.green('enabled') : chalk.yellow('disabled')}`);
-    console.log(`Configured destination: ${payload.configured ? chalk.cyan(payload.destination) : chalk.dim('not configured')}`);
-    console.log(`Config file: ${chalk.dim(payload.config_path)}`);
-    if (payload.install_id) {
-      console.log(`Install ID: ${chalk.dim(payload.install_id)}`);
-    }
-  });
-
-telemetryCmd
-  .command('enable')
-  .description('Enable anonymous telemetry for setup and operator workflows')
-  .option('--home <path>', 'Override the home directory for telemetry config')
-  .action((opts) => {
-    const runtime = getTelemetryRuntimeConfig();
-    if (!runtime.apiKey || runtime.disabled) {
-      printErrorWithNext('Telemetry destination is not configured. Set SWITCHMAN_TELEMETRY_API_KEY first.', 'switchman telemetry status');
-      process.exitCode = 1;
-      return;
-    }
-    const result = enableTelemetry(opts.home || undefined);
-    console.log(`${chalk.green('✓')} Telemetry enabled`);
-    console.log(`  ${chalk.dim(result.path)}`);
-  });
-
-telemetryCmd
-  .command('disable')
-  .description('Disable anonymous telemetry')
-  .option('--home <path>', 'Override the home directory for telemetry config')
-  .action((opts) => {
-    const result = disableTelemetry(opts.home || undefined);
-    console.log(`${chalk.green('✓')} Telemetry disabled`);
-    console.log(`  ${chalk.dim(result.path)}`);
-  });
-
-telemetryCmd
-  .command('test')
-  .description('Send one test telemetry event and report whether delivery succeeded')
-  .option('--home <path>', 'Override the home directory for telemetry config')
-  .option('--json', 'Output raw JSON')
-  .action(async (opts) => {
-    const result = await sendTelemetryEvent('telemetry_test', {
-      app_version: program.version(),
-      os: process.platform,
-      node_version: process.version,
-      source: 'switchman-cli-test',
-    }, { homeDir: opts.home || undefined });
-
-    if (opts.json) {
-      console.log(JSON.stringify(result, null, 2));
-      if (!result.ok) process.exitCode = 1;
-      return;
-    }
-
-    if (result.ok) {
-      console.log(`${chalk.green('✓')} Telemetry test event delivered`);
-      console.log(`  ${chalk.dim('destination:')} ${chalk.cyan(result.destination)}`);
-      if (result.status) {
-        console.log(`  ${chalk.dim('status:')} ${result.status}`);
-      }
-      return;
-    }
-
-    printErrorWithNext(`Telemetry test failed (${result.reason || 'unknown_error'}).`, 'switchman telemetry status');
-    console.log(`  ${chalk.dim('destination:')} ${result.destination || 'unknown'}`);
-    if (result.status) {
-      console.log(`  ${chalk.dim('status:')} ${result.status}`);
-    }
-    if (result.error) {
-      console.log(`  ${chalk.dim('error:')} ${result.error}`);
-    }
-    process.exitCode = 1;
-  });
-
-mcpCmd
-  .command('install')
-  .description('Install editor-specific MCP config for Switchman')
-  .option('--windsurf', 'Write Windsurf MCP config to ~/.codeium/mcp_config.json')
-  .option('--home <path>', 'Override the home directory for config writes (useful for testing)')
-  .option('--json', 'Output raw JSON')
-  .addHelpText('after', `
-Examples:
-  switchman mcp install --windsurf
-  switchman mcp install --windsurf --json
-`)
-  .action((opts) => {
-    if (!opts.windsurf) {
-      console.error(chalk.red('Choose an editor install target, for example `switchman mcp install --windsurf`.'));
-      process.exitCode = 1;
-      return;
-    }
-
-    const result = upsertWindsurfMcpConfig(opts.home);
-
-    if (opts.json) {
-      console.log(JSON.stringify({
-        editor: 'windsurf',
-        path: result.path,
-        created: result.created,
-        changed: result.changed,
-      }, null, 2));
-      return;
-    }
-
-    console.log(`${chalk.green('✓')} Windsurf MCP config ${result.changed ? 'written' : 'already up to date'}`);
-    console.log(`  ${chalk.dim('path:')} ${chalk.cyan(result.path)}`);
-    console.log(`  ${chalk.dim('open:')} Windsurf -> Settings -> Cascade -> MCP Servers`);
-    console.log(`  ${chalk.dim('note:')} Windsurf reads the shared config from ${getWindsurfMcpConfigPath(opts.home)}`);
-  });
+registerMcpCommands(program, {
+  chalk,
+  getWindsurfMcpConfigPath,
+  upsertWindsurfMcpConfig,
+});
+registerTelemetryCommands(program, {
+  chalk,
+  disableTelemetry,
+  enableTelemetry,
+  getTelemetryConfigPath,
+  getTelemetryRuntimeConfig,
+  loadTelemetryConfig,
+  printErrorWithNext,
+  sendTelemetryEvent,
+});
 
 
 // ── plan ──────────────────────────────────────────────────────────────────────
