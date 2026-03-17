@@ -224,153 +224,107 @@ async function refreshToken(refreshToken) {
  */
 export async function loginWithGitHub() {
   const { default: open } = await import('open');
-  const { createServer } = await import('http');
 
-  return new Promise((resolve) => {
-    let server;
-    const timeout = setTimeout(() => {
-      server?.close();
-      resolve({ success: false, error: 'timeout' });
-    }, 5 * 60 * 1000);
+  // ── Step 1: Generate a short human-readable code ──────────────────────────
+  const adjectives = ['SWIFT', 'CLEAR', 'SAFE', 'CLEAN', 'FAST', 'BOLD', 'CALM', 'KEEN'];
+  const adj = adjectives[Math.floor(Math.random() * adjectives.length)];
+  const num = Math.floor(1000 + Math.random() * 9000);
+  const code = `${adj}-${num}`;
 
-    server = createServer(async (req, res) => {
-      const url = new URL(req.url, 'http://localhost:7429');
-
-      if (url.pathname === '/callback') {
-        const code         = url.searchParams.get('code');
-        const accessToken  = url.searchParams.get('access_token');
-        const refreshToken = url.searchParams.get('refresh_token');
-        const error        = url.searchParams.get('error');
-
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(`
-          <!DOCTYPE html><html>
-          <head><style>
-            body { background:#0b1020; color:#e6eef8; font-family:monospace;
-                   display:flex; align-items:center; justify-content:center;
-                   min-height:100vh; margin:0; }
-            .box { text-align:center; }
-            .ok  { color:#4ade80; font-size:48px; }
-            .err { color:#f87171; font-size:48px; }
-            h2   { font-size:24px; margin:16px 0 8px; }
-            p    { color:#5f7189; }
-          </style></head>
-          <body><div class="box">
-            <div class="${error ? 'err' : 'ok'}">${error ? '✕' : '✓'}</div>
-            <h2>${error ? 'Sign in failed' : 'Signed in successfully'}</h2>
-            <p>${error ? 'You can close this tab.' : 'You can close this tab and return to your terminal.'}</p>
-          </div></body></html>
-        `);
-
-        clearTimeout(timeout);
-        server.close();
-
-        if (error) {
-          resolve({ success: false, error });
-          return;
-        }
-
-        // If Supabase sent the token directly as query params
-        if (accessToken) {
-          saveSession({
-            access_token:  accessToken,
-            refresh_token: refreshToken ?? null,
-            expires_in:    3600,
-            user:          null, // will be fetched on next checkLicence
-          });
-          // Fetch the user email from Supabase
-          try {
-            const userRes = await fetch(`${AUTH_URL}/user`, {
-              headers: {
-                'Authorization': `Bearer ${accessToken}`,
-                'apikey': SUPABASE_ANON,
-              },
-            });
-            if (userRes.ok) {
-              const user = await userRes.json();
-              const creds = readCredentials() || {};
-              writeCredentials({ ...creds, email: user.email, user_id: user.id });
-              resolve({ success: true, email: user.email });
-            } else {
-              resolve({ success: true, email: null });
-            }
-          } catch {
-            resolve({ success: true, email: null });
-          }
-          return;
-        }
-
-        // Exchange the code for a session
-        if (code) {
-          try {
-            const tokenRes = await fetch(`${AUTH_URL}/token?grant_type=pkce`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'apikey': SUPABASE_ANON,
-              },
-              body: JSON.stringify({ auth_code: code }),
-            });
-
-            if (tokenRes.ok) {
-              const session = await tokenRes.json();
-              saveSession(session);
-              resolve({ success: true, email: session.user?.email ?? null });
-              return;
-            }
-
-            // Fallback exchange
-            const exchangeRes = await fetch(`${AUTH_URL}/token?grant_type=authorization_code`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'apikey': SUPABASE_ANON,
-              },
-              body: JSON.stringify({ code }),
-            });
-
-            if (exchangeRes.ok) {
-              const session = await exchangeRes.json();
-              saveSession(session);
-              resolve({ success: true, email: session.user?.email ?? null });
-              return;
-            }
-
-            resolve({ success: false, error: 'token_exchange_failed' });
-          } catch (err) {
-            resolve({ success: false, error: err.message });
-          }
-          return;
-        }
-
-        resolve({ success: false, error: 'no_code' });
-      }
+  // ── Step 2: Store the pending code in Supabase ────────────────────────────
+  try {
+    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/cli_auth_codes`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON,
+        'Prefer': 'return=minimal',
+      },
+      body: JSON.stringify({
+        code,
+        status: 'pending',
+      }),
     });
 
-    server.listen(7429, 'localhost', () => {
-      const params = new URLSearchParams({
-        provider:    'github',
-        redirect_to: 'http://localhost:7429/callback',
-        scopes:      'read:user user:email',
-      });
+    if (!insertRes.ok) {
+      return { success: false, error: 'Could not create auth session. Please try again.' };
+    }
+  } catch {
+    return { success: false, error: 'Network error. Please check your connection.' };
+  }
 
-      const loginUrl = `${AUTH_URL}/authorize?${params}`;
-      console.log('');
-      console.log('  Opening GitHub sign-in in your browser...');
-      console.log(`  If it doesn\'t open, visit: ${loginUrl}`);
-      console.log('');
+  // ── Step 3: Open the activate page in the browser ─────────────────────────
+  const activateUrl = `https://switchman.dev/activate?code=${code}`;
 
-      open(loginUrl).catch(() => {
-        console.log('  Could not open browser automatically.');
-        console.log(`  Please visit: ${loginUrl}`);
-      });
-    });
+  console.log('');
+  console.log('  Visit this URL to sign in:');
+  console.log(`  ${activateUrl}`);
+  console.log('');
+  console.log(`  Your code: ${code}`);
+  console.log('');
+  console.log('  Waiting for authorization...');
 
-    server.on('error', (err) => {
-      clearTimeout(timeout);
-      resolve({ success: false, error: err.message });
-    });
+  open(activateUrl).catch(() => {
+    // Browser didn't open — user can copy the URL manually
   });
+
+  // ── Step 4: Poll Supabase every 2 seconds for up to 10 minutes ────────────
+  const POLL_INTERVAL_MS = 2000;
+  const MAX_WAIT_MS      = 10 * 60 * 1000;
+  const started          = Date.now();
+
+  while (Date.now() - started < MAX_WAIT_MS) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+
+    try {
+      const pollRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/cli_auth_codes?code=eq.${code}&select=status,access_token,refresh_token,user_email,user_id`,
+        {
+          headers: {
+            'apikey': SUPABASE_ANON,
+            'Accept': 'application/json',
+          },
+        }
+      );
+
+      if (!pollRes.ok) continue;
+
+      const rows = await pollRes.json();
+      const row  = rows?.[0];
+
+      if (!row) continue;
+
+      if (row.status === 'expired') {
+        return { success: false, error: 'Code expired. Please run switchman login again.' };
+      }
+
+      if (row.status === 'authorized' && row.access_token) {
+        // Save the credentials
+        writeCredentials({
+          access_token:  row.access_token,
+          refresh_token: row.refresh_token ?? null,
+          expires_at:    Date.now() + 3600 * 1000,
+          email:         row.user_email ?? null,
+          user_id:       row.user_id ?? null,
+        });
+        clearLicenceCache();
+
+        // Clean up the code row
+        fetch(`${SUPABASE_URL}/rest/v1/cli_auth_codes?code=eq.${code}`, {
+          method: 'DELETE',
+          headers: { 'apikey': SUPABASE_ANON },
+        }).catch(() => {});
+
+        return { success: true, email: row.user_email };
+      }
+
+      // status === 'pending' — keep polling
+    } catch {
+      // Network blip — keep polling
+    }
+  }
+
+  return { success: false, error: 'timeout' };
 }
 
 function saveSession(session) {
