@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "switchman": "src/cli/index.js",
+    "switchman": "bin/switchman.js",
     "switchman-mcp": "src/mcp/server.js"
   },
   "repository": {
