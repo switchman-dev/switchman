@@ -134,12 +134,13 @@ export async function checkLicence() {
 
   // Try live validation
   try {
-    const res = await fetch(VALIDATE_URL, {
-      headers: {
-        'Authorization': `Bearer ${creds.access_token}`,
-        'apikey': SUPABASE_ANON,
-      },
-    });
+   const res = await fetch(VALIDATE_URL, {
+  headers: {
+    'Authorization': `Bearer ${SUPABASE_ANON}`,
+    'apikey': SUPABASE_ANON,
+    'x-user-token': creds.access_token,
+  },
+});
 
     if (!res.ok) {
       // If token is expired, try to refresh
