@@ -1,10 +1,5 @@
-examples/worktrees/
-examples/taskapi/package-lock.json
+docs/
 tests/
-.switchman/
-landing/
-logo/
-*.md
-!README.md
-!CHANGELOG.md
-!CLAUDE.md
+tests.zip
+*.zip
+.markdownlint.json
