@@ -32,6 +32,7 @@ switchman demo
 ```
 
 Creates a throwaway repo and shows:
+
 - agent1 claiming `src/auth.js`
 - agent2 getting blocked from the same file
 - agent2 rerouting safely to `docs/auth-flow.md`
@@ -61,6 +62,7 @@ switchman login --status # check your plan
 ```
 
 **What's in Pro:**
+
 - Unlimited concurrent agents (free: up to 3)
 - Cloud-synced team activity across machines
 - Team invites — `switchman team invite alice@example.com`
@@ -84,11 +86,13 @@ switchman queue run
 ```
 
 What `switchman setup` gives you:
+
 - a shared Switchman database in `.switchman/`
 - linked agent workspaces
 - MCP config for Claude Code and Cursor
 
 Fastest path to success:
+
 1. Use Claude Code for the first run
 2. Run `switchman verify-setup` to confirm editor wiring
 3. Run `switchman claude refresh` to generate a repo-aware `CLAUDE.md`
@@ -98,6 +102,7 @@ Fastest path to success:
 7. Run `switchman gate ci && switchman queue run` when tasks finish
 
 Editor setup guides:
+
 - [Claude Code](docs/setup-claude-code.md)
 - [Cursor](docs/setup-cursor.md)
 - [Windsurf](docs/setup-windsurf.md)
@@ -109,12 +114,14 @@ Editor setup guides:
 Git gives you branches. Switchman gives you coordination.
 
 Branches and worktrees solve isolation — they do not tell you:
+
 - which task each agent should take next
 - who already owns a file
 - whether a session is stale
 - whether finished work is safe to land
 
 Switchman adds:
+
 - **Task planning** — break goals into governed parallel work
 - **File locking** — parallel edits don't quietly collide
 - **Live status** — see what's running, blocked, or stale
@@ -153,6 +160,7 @@ switchman gate ci
 ```
 
 What good looks like:
+
 - each agent stayed in its own lane
 - overlap was blocked before wasted work spread
 - the queue made it obvious what should land now and what should wait
@@ -189,6 +197,7 @@ switchman explain landing <pipeline-id>
 ```
 
 More help:
+
 - [Status and recovery](docs/status-and-recovery.md)
 - [Merge queue](docs/merge-queue.md)
 - [Pipelines and PRs](docs/pipelines.md)
