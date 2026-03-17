@@ -6352,19 +6352,22 @@ Examples:
     const licence = await checkLicence();
  
     console.log(`  ${chalk.green('✓')} Signed in as ${chalk.cyan(result.email ?? 'unknown')}`);
- 
+
     if (licence.valid) {
+      console.log(`  ${chalk.green('✓')} Pro licence verified — all features unlocked`);
       console.log(`  ${chalk.green('✓')} Switchman Pro active`);
       console.log(`  ${chalk.dim('Plan:')} ${licence.plan ?? 'Pro'}`);
       console.log('');
       console.log(`  ${chalk.dim('Credentials saved · valid 24h · 7-day offline grace')}`);
       console.log('');
-      console.log(`  Run ${chalk.cyan('switchman setup --agents 10')} to use unlimited agents.`);
+      console.log(`  Run ${chalk.cyan('switchman setup --agents 10')} to start with unlimited agents.`);
     } else {
-      console.log(`  ${chalk.yellow('⚠')} No active Pro licence found`);
+      console.log(`  ${chalk.yellow('⚠')} Signed in — no Pro licence found yet`);
       console.log('');
-      console.log(`  If you just paid, it may take a moment to activate.`);
-      console.log(`  ${chalk.dim('Upgrade at:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+      console.log(`  ${chalk.dim('If you just subscribed, Polar may take 30–60 seconds to activate.')}`);
+      console.log(`  ${chalk.dim('Check your status with:')} ${chalk.cyan('switchman login --status')}`);
+      console.log('');
+      console.log(`  ${chalk.dim('Not subscribed yet?')} ${chalk.cyan(PRO_PAGE_URL)}`);
     }
  
     console.log('');
