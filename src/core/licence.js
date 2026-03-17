@@ -123,6 +123,13 @@ export async function checkLicence() {
     return { valid: false, reason: 'not_logged_in' };
   }
 
+   // Proactively refresh if token expires within 5 minutes
+  if (creds.expires_at && Date.now() > creds.expires_at - 5 * 60 * 1000) {
+    if (creds.refresh_token) {
+      await refreshToken(creds.refresh_token);
+    }
+  }
+
   // Check the 24-hour cache first
   const cache = readLicenceCache();
   if (cache?.valid && cache.cached_at) {
