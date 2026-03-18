@@ -205,6 +205,7 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
     ], {
       cwd: repoDir,
       encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir },
     });
   } catch (err) {
     unpaidOutput = err.stdout || '';
