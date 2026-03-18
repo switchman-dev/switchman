@@ -103,6 +103,7 @@ import {
   repairRepoState,
 } from './repair.js';
 import {
+  buildSessionSummary,
   analyzeTaskScope,
   buildClaimExplainReport,
   buildDoctorReport,
@@ -679,6 +680,7 @@ const ROOT_HELP_COMMANDS = new Set([
   'plan',
   'task',
   'status',
+  'session-summary',
   'recover',
   'merge',
   'repair',
@@ -697,6 +699,7 @@ Start here:
   switchman setup --agents 3
   switchman task add "Your task" --priority 8
   switchman status --watch
+  switchman session-summary
   switchman recover
   switchman gate ci && switchman queue run
 
@@ -706,6 +709,7 @@ For you (the operator):
   switchman claude refresh
   switchman task add
   switchman status
+  switchman session-summary
   switchman recover
   switchman merge
   switchman repair
@@ -864,12 +868,12 @@ Examples:
       const licence = await checkLicence();
       if (!licence.valid) {
         console.log('');
-        console.log(chalk.yellow(`  ⚠  Free tier supports up to ${FREE_AGENT_LIMIT} agents.`));
+        console.log(chalk.red(`  ✗ Agent limit reached (${FREE_AGENT_LIMIT}/${FREE_AGENT_LIMIT})`));
         console.log('');
-        console.log(`  You requested ${chalk.cyan(agentCount)} agents — that requires ${chalk.bold('Switchman Pro')}.`);
+        console.log(`  You need ${chalk.cyan(`agent${agentCount}`)} right now.`);
         console.log('');
-        console.log(`  ${chalk.dim('Upgrade at:')} ${chalk.cyan(PRO_PAGE_URL)}`);
-        console.log(`  ${chalk.dim('Or run:   ')} ${chalk.cyan('switchman upgrade')}`);
+        console.log(`  Unlock unlimited agents in 60 seconds -> ${chalk.cyan('switchman upgrade')}`);
+        console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
         console.log('');
         process.exit(1);
       }
@@ -1077,8 +1081,9 @@ Examples:
       const licence = await checkLicence();
       if (!licence.valid) {
         console.log('');
-        console.log(chalk.yellow('  ⚠  AI planning requires Switchman Pro.'));
-        console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman upgrade')}`);
+        console.log(chalk.red('  ✗ switchman plan is a Pro feature'));
+        console.log(`  ${chalk.dim('Generate parallel task plans from a goal — your repo context, your codebase, structured for agents.')}`);
+        console.log(`  ${chalk.dim('Try it free for 30 days ->')} ${chalk.cyan('switchman upgrade')}`);
         console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
         console.log('');
         process.exitCode = 1;
@@ -1982,6 +1987,7 @@ program
   });
 
 registerOperatorCommands(program, {
+  buildSessionSummary,
   buildDoctorReport,
   buildRecoverReport,
   buildWatchSignature,

@@ -1,5 +1,6 @@
 export function registerOperatorCommands(program, deps) {
   const {
+    buildSessionSummary,
     buildDoctorReport,
     buildRecoverReport,
     chalk,
@@ -33,6 +34,48 @@ export function registerOperatorCommands(program, deps) {
     summarizeTeamCoordinationState,
     buildWatchSignature,
   } = deps;
+
+  program
+    .command('session-summary')
+    .description('Show what Switchman prevented, recovered, and landed in this recent session')
+    .option('--hours <n>', 'How many recent hours to summarize', '8')
+    .option('--json', 'Output raw JSON')
+    .addHelpText('after', `
+Examples:
+  switchman session-summary
+  switchman session-summary --hours 24
+  switchman session-summary --json
+`)
+    .action(async (opts) => {
+      const repoRoot = getRepo();
+      const report = await buildSessionSummary(repoRoot, {
+        hours: Math.max(1, Number.parseInt(opts.hours, 10) || 8),
+      });
+
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      console.log('');
+      console.log(chalk.bold('Session summary'));
+      console.log(chalk.dim(`Last ${report.hours} hour(s)`));
+      console.log(`  ${chalk.green('✓')} ${report.metrics.rogue_writes_blocked} rogue write${report.metrics.rogue_writes_blocked === 1 ? '' : 's'} blocked`);
+      console.log(`  ${chalk.green('✓')} ${report.metrics.retries_scheduled} retry / recovery handoff${report.metrics.retries_scheduled === 1 ? '' : 's'} recorded`);
+      console.log(`  ${chalk.green('✓')} ${report.metrics.queue_blocks_avoided} risky landing issue${report.metrics.queue_blocks_avoided === 1 ? '' : 's'} caught`);
+      console.log(`  ${chalk.green('✓')} ${report.metrics.queue_merges_completed} safe merge${report.metrics.queue_merges_completed === 1 ? '' : 's'} completed`);
+      if (report.estimated_minutes_saved > 0) {
+        console.log('');
+        console.log(chalk.dim(`Estimated coordination time saved: ~${report.estimated_minutes_saved} minute${report.estimated_minutes_saved === 1 ? '' : 's'}`));
+      }
+      if (report.upgrade_cta) {
+        console.log('');
+        console.log(chalk.yellow(report.upgrade_cta.title));
+        console.log(`  ${chalk.dim(report.upgrade_cta.detail)}`);
+        console.log(`  ${chalk.cyan(report.upgrade_cta.command)}`);
+      }
+      console.log('');
+    });
 
   program
     .command('scan')

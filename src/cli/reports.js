@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import { execSync } from 'child_process';
 import { posix } from 'path';
 
 import { matchesPathPatterns } from '../core/ignore.js';
@@ -22,7 +23,7 @@ import {
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
-import { getRetentionDaysForCurrentPlan } from '../core/licence.js';
+import { FREE_RETENTION_DAYS, getRetentionDaysForCurrentPlan } from '../core/licence.js';
 import { loadChangePolicy, loadLeasePolicy } from '../core/policy.js';
 import { getPipelineLandingExplainReport, getPipelineStatus, summarizePipelinePolicyState } from '../core/pipeline.js';
 import { buildQueueStatusSummary, resolveQueueSource } from '../core/queue.js';
@@ -37,6 +38,58 @@ import {
   renderPanel,
   renderSignalStrip,
 } from './ui.js';
+
+function listRecentGitAuthors(repoRoot, limit = 30) {
+  try {
+    return [...new Set(
+      execSync(`git log --format=%ae -n ${limit}`, {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+        .split('\n')
+        .map((line) => line.trim().toLowerCase())
+        .filter(Boolean),
+    )];
+  } catch {
+    return [];
+  }
+}
+
+function buildUpgradeHints({ repoRoot, retentionDays, oldestAuditAt = null, recentAuthors = [] }) {
+  const hints = [];
+
+  if (Number(retentionDays) === FREE_RETENTION_DAYS && oldestAuditAt) {
+    const oldest = new Date(oldestAuditAt);
+    if (!Number.isNaN(oldest.getTime())) {
+      const ageDays = Math.floor((Date.now() - oldest.getTime()) / (24 * 60 * 60 * 1000));
+      const daysUntilExpiry = Math.max(0, FREE_RETENTION_DAYS - ageDays);
+      if (daysUntilExpiry <= 2) {
+        hints.push({
+          kind: 'history_retention',
+          severity: 'warn',
+          title: `Your task history expires in ${daysUntilExpiry} day${daysUntilExpiry === 1 ? '' : 's'}`,
+          detail: `Free history keeps ${FREE_RETENTION_DAYS} days of audit trail in ${repoRoot}. Pro keeps 90 days for debugging, handoff, and incident review.`,
+          next_step: 'upgrade before the oldest recent work rolls out of local history',
+          command: 'switchman upgrade',
+        });
+      }
+    }
+  }
+
+  if (Number(retentionDays) === FREE_RETENTION_DAYS && recentAuthors.length > 1) {
+    hints.push({
+      kind: 'team_visibility',
+      severity: 'warn',
+      title: 'Multiple developers are active in this repo',
+      detail: `Recent git history shows ${recentAuthors.length} contributors. Free coordination is local to one machine; Pro adds shared cloud state, handoff, and team visibility.`,
+      next_step: 'upgrade if this repo is becoming shared operational territory',
+      command: 'switchman upgrade',
+    });
+  }
+
+  return hints;
+}
 
 function normalizeCliRepoPath(targetPath) {
   const rawPath = String(targetPath || '').replace(/\\/g, '/').trim();
@@ -1047,6 +1100,7 @@ function buildUnifiedStatusReport({
   queueSummary,
   recentQueueEvents,
   retentionDays = 7,
+  upgradeHints = [],
 }) {
   const queueAttention = [
     ...queueItems
@@ -1071,7 +1125,11 @@ function buildUnifiedStatusReport({
       })),
   ];
 
-  const attention = [...doctorReport.attention, ...queueAttention];
+  const upgradeAttention = upgradeHints.map((hint) => ({
+    ...hint,
+    severity: hint.severity || 'warn',
+  }));
+  const attention = [...doctorReport.attention, ...queueAttention, ...upgradeAttention];
   const nextUp = tasks
     .filter((task) => task.status === 'pending')
     .sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0))
@@ -1094,6 +1152,7 @@ function buildUnifiedStatusReport({
     ...doctorReport.suggested_commands,
     ...(queueItems.length > 0 ? ['switchman queue status'] : []),
     ...(queueSummary.next ? ['switchman queue run'] : []),
+    ...upgradeHints.map((hint) => hint.command).filter(Boolean),
   ].filter(Boolean);
   const isFirstRunReady = tasks.length === 0
     && doctorReport.active_work.length === 0
@@ -1149,9 +1208,11 @@ function buildUnifiedStatusReport({
     next_steps: [...new Set([
       ...(attention.length > 0 ? doctorReport.next_steps : defaultNextSteps),
       ...queueAttention.map((item) => item.next_step),
+      ...upgradeHints.map((item) => item.next_step),
     ])].slice(0, 6),
     suggested_commands: [...new Set(attention.length > 0 ? suggestedCommands : defaultSuggestedCommands)].slice(0, 6),
     retention_days: retentionDays,
+    upgrade_hints: upgradeHints,
   };
 }
 
@@ -1180,6 +1241,18 @@ export async function collectStatusSnapshot(repoRoot) {
       .flatMap((item) => listMergeQueueEvents(db, item.id, { limit: 3 }).map((event) => ({ ...event, queue_item_id: item.id })))
       .sort((a, b) => b.id - a.id)
       .slice(0, 8);
+    const recentAuditEvents = listAuditEvents(db, { limit: 5000 });
+    const oldestAuditAt = recentAuditEvents.length > 0
+      ? recentAuditEvents.reduce((oldest, event) =>
+        !oldest || String(event.created_at || '') < String(oldest) ? event.created_at : oldest,
+      null)
+      : null;
+    const upgradeHints = buildUpgradeHints({
+      repoRoot,
+      retentionDays,
+      oldestAuditAt,
+      recentAuthors: listRecentGitAuthors(repoRoot),
+    });
     const scanReport = await scanAllWorktrees(db, repoRoot);
     const aiGate = await runAiMergeGate(db, repoRoot);
     const doctorReport = buildDoctorReport({
@@ -1202,7 +1275,57 @@ export async function collectStatusSnapshot(repoRoot) {
       queueSummary,
       recentQueueEvents,
       retentionDays,
+      upgradeHints,
     });
+  } finally {
+    db.close();
+  }
+}
+
+export async function buildSessionSummary(repoRoot, { hours = 8 } = {}) {
+  const db = openDb(repoRoot);
+  try {
+    const retentionDays = await getRetentionDaysForCurrentPlan();
+    const since = Date.now() - Math.max(1, Number(hours) || 8) * 60 * 60 * 1000;
+    const isRecent = (isoString) => {
+      const timestamp = new Date(isoString || '').getTime();
+      return !Number.isNaN(timestamp) && timestamp >= since;
+    };
+
+    const auditEvents = listAuditEvents(db, { limit: 5000 }).filter((event) => isRecent(event.created_at));
+    const queueItems = listMergeQueue(db);
+    const queueEvents = queueItems
+      .flatMap((item) => listMergeQueueEvents(db, item.id, { limit: 50 }).map((event) => ({ ...event, item })))
+      .filter((event) => isRecent(event.created_at));
+
+    const metrics = {
+      tasks_completed: auditEvents.filter((event) => event.event_type === 'task_completed').length,
+      retries_scheduled: auditEvents.filter((event) => event.event_type === 'task_retried' || event.event_type === 'pipeline_task_retry_scheduled').length,
+      rogue_writes_blocked: auditEvents.filter((event) => event.event_type === 'write_observed' && event.status === 'denied').length,
+      queue_merges_completed: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && event.status === 'merged').length,
+      queue_blocks_avoided: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && ['blocked', 'retrying', 'wave_blocked', 'escalated', 'held'].includes(event.status)).length,
+    };
+
+    const estimatedMinutesSaved =
+      metrics.rogue_writes_blocked * 12 +
+      metrics.retries_scheduled * 10 +
+      metrics.queue_blocks_avoided * 8 +
+      metrics.queue_merges_completed * 4;
+
+    return {
+      generated_at: new Date().toISOString(),
+      hours: Math.max(1, Number(hours) || 8),
+      retention_days: retentionDays,
+      metrics,
+      estimated_minutes_saved: estimatedMinutesSaved,
+      upgrade_cta: retentionDays === FREE_RETENTION_DAYS
+        ? {
+          title: 'Running a bigger team or longer agent sessions?',
+          command: 'switchman upgrade',
+          detail: 'Pro adds unlimited agents, shared cloud state, and 90-day history.',
+        }
+        : null,
+    };
   } finally {
     db.close();
   }

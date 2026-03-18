@@ -211,7 +211,8 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
     unpaidOutput = err.stdout || '';
   }
 
-  assert(unpaidOutput.includes('AI planning requires Switchman Pro'), 'Plan blocks unpaid usage behind the Pro gate');
+  assert(unpaidOutput.includes('switchman plan is a Pro feature'), 'Plan blocks unpaid usage behind the Pro gate');
+  assert(unpaidOutput.includes('Generate parallel task plans from a goal'), 'Plan explains the Pro planning value proposition');
   assert(unpaidOutput.includes('switchman upgrade'), 'Plan points unpaid users at the upgrade command');
 
   writeProTestCredentials(homeDir);
@@ -504,6 +505,42 @@ test('Planner keeps API documentation updates docs-only and treats payments work
   assert(paymentsImplementation.task_spec.risk_level === 'high', 'Payments planning is treated as high risk');
   assert(paymentsImplementation.task_spec.subsystem_tags.includes('payments'), 'Payments planning tags the payments subsystem');
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Setup turns the fourth-agent limit into an urgent upgrade prompt', () => {
+  const repoDir = join(tmpdir(), `sw-setup-upgrade-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-setup-upgrade-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  let output = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'setup',
+      '--agents',
+      '4',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir },
+    });
+  } catch (err) {
+    output = err.stdout || '';
+  }
+
+  assert(output.includes('Agent limit reached (3/3)'), 'Setup reports the free agent limit as an urgent blocker');
+  assert(output.includes('You need agent4 right now.'), 'Setup makes the fourth-agent need feel immediate');
+  assert(output.includes('Unlock unlimited agents in 60 seconds -> switchman upgrade'), 'Setup points the blocked operator straight at upgrade');
+
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
 });
 
 test('Root help keeps the front door small and points advanced users deeper', () => {
@@ -6736,6 +6773,63 @@ test('Status JSON unifies queue, lease policy, and operator attention', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Status warns free users before short history expires and nudges multi-author repos toward Pro', () => {
+  const repoDir = join(tmpdir(), `sw-status-upgrade-hints-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-status-upgrade-hints-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+  execSync('git config user.email "pair@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Pair"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'PAIRING.md'), 'shared work\n');
+  execSync('git add PAIRING.md', { cwd: repoDir });
+  execSync('git commit -m "pairing change"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  logAuditEvent(db, {
+    eventType: 'task_completed',
+    taskId: 'task-old',
+    status: 'allowed',
+    details: JSON.stringify({ summary: 'old task event' }),
+  });
+  db.prepare(`UPDATE audit_log SET created_at=datetime('now', '-6 days') WHERE task_id='task-old'`).run();
+  db.close();
+
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  }));
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  assert(jsonOutput.upgrade_hints.some((item) => item.kind === 'history_retention'), 'Status JSON includes a history retention upgrade hint');
+  assert(jsonOutput.upgrade_hints.some((item) => item.kind === 'team_visibility'), 'Status JSON includes a multi-author team visibility hint');
+  assert(textOutput.includes('Your task history expires in'), 'Status text warns before free history expires');
+  assert(textOutput.includes('Multiple developers are active in this repo'), 'Status text surfaces the team visibility upgrade nudge');
+  assert(textOutput.includes('switchman upgrade'), 'Status text points the operator at the upgrade command');
+
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
 test('Status text surfaces one front-door operator view', () => {
   const repoDir = join(tmpdir(), `sw-status-text-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -6799,7 +6893,68 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('switchman claude refresh'), 'Top-level help includes the Claude guide refresh command');
   assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the explicit first task step');
   assert(helpOutput.includes('switchman plan "Add authentication"   (Pro)'), 'Top-level help marks planning as a Pro operator command');
+  assert(helpOutput.includes('switchman session-summary'), 'Top-level help includes the session summary command');
   assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
+});
+
+test('Session summary shows recent coordination value and a Pro handoff prompt on free tier', () => {
+  const repoDir = join(tmpdir(), `sw-session-summary-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-session-summary-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  logAuditEvent(db, {
+    eventType: 'write_observed',
+    status: 'denied',
+    taskId: 'task-rogue',
+    details: JSON.stringify({ file_path: 'src/rogue.js' }),
+  });
+  logAuditEvent(db, {
+    eventType: 'task_retried',
+    status: 'allowed',
+    taskId: 'task-retry',
+    details: JSON.stringify({ summary: 'manual recovery' }),
+  });
+  const item = enqueueMergeItem(db, {
+    sourceType: 'branch',
+    sourceRef: 'feature/session',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(db, item.id, {
+    status: 'blocked',
+    lastErrorCode: 'gate_failed',
+    lastErrorSummary: 'Repo gate rejected unmanaged changes.',
+    nextAction: 'Run `switchman gate ci` and retry.',
+  });
+  db.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'session-summary',
+    '--hours',
+    '24',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  assert(output.includes('Session summary'), 'Session summary prints the heading');
+  assert(output.includes('rogue write'), 'Session summary reports blocked rogue edits');
+  assert(output.includes('retry / recovery handoff'), 'Session summary reports recovery activity');
+  assert(output.includes('risky landing issue'), 'Session summary reports landing issues caught');
+  assert(output.includes('switchman upgrade'), 'Session summary includes the upgrade call to action on free tier');
+
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
 });
 
 test('Claude refresh writes a repo-aware CLAUDE.md from local repo signals', () => {
