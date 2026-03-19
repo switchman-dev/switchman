@@ -8,6 +8,21 @@
     "switchman": "bin/switchman.js",
     "switchman-mcp": "src/mcp/server.js"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "CHANGELOG.md",
+    "CLAUDE.md",
+    "examples/README.md",
+    "examples/demo.sh",
+    "examples/setup.sh",
+    "examples/teardown.sh",
+    "examples/walkthrough.sh",
+    "examples/taskapi/package.json",
+    "examples/taskapi/package-lock.json",
+    "examples/taskapi/src/"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/switchman-dev/switchman.git"

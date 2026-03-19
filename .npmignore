@@ -3,3 +3,11 @@ tests/
 tests.zip
 *.zip
 .markdownlint.json
+.cursor/
+.mcp.json
+.switchman/
+examples/**/.cursor/
+examples/**/.mcp.json
+examples/**/.switchman/
+examples/worktrees/
+**/.DS_Store
