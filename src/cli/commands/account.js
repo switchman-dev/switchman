@@ -14,6 +14,7 @@ export function registerAccountCommands(program, {
   chalk,
   checkLicence,
   clearCredentials,
+  getPendingQueueStatus,
   getRepo,
   loginWithGitHub,
   ora,
@@ -52,6 +53,10 @@ Examples:
           }
           if (licence.offline) {
             console.log(`  ${chalk.dim('(offline cache)')}`);
+          }
+          const pendingSync = getPendingQueueStatus();
+          if ((pendingSync.pending || 0) > 0) {
+            console.log(`  ${chalk.yellow('Pending team sync:')} ${pendingSync.pending} event(s) buffered locally`);
           }
         } else {
           console.log(`  ${chalk.yellow('⚠')} Logged in as ${chalk.cyan(creds.email ?? 'unknown')} but no active Pro licence`);

@@ -33,6 +33,8 @@ const SYNC_TIMEOUT_MS  = 3000;
 const MAX_RETRIES      = 3;
 const MAX_QUEUED       = 50;
 const QUEUE_FILE_NAME  = 'sync-queue.json';
+const MAX_QUEUE_ATTEMPTS = 12;
+const BASE_RETRY_DELAY_MS = 30 * 1000;
 
 // ─── Offline queue ────────────────────────────────────────────────────────────
 
@@ -69,7 +71,13 @@ function writeQueue(events) {
 function enqueueEvent(event) {
   try {
     const queue = readQueue();
-    queue.push({ ...event, queued_at: new Date().toISOString(), attempts: 0 });
+    queue.push({
+      ...event,
+      queued_at: new Date().toISOString(),
+      attempts: 0,
+      last_error: null,
+      next_retry_at: new Date().toISOString(),
+    });
     writeQueue(queue);
   } catch {
     // Best effort
@@ -160,23 +168,64 @@ async function pushEventWithRetry(row, accessToken) {
   return { ok: false, attempts: MAX_RETRIES, reason: lastError };
 }
 
+function isRetryableFailure(reason) {
+  return reason === 'network_error'
+    || reason === 'timeout'
+    || /^http_5\d\d$/.test(String(reason || ''));
+}
+
+function computeNextRetryAt(attempts) {
+  const effectiveAttempts = Math.max(1, Number(attempts) || 1);
+  const cappedExponent = Math.min(5, effectiveAttempts - 1);
+  const delayMs = BASE_RETRY_DELAY_MS * Math.pow(2, cappedExponent);
+  return new Date(Date.now() + delayMs).toISOString();
+}
+
 // ─── Flush offline queue ──────────────────────────────────────────────────────
 
 async function flushQueue(accessToken) {
   const queue = readQueue();
-  if (queue.length === 0) return;
+  if (queue.length === 0) {
+    return { attempted: 0, flushed: 0, remaining: 0 };
+  }
 
   const remaining = [];
+  let attempted = 0;
+  let flushed = 0;
+  const now = Date.now();
 
   for (const event of queue) {
+    const nextRetryAt = event.next_retry_at ? new Date(event.next_retry_at).getTime() : 0;
+    if (!Number.isNaN(nextRetryAt) && nextRetryAt > now) {
+      remaining.push(event);
+      continue;
+    }
+
     const { queued_at, attempts, ...row } = event;
+    attempted += 1;
     const result = await pushEventWithRetry(row, accessToken);
     if (!result.ok) {
-      remaining.push({ ...event, attempts: (attempts ?? 0) + result.attempts });
+      const totalAttempts = (attempts ?? 0) + result.attempts;
+      if (totalAttempts >= MAX_QUEUE_ATTEMPTS || !isRetryableFailure(result.reason)) {
+        continue;
+      }
+      remaining.push({
+        ...event,
+        attempts: totalAttempts,
+        last_error: result.reason || 'unknown_error',
+        next_retry_at: computeNextRetryAt(totalAttempts),
+      });
+      continue;
     }
+    flushed += 1;
   }
 
   writeQueue(remaining);
+  return {
+    attempted,
+    flushed,
+    remaining: remaining.length,
+  };
 }
 
 // ─── Push ─────────────────────────────────────────────────────────────────────
@@ -220,6 +269,10 @@ export async function pushSyncEvent(eventType, payload, { worktree = null } = {}
       return { ok: true, queued: false, attempts: result.attempts };
     }
 
+    if (!isRetryableFailure(result.reason)) {
+      return { ok: false, queued: false, attempts: result.attempts, reason: result.reason };
+    }
+
     // Push failed after retries — save to offline queue
     enqueueEvent(row);
     return { ok: false, queued: true, attempts: result.attempts, reason: result.reason };
@@ -242,6 +295,8 @@ export async function pullTeamState() {
 
     const teamId = await getTeamId(creds.access_token, creds.user_id);
     if (!teamId) return [];
+
+    await flushQueue(creds.access_token).catch(() => {});
 
     const since = new Date(Date.now() - 5 * 60 * 1000).toISOString();
 
@@ -273,6 +328,8 @@ export async function pullActiveTeamMembers() {
 
     const teamId = await getTeamId(creds.access_token, creds.user_id);
     if (!teamId) return [];
+
+    await flushQueue(creds.access_token).catch(() => {});
 
     const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
 
@@ -341,4 +398,51 @@ export async function cleanupOldSyncEvents({ retentionDays = 7 } = {}) {
  */
 export function getPendingQueueCount() {
   return readQueue().length;
+}
+
+export function getPendingQueueStatus() {
+  const queue = readQueue();
+  if (queue.length === 0) {
+    return {
+      pending: 0,
+      oldest_queued_at: null,
+      next_retry_at: null,
+      last_error: null,
+    };
+  }
+
+  const oldestQueuedAt = queue
+    .map((event) => event.queued_at || null)
+    .filter(Boolean)
+    .sort()[0] || null;
+
+  const nextRetryAt = queue
+    .map((event) => event.next_retry_at || null)
+    .filter(Boolean)
+    .sort()[0] || null;
+
+  const lastError = [...queue]
+    .reverse()
+    .map((event) => event.last_error || null)
+    .find(Boolean) || null;
+
+  return {
+    pending: queue.length,
+    oldest_queued_at: oldestQueuedAt,
+    next_retry_at: nextRetryAt,
+    last_error: lastError,
+  };
+}
+
+export async function flushPendingSyncEvents() {
+  try {
+    const creds = readCredentials();
+    if (!creds?.access_token) {
+      return { ok: false, reason: 'not_logged_in', attempted: 0, flushed: 0, remaining: getPendingQueueCount() };
+    }
+    const result = await flushQueue(creds.access_token);
+    return { ok: true, ...result };
+  } catch {
+    return { ok: false, reason: 'unexpected_error', attempted: 0, flushed: 0, remaining: getPendingQueueCount() };
+  }
 }

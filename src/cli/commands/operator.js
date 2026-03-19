@@ -251,6 +251,7 @@ Use this first when the repo feels stuck.
             team_sync: {
               summary: teamSummary,
               recent_events: teamState.filter((event) => event.user_id !== myUserId).slice(0, 25),
+              pending_buffer: report.sync_state || null,
             },
           };
           console.log(JSON.stringify(opts.repair ? { ...withTeam, repair: repairResult } : withTeam, null, 2));

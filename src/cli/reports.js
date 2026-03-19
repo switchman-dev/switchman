@@ -27,7 +27,7 @@ import { FREE_RETENTION_DAYS, getRetentionDaysForCurrentPlan } from '../core/lic
 import { loadChangePolicy, loadLeasePolicy } from '../core/policy.js';
 import { getPipelineLandingExplainReport, getPipelineStatus, summarizePipelinePolicyState } from '../core/pipeline.js';
 import { buildQueueStatusSummary, resolveQueueSource } from '../core/queue.js';
-import { cleanupOldSyncEvents } from '../core/sync.js';
+import { cleanupOldSyncEvents, getPendingQueueStatus } from '../core/sync.js';
 import {
   colorForHealth,
   formatRelativePolicy,
@@ -1100,6 +1100,7 @@ function buildUnifiedStatusReport({
   queueSummary,
   recentQueueEvents,
   retentionDays = 7,
+  syncState = null,
   upgradeHints = [],
 }) {
   const queueAttention = [
@@ -1212,6 +1213,12 @@ function buildUnifiedStatusReport({
     ])].slice(0, 6),
     suggested_commands: [...new Set(attention.length > 0 ? suggestedCommands : defaultSuggestedCommands)].slice(0, 6),
     retention_days: retentionDays,
+    sync_state: syncState || {
+      pending: 0,
+      oldest_queued_at: null,
+      next_retry_at: null,
+      last_error: null,
+    },
     upgrade_hints: upgradeHints,
   };
 }
@@ -1236,6 +1243,7 @@ export async function collectStatusSnapshot(repoRoot) {
     const claims = getActiveFileClaims(db);
     const queueItems = listMergeQueue(db);
     const queueSummary = buildQueueStatusSummary(queueItems);
+    const syncState = getPendingQueueStatus();
     const recentQueueEvents = queueItems
       .slice(0, 5)
       .flatMap((item) => listMergeQueueEvents(db, item.id, { limit: 3 }).map((event) => ({ ...event, queue_item_id: item.id })))
@@ -1275,6 +1283,7 @@ export async function collectStatusSnapshot(repoRoot) {
       queueSummary,
       recentQueueEvents,
       retentionDays,
+      syncState,
       upgradeHints,
     });
   } finally {
@@ -1417,6 +1426,12 @@ export function renderUnifiedStatusReport(report, { teamActivity = [], teamSumma
   console.log(`${chalk.dim('why:')} ${nextStepLine}`);
   console.log(chalk.dim(`policy: ${formatRelativePolicy(report.lease_policy)} • requeue on reap ${report.lease_policy.requeue_task_on_reap ? 'on' : 'off'}`));
   console.log(chalk.dim(`history retention: ${report.retention_days || 7} days`));
+  if ((report.sync_state?.pending || 0) > 0) {
+    const retryNote = report.sync_state.next_retry_at
+      ? ` • next retry ${report.sync_state.next_retry_at}`
+      : '';
+    console.log(chalk.yellow(`shared sync buffered locally: ${report.sync_state.pending} event(s) pending${retryNote}`));
+  }
   if (report.merge_readiness.policy_state?.active) {
     console.log(chalk.dim(`change policy: ${report.merge_readiness.policy_state.domains.join(', ')} • ${report.merge_readiness.policy_state.enforcement} • missing ${report.merge_readiness.policy_state.missing_task_types.join(', ') || 'none'}`));
   }

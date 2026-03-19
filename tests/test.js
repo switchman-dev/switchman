@@ -22,6 +22,7 @@ import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipel
 import { buildTaskSpec, planPipelineTasks } from '../src/core/planner.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../src/core/policy.js';
 import { describeQueueError, resolveQueueSource, runMergeQueue } from '../src/core/queue.js';
+import { getPendingQueueStatus, pullTeamState, pushSyncEvent } from '../src/core/sync.js';
 import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
@@ -4391,6 +4392,71 @@ test('Telemetry send reports not-configured and disabled states clearly', async 
   rmSync(fakeHome, { recursive: true, force: true });
 });
 
+testAsync('Shared sync buffers retryable cloud failures locally and flushes them on the next successful contact', async () => {
+  const fakeHome = join(tmpdir(), `sw-sync-buffer-home-${Date.now()}`);
+  mkdirSync(fakeHome, { recursive: true });
+  writeProTestCredentials(fakeHome, 'sync@test.com', { userId: 'sync-user-1' });
+
+  const originalHome = process.env.HOME;
+  const originalFetch = global.fetch;
+  let allowSyncPost = false;
+  let syncPostAttempts = 0;
+
+  try {
+    process.env.HOME = fakeHome;
+    global.fetch = async (url, options = {}) => {
+      const requestUrl = String(url);
+      const method = String(options.method || 'GET').toUpperCase();
+
+      if (requestUrl.includes('/rest/v1/team_members')) {
+        return new Response(JSON.stringify([{ team_id: 'team-sync-1' }]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (requestUrl.includes('/rest/v1/sync_state') && method === 'POST') {
+        syncPostAttempts += 1;
+        if (!allowSyncPost) {
+          return new Response(JSON.stringify({ reason: 'upstream_unavailable' }), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response('', { status: 201 });
+      }
+
+      if (requestUrl.includes('/rest/v1/sync_state') && method === 'GET') {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response(JSON.stringify({ reason: 'unexpected_request' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const queued = await pushSyncEvent('task_added', { task_id: 'task-sync-1' }, { worktree: 'agent1' });
+    assert(queued.ok === false, 'Shared sync reports a failed cloud push when the upstream is unavailable');
+    assert(queued.queued === true, 'Shared sync queues retryable failures locally');
+    assert(getPendingQueueStatus().pending === 1, 'Retryable shared sync failures are buffered on disk');
+
+    allowSyncPost = true;
+    await pullTeamState();
+
+    const status = getPendingQueueStatus();
+    assert(status.pending === 0, 'Buffered shared sync events flush after the next successful cloud contact');
+    assert(syncPostAttempts >= 2, 'Shared sync retries the buffered event on the next contact');
+  } finally {
+    global.fetch = originalFetch;
+    process.env.HOME = originalHome;
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
 test('Stale lease reaping releases claims and re-queues the task', () => {
   const reapDb = initDb(join(tmpdir(), `sw-lease-reap-${Date.now()}`));
   const taskId = createTask(reapDb, { title: 'reap task' });
@@ -7469,6 +7535,51 @@ test('Status on a fresh setup gives first-run guidance instead of generic health
   assert(jsonOutput.suggested_commands.includes('switchman demo'), 'Fresh status JSON includes the demo in suggested commands');
 
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Status JSON surfaces buffered shared sync state when cloud events are pending', () => {
+  const repoDir = join(tmpdir(), `sw-status-sync-buffer-${Date.now()}`);
+  const fakeHome = join(tmpdir(), `sw-status-sync-buffer-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(join(fakeHome, '.switchman'), { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+  writeFileSync(join(fakeHome, '.switchman', 'sync-queue.json'), JSON.stringify([{
+    team_id: 'team-1',
+    user_id: 'user-1',
+    worktree: 'agent1',
+    event_type: 'task_added',
+    payload: { task_id: 'task-1' },
+    queued_at: new Date().toISOString(),
+    attempts: 2,
+    last_error: 'timeout',
+    next_retry_at: new Date(Date.now() + 60 * 1000).toISOString(),
+  }], null, 2));
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  db.close();
+
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: fakeHome },
+  }));
+
+  assert(jsonOutput.sync_state.pending === 1, 'Status JSON includes the buffered shared sync count');
+  assert(jsonOutput.team_sync.pending_buffer.pending === 1, 'Status JSON carries the buffered shared sync state in the team panel');
+  assert(jsonOutput.sync_state.last_error === 'timeout', 'Status JSON includes the last buffered shared sync error');
+
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(fakeHome, { recursive: true, force: true });
 });
 
 test('Recover command resets stale leases and stranded tasks while summarizing abandoned changes', () => {
