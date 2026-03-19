@@ -90,26 +90,33 @@ switchman login --status # check your plan
 
 ```bash
 cd my-project
-switchman setup --agents 3
-switchman task add "Implement auth helper" --priority 9
+switchman start "Implement auth helper"
 switchman status --watch
 switchman gate ci
 switchman queue run
 ```
 
-What `switchman setup` gives you:
+What `switchman start` gives you:
 
-- a shared Switchman database in `.switchman/`
+- repo context-aware task planning
 - linked agent workspaces
-- MCP config for Claude Code and Cursor
+- a shared Switchman database in `.switchman/`
+- a repo-aware `CLAUDE.md` when one does not exist
+
+Prefer the older explicit flow when you want full manual control:
+
+```bash
+switchman setup --agents 3
+switchman task add "Implement auth helper" --priority 9
+```
 
 Fastest path to success:
 
 1. Use Claude Code for the first run
 2. Run `switchman verify-setup` to confirm editor wiring
-3. Run `switchman claude refresh` to generate a repo-aware `CLAUDE.md`
+3. Run `switchman claude refresh` if you want to regenerate the repo-aware `CLAUDE.md`
 4. Open one Claude Code window per generated workspace
-5. Add tasks before agents start
+5. Use `switchman start` for the shortest path, or add tasks manually if you want tighter control
 6. Keep `switchman status --watch` open in a separate terminal
 7. Run `switchman gate ci && switchman queue run` when tasks finish
 
@@ -149,11 +156,17 @@ Switchman is for the point where "we can manage this by hand" stops being true.
 Three goals arrive at once: harden auth, ship a schema update, refresh docs.
 
 ```bash
+switchman start "Harden auth middleware, ship the schema migration, and update the related docs" --agents 5
+switchman status --watch
+```
+
+`switchman start` reads repo context, proposes the initial work split, and boots the session. If you prefer to drive the queue by hand, you can still fall back to explicit task adds:
+
+```bash
 switchman setup --agents 5
 switchman task add "Harden auth middleware" --priority 9
 switchman task add "Ship schema migration" --priority 8
 switchman task add "Update auth and schema docs" --priority 6
-switchman status --watch
 ```
 
 Agents pick up work in separate workspaces. If two reach for the same file, Switchman blocks the second claim early. When branches finish:
