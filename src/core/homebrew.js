@@ -1,5 +1,10 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { dirname, join, resolve } from 'path';
+import { fileURLToPath } from 'url';
+
+function defaultPackageRoot() {
+  return resolve(dirname(dirname(dirname(fileURLToPath(import.meta.url)))));
+}
 
 function getPackageVersion(repoRoot) {
   const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
@@ -41,7 +46,7 @@ end
 `;
 }
 
-export function buildHomebrewFormula(repoRoot, {
+export function buildHomebrewFormula(repoRoot = defaultPackageRoot(), {
   version = null,
   url = null,
   sha256 = null,

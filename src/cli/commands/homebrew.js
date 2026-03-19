@@ -1,7 +1,6 @@
 export function registerHomebrewCommands(parentCommand, {
   buildHomebrewFormula,
   chalk,
-  getRepo,
   writeHomebrewFormula,
 }) {
   const brewCmd = parentCommand
@@ -14,8 +13,7 @@ export function registerHomebrewCommands(parentCommand, {
     .requiredOption('--sha256 <sha>', 'SHA256 for the release tarball')
     .option('--output <path>', 'Write the formula to a file instead of stdout')
     .action((opts) => {
-      const repoRoot = getRepo();
-      const result = buildHomebrewFormula(repoRoot, {
+      const result = buildHomebrewFormula(undefined, {
         version: opts.version || null,
         url: opts.url || null,
         sha256: opts.sha256,

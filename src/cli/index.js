@@ -2746,7 +2746,6 @@ registerSchedulerCommands(program, {
 registerHomebrewCommands(advancedCmd, {
   buildHomebrewFormula,
   chalk,
-  getRepo,
   writeHomebrewFormula,
 });
 
