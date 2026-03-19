@@ -7476,6 +7476,30 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
 });
 
+test('Advanced Homebrew formula command renders a release-ready formula', () => {
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'advanced',
+    'brew-formula',
+    '--sha256',
+    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  ], {
+    cwd: TEST_DIR,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('class SwitchmanDev < Formula'), 'Homebrew command emits a formula class');
+  assert(output.includes('depends_on "node@22"'), 'Homebrew formula depends on Node 22');
+  assert(output.includes('npm", "install", *std_npm_args(libexec)'), 'Homebrew formula installs through npm into libexec');
+  assert(output.includes('bin.install_symlink libexec/"bin/switchman"'), 'Homebrew formula links the main Switchman binary');
+});
+
+test('README install section includes the Homebrew path', () => {
+  const readme = readFileSync(join(process.cwd(), 'README.md'), 'utf8');
+  assert(readme.includes('brew install switchman-dev/tap/switchman-dev'), 'README includes the Homebrew install command');
+  assert(readme.includes('switchman advanced brew-formula --sha256'), 'README includes the formula generation command for releases');
+});
+
 test('Session summary shows recent coordination value and a Pro handoff prompt on free tier', () => {
   const repoDir = join(tmpdir(), `sw-session-summary-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-session-summary-home-${Date.now()}`);

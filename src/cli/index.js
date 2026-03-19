@@ -49,6 +49,7 @@ import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
 import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, evaluatePipelinePolicyGate, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, inferPipelineIdFromBranch, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, repairPipelineState, resumePipelineLandingRecovery, runPipeline, startPipeline, summarizePipelinePolicyState, syncPipelinePr } from '../core/pipeline.js';
 import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus, writeGitHubPipelineLandingStatus } from '../core/ci.js';
+import { buildHomebrewFormula, writeHomebrewFormula } from '../core/homebrew.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, evaluateQueueRepoGate, resolveQueueSource, runMergeQueue } from '../core/queue.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, getChangePolicyPath, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../core/policy.js';
@@ -88,6 +89,7 @@ import { registerMcpCommands } from './commands/mcp.js';
 import { registerAuditCommands } from './commands/audit.js';
 import { registerAccountCommands } from './commands/account.js';
 import { registerGateCommands } from './commands/gate.js';
+import { registerHomebrewCommands } from './commands/homebrew.js';
 import { registerLeaseCommands } from './commands/lease.js';
 import { registerMonitorCommands } from './commands/monitor.js';
 import { registerNotificationCommands } from './commands/notifications.js';
@@ -1153,6 +1155,7 @@ Advanced operator commands:
   switchman policy <...>
   switchman monitor <...>
   switchman repair
+  switchman advanced brew-formula --sha256 <...>
 
 Experimental commands:
   switchman semantic <...>
@@ -2738,6 +2741,13 @@ registerSchedulerCommands(program, {
   readSchedulerState,
   spawn,
   startBackgroundScheduler,
+});
+
+registerHomebrewCommands(advancedCmd, {
+  buildHomebrewFormula,
+  chalk,
+  getRepo,
+  writeHomebrewFormula,
 });
 
 registerNotificationCommands(program, {

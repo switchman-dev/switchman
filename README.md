@@ -21,6 +21,18 @@ Requirements: Node.js 22.5+ · Git 2.5+
 npm install -g switchman-dev
 ```
 
+Homebrew release path:
+
+```bash
+brew install switchman-dev/tap/switchman-dev
+```
+
+If you're cutting a release, generate the formula with:
+
+```bash
+switchman advanced brew-formula --sha256 <release-tarball-sha> --output Formula/switchman-dev.rb
+```
+
 > Switchman uses the built-in `node:sqlite` runtime — no extra database to install or manage.
 
 ---
