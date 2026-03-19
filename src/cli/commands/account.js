@@ -150,6 +150,12 @@ Examples:
 
       if (!result.success) {
         console.log(`  ${chalk.red('✗')} Sign in failed: ${result.error ?? 'unknown error'}`);
+        if (result.activate_url) {
+          console.log(`  ${chalk.dim('Open manually:')} ${chalk.cyan(result.activate_url)}`);
+        }
+        if (result.code) {
+          console.log(`  ${chalk.dim('Code:')} ${chalk.cyan(result.code)}`);
+        }
         console.log(`  ${chalk.dim('Try again or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
         console.log('');
         process.exit(1);

@@ -33,6 +33,7 @@ import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, loadChangePolicy, loadLeas
 import { describeQueueError, resolveQueueSource, runMergeQueue } from '../src/core/queue.js';
 import { getPendingQueueStatus, pullTeamState, pushSyncEvent } from '../src/core/sync.js';
 import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
+import { loginWithGitHub } from '../src/core/licence.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 const TEST_ZDOTDIR = join(tmpdir(), `switchman-zdotdir-${Date.now()}`);
@@ -7402,6 +7403,59 @@ test('Status text surfaces one front-door operator view', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Status watch renders the compact live terminal dashboard', () => {
+  const repoDir = join(tmpdir(), `sw-status-watch-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'agent1', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Add auth middleware', priority: 9 });
+  assignTask(db, taskId, 'agent1');
+  startTaskLease(db, taskId, 'agent1', 'claude');
+  claimFiles(db, taskId, 'agent1', ['src/auth.js']);
+  const queued = enqueueMergeItem(db, {
+    sourceType: 'branch',
+    sourceRef: 'feature/auth',
+    targetBranch: 'main',
+  });
+  markMergeQueueState(db, queued.id, {
+    status: 'blocked',
+    lastErrorCode: 'merge_conflict',
+    lastErrorSummary: 'Merge conflict blocked queue item.',
+    nextAction: 'Run `switchman queue retry q1` after fixing the branch state.',
+  });
+  db.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'status',
+    '--watch',
+    '--watch-interval-ms',
+    '1',
+    '--max-cycles',
+    '1',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('switchman live watch'), 'Watch mode uses the dedicated live dashboard banner');
+  assert(output.includes('Agents'), 'Watch mode includes the live agent panel');
+  assert(output.includes('Focus'), 'Watch mode includes the live focus panel');
+  assert(output.includes('Queue'), 'Watch mode includes the live queue panel');
+  assert(output.includes('Team + sync'), 'Watch mode includes the team and sync panel');
+  assert(output.includes('Last event:'), 'Watch mode includes the ticker line');
+  assert(output.includes('refresh 100ms'), 'Watch mode shows the live refresh cadence');
+  assert(output.includes('claims: src/auth.js'), 'Watch mode shows claimed files under the active agent');
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('CLI help includes examples for the main entrypoint', () => {
   const helpOutput = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
@@ -7480,6 +7534,200 @@ test('Session summary shows recent coordination value and a Pro handoff prompt o
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
+});
+
+test('Desktop notifications on free tier fire for finished tasks and blocked claims', () => {
+  const repoDir = join(tmpdir(), `sw-notify-free-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-notify-free-home-${Date.now()}`);
+  const sinkPath = join(tmpdir(), `sw-notify-free-sink-${Date.now()}.jsonl`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'notifications',
+    'desktop',
+    'on',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'agent1', path: repoDir, branch: 'main' });
+  const doneTask = createTask(db, { title: 'Ship auth middleware', priority: 8 });
+  assignTask(db, doneTask, 'agent1');
+  startTaskLease(db, doneTask, 'agent1', 'claude');
+  claimFiles(db, doneTask, 'agent1', ['src/auth.js']);
+
+  const blockedOwner = createTask(db, { title: 'Existing auth change', priority: 9 });
+  assignTask(db, blockedOwner, 'agent1');
+  startTaskLease(db, blockedOwner, 'agent1', 'claude');
+  claimFiles(db, blockedOwner, 'agent1', ['src/shared.js']);
+
+  const blockedTask = createTask(db, { title: 'Conflicting edit', priority: 7 });
+  db.close();
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'task',
+    'done',
+    doneTask,
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir, SWITCHMAN_NOTIFICATION_TEST_SINK: sinkPath },
+  });
+
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'claim',
+      blockedTask,
+      'agent2',
+      'src/shared.js',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir, SWITCHMAN_NOTIFICATION_TEST_SINK: sinkPath },
+    });
+  } catch {
+    // expected blocked claim
+  }
+
+  const notifications = readFileSync(sinkPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  assert(notifications.some((entry) => entry.channel === 'desktop' && entry.title === 'Agent finished a task'), 'Free desktop notifications fire when an agent finishes work');
+  assert(notifications.some((entry) => entry.channel === 'desktop' && entry.title === 'Agent blocked by a file claim'), 'Free desktop notifications fire when a claim is blocked');
+
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+  rmSync(sinkPath, { force: true });
+});
+
+test('Slack notifications are Pro-only and can be delivered for failed tasks', () => {
+  const repoDir = join(tmpdir(), `sw-notify-pro-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-notify-pro-home-${Date.now()}`);
+  const switchmanDir = join(homeDir, '.switchman');
+  const sinkPath = join(tmpdir(), `sw-notify-pro-sink-${Date.now()}.jsonl`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(switchmanDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  writeFileSync(join(switchmanDir, 'credentials.json'), JSON.stringify({
+    access_token: 'pro-token',
+    refresh_token: 'refresh-token',
+    expires_at: Date.now() + 60 * 60 * 1000,
+    email: 'pro@test.com',
+  }, null, 2));
+  writeFileSync(join(switchmanDir, 'licence-cache.json'), JSON.stringify({
+    valid: true,
+    plan: 'pro',
+    cached_at: Date.now(),
+  }, null, 2));
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'notifications',
+    'slack',
+    '--webhook',
+    'https://hooks.slack.test/services/T000/B000/XXX',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'agent1', path: repoDir, branch: 'main' });
+  const failedTask = createTask(db, { title: 'Handle payments retry', priority: 9 });
+  db.close();
+
+  execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'task',
+    'fail',
+    failedTask,
+    'webhook exploded',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir, SWITCHMAN_NOTIFICATION_TEST_SINK: sinkPath },
+  });
+
+  const notifications = readFileSync(sinkPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  assert(notifications.some((entry) => entry.channel === 'slack' && entry.title === 'Agent hit a failed task'), 'Pro Slack notifications fire when an agent fails a task');
+
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+  rmSync(sinkPath, { force: true });
+});
+
+await testAsync('Login reports a clear manual fallback when the browser cannot be opened', async () => {
+  const requests = [];
+  const result = await loginWithGitHub({
+    fetchImpl: async (url, options = {}) => {
+      requests.push({ url, method: options.method || 'GET' });
+      return {
+        ok: true,
+        async json() { return []; },
+      };
+    },
+    openBrowser: async () => {
+      throw new Error('open failed');
+    },
+    sleep: async () => {},
+    maxWaitMs: 10,
+    pollIntervalMs: 1,
+  });
+
+  assert(result.success === false, 'Login fails cleanly when the browser cannot be opened');
+  assert(result.reason === 'browser_open_failed', 'Login classifies browser launch failures explicitly');
+  assert(result.error.includes('could not open your browser automatically'), 'Login explains the browser-open problem plainly');
+  assert(result.activate_url?.includes('switchman.dev/activate?code='), 'Login returns the manual activate URL');
+  assert(result.code && /^[A-Z]+-\d{4}$/.test(result.code), 'Login returns the short manual authorization code');
+  assert(requests.some((entry) => entry.method === 'POST' && entry.url.includes('/rest/v1/cli_auth_codes')), 'Login still creates the auth session before reporting the browser problem');
+});
+
+await testAsync('Login times out with the exact manual recovery information still visible', async () => {
+  let pollCount = 0;
+  const result = await loginWithGitHub({
+    fetchImpl: async (url, options = {}) => {
+      if ((options.method || 'GET') === 'POST') {
+        return {
+          ok: true,
+          async json() { return {}; },
+        };
+      }
+      pollCount += 1;
+      return {
+        ok: true,
+        async json() { return [{ status: 'pending' }]; },
+      };
+    },
+    openBrowser: async () => {},
+    sleep: async () => {},
+    maxWaitMs: 1,
+    pollIntervalMs: 0,
+  });
+
+  assert(result.success === false, 'Login fails cleanly after the authorization timeout');
+  assert(result.reason === 'timeout', 'Login classifies authorization timeouts explicitly');
+  assert(result.error.includes('Timed out waiting for GitHub authorization'), 'Login explains the timeout plainly');
+  assert(result.activate_url?.includes('switchman.dev/activate?code='), 'Login keeps the activate URL on timeout');
+  assert(result.code && /^[A-Z]+-\d{4}$/.test(result.code), 'Login keeps the sign-in code on timeout');
+  assert(pollCount >= 1, 'Login polls the pending auth session before timing out');
 });
 
 test('Claude refresh writes a repo-aware CLAUDE.md from local repo signals', () => {

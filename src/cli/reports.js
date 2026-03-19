@@ -38,6 +38,7 @@ import {
   renderMiniBar,
   renderPanel,
   renderSignalStrip,
+  statusBadge,
 } from './ui.js';
 
 function listRecentGitAuthors(repoRoot, limit = 30) {
@@ -1641,4 +1642,173 @@ export function renderUnifiedStatusReport(report, { teamActivity = [], teamSumma
   for (const step of report.next_steps) {
     console.log(`  - ${step}`);
   }
+}
+
+function summarizeTickerEvent(report, teamActivity = []) {
+  const newestTeamEvent = teamActivity[0];
+  if (newestTeamEvent) {
+    const email = newestTeamEvent.payload?.email || newestTeamEvent.email || newestTeamEvent.user_id || 'teammate';
+    const worktree = newestTeamEvent.worktree || newestTeamEvent.payload?.worktree || 'shared queue';
+    return `${email} ${worktree} ${fallbackEventLabel(newestTeamEvent.event_type || 'activity').toLowerCase()}`;
+  }
+
+  const recentQueueEvent = report.queue?.recent_events?.[0];
+  if (recentQueueEvent) {
+    return `queue ${recentQueueEvent.queue_item_id} ${fallbackEventLabel(recentQueueEvent.event_type || 'updated').toLowerCase()}`;
+  }
+
+  const blockedItem = report.attention?.find((item) => item.severity === 'block');
+  if (blockedItem) {
+    return blockedItem.title;
+  }
+
+  const warningItem = report.attention?.find((item) => item.severity !== 'block');
+  if (warningItem) {
+    return warningItem.title;
+  }
+
+  const activeItem = report.active_work?.[0];
+  if (activeItem) {
+    return `${activeItem.worktree} is running ${activeItem.task_title}`;
+  }
+
+  return 'Watching for new work, conflicts, and queue movement.';
+}
+
+export function renderLiveWatchDashboard(report, {
+  teamActivity = [],
+  teamSummary = null,
+  watchState = null,
+  updatedAt = null,
+  cycles = 0,
+  maxCycles = 0,
+  watchIntervalMs = 2000,
+} = {}) {
+  const healthColor = colorForHealth(report.health);
+  const badge = healthColor(healthLabel(report.health));
+  const queueCounts = report.counts.queue || {
+    queued: 0,
+    retrying: 0,
+    blocked: 0,
+    merging: 0,
+    merged: 0,
+  };
+  const blockedItems = report.attention.filter((item) => item.severity === 'block');
+  const warningItems = report.attention.filter((item) => item.severity !== 'block');
+  const queueLoad = queueCounts.queued + queueCounts.retrying + queueCounts.blocked + queueCounts.merging;
+  const syncPending = Number(report.sync_state?.pending || 0);
+  const teamMembers = Number(teamSummary?.members || 0);
+  const sourceLine = report.shared_summary?.mode === 'shared'
+    ? `shared team queue • ${report.shared_summary.team_id || 'team'} • ${report.shared_summary.repo_key || 'repo'}`
+    : 'local coordination only';
+  const watcherLine = [
+    updatedAt ? `updated ${updatedAt}` : 'updated just now',
+    watchState || 'baseline snapshot',
+    maxCycles > 0 ? `cycle ${cycles}/${maxCycles}` : null,
+    `refresh ${watchIntervalMs}ms`,
+  ].filter(Boolean).join(' • ');
+
+  const agentLines = report.active_work.length > 0
+    ? report.active_work.slice(0, 6).map((item) => {
+      const claimedFiles = report.claims
+        .filter((claim) => claim.worktree === item.worktree)
+        .slice(0, 2)
+        .map((claim) => claim.file_path);
+      const claimSuffix = claimedFiles.length > 0
+        ? ` ${chalk.dim(`claims: ${claimedFiles.join(', ')}${report.claims.filter((claim) => claim.worktree === item.worktree).length > 2 ? ' +' : ''}`)}`
+        : '';
+      const boundary = item.boundary_validation
+        ? ` ${renderChip('validation', item.boundary_validation.status, item.boundary_validation.status === 'accepted' ? chalk.green : chalk.yellow)}`
+        : '';
+      const stale = (item.dependency_invalidations?.length || 0) > 0
+        ? ` ${renderChip('stale', item.dependency_invalidations.length, chalk.yellow)}`
+        : '';
+      return `${statusBadge('busy')} ${chalk.cyan(item.worktree)} ${chalk.dim('->')} ${item.task_title} ${chalk.dim(item.task_id)}${boundary}${stale}${claimSuffix}`;
+    })
+    : [chalk.dim('No agent work is active right now.')];
+
+  const focusLines = [
+    ...(blockedItems.slice(0, 2).map((item) => `${renderChip('BLOCKED', item.kind || 'item', chalk.red)} ${item.title}`)),
+    ...(warningItems.slice(0, 2).map((item) => `${renderChip('WATCH', item.kind || 'item', chalk.yellow)} ${item.title}`)),
+    ...(report.next_up.slice(0, 2).map((task) => `${renderChip('NEXT', `p${task.priority}`, chalk.green)} ${task.title} ${chalk.dim(task.id)}`)),
+  ];
+  if (focusLines.length === 0) {
+    focusLines.push(chalk.green('Nothing urgent. Safe to keep work moving.'));
+  }
+
+  const queueLines = [];
+  if (report.queue?.summary?.next) {
+    const next = report.queue.summary.next;
+    queueLines.push(`${renderChip('NEXT', next.id, chalk.blue)} ${next.source_type}:${next.source_ref} ${chalk.dim(`retries:${next.retry_count}/${next.max_retries}`)}`);
+  }
+  for (const item of report.queue.items.filter((entry) => ['blocked', 'retrying', 'merging'].includes(entry.status)).slice(0, 3)) {
+    queueLines.push(`${renderChip(item.status.toUpperCase(), item.id, item.status === 'blocked' ? chalk.red : item.status === 'retrying' ? chalk.yellow : chalk.blue)} ${item.source_type}:${item.source_ref}`);
+  }
+  if (queueLines.length === 0) {
+    queueLines.push(chalk.dim('No active landing queue pressure.'));
+  }
+
+  const teamLines = [];
+  if (teamMembers > 0) {
+    teamLines.push(`${chalk.white(teamMembers)} teammate${teamMembers === 1 ? '' : 's'} active in shared coordination`);
+  }
+  if ((teamSummary?.queue_events || 0) > 0) {
+    teamLines.push(`${chalk.white(teamSummary.queue_events)} recent queue event${teamSummary.queue_events === 1 ? '' : 's'}`);
+  }
+  if ((teamSummary?.lease_events || 0) > 0) {
+    teamLines.push(`${chalk.white(teamSummary.lease_events)} recent lease / task handoff${teamSummary.lease_events === 1 ? '' : 's'}`);
+  }
+  if ((teamSummary?.claim_events || 0) > 0) {
+    teamLines.push(`${chalk.white(teamSummary.claim_events)} recent claim change${teamSummary.claim_events === 1 ? '' : 's'}`);
+  }
+  if (teamLines.length === 0) {
+    teamLines.push(chalk.dim('No remote team activity visible in this cycle.'));
+  }
+
+  console.log('');
+  console.log(healthColor('='.repeat(72)));
+  console.log(`${badge} ${chalk.bold('switchman live watch')} ${chalk.dim('• terminal dashboard for parallel agents')}`);
+  console.log(chalk.dim(report.repo_root));
+  console.log(chalk.dim(sourceLine));
+  console.log(healthColor('='.repeat(72)));
+  console.log(renderSignalStrip([
+    renderChip('tasks', `${report.counts.pending}/${report.counts.in_progress}/${report.counts.done}/${report.counts.failed}`, chalk.white),
+    renderChip('leases', report.counts.active_leases, report.counts.active_leases > 0 ? chalk.blue : chalk.green),
+    renderChip('claims', report.counts.active_claims, report.counts.active_claims > 0 ? chalk.cyan : chalk.green),
+    renderChip('queue', queueLoad, queueLoad > 0 ? chalk.blue : chalk.green),
+    renderChip('sync', syncPending, syncPending > 0 ? chalk.yellow : chalk.green),
+    renderChip('team', teamMembers, teamMembers > 0 ? chalk.cyan : chalk.green),
+  ]));
+  console.log(renderMetricRow([
+    { label: 'health', value: healthLabel(report.health), color: healthColor },
+    { label: 'blocked', value: blockedItems.length, color: blockedItems.length > 0 ? chalk.red : chalk.green },
+    { label: 'warnings', value: warningItems.length, color: warningItems.length > 0 ? chalk.yellow : chalk.green },
+    { label: 'history', value: `${report.retention_days || 7}d`, color: chalk.white },
+  ]));
+  console.log(chalk.dim(watcherLine));
+  console.log('');
+
+  const panelBlocks = [
+    renderPanel('Agents', agentLines, report.active_work.length > 0 ? chalk.cyan : chalk.green),
+    renderPanel('Focus', focusLines, blockedItems.length > 0 ? chalk.red : warningItems.length > 0 ? chalk.yellow : chalk.green),
+    renderPanel('Queue', queueLines, queueCounts.blocked > 0 ? chalk.red : queueLoad > 0 ? chalk.blue : chalk.green),
+    renderPanel('Team + sync', [
+      ...teamLines,
+      syncPending > 0
+        ? `${chalk.yellow('buffered sync:')} ${syncPending} event(s) waiting to flush`
+        : chalk.green('Cloud sync is current.'),
+    ], syncPending > 0 ? chalk.yellow : chalk.green),
+  ];
+
+  for (const block of panelBlocks) {
+    for (const line of block) console.log(line);
+    console.log('');
+  }
+
+  console.log(`${chalk.bold('Last event:')} ${summarizeTickerEvent(report, teamActivity)}`);
+  if (report.failed_tasks.length > 0) {
+    const failure = report.failed_tasks[0];
+    console.log(`${chalk.bold('Latest failure:')} ${failure.title} ${chalk.dim(`(${humanizeReasonCode(failure.failure?.reason?.code || failure.failure?.reason_code || '') || failure.failure?.summary || 'unknown'})`)}`);
+  }
+  console.log(`${chalk.bold('Run next:')} ${chalk.cyan(report.suggested_commands[0] || 'switchman status')}`);
 }

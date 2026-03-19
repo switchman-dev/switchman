@@ -230,8 +230,38 @@ async function refreshToken(refreshToken) {
  * Opens the browser, polls for the token, saves credentials.
  * Returns { success, email } or { success: false, error }
  */
-export async function loginWithGitHub() {
-  const { default: open } = await import('open');
+function humanizeLoginError(reason, activateUrl = null, code = null) {
+  const retryLine = 'Run `switchman login` again.';
+  const manualLine = activateUrl
+    ? `Open ${activateUrl}${code ? ` and enter code ${code}` : ''} manually.`
+    : 'Run `switchman login` again.';
+
+  switch (reason) {
+    case 'auth_session_create_failed':
+      return `Could not create an auth session with the Switchman backend. ${retryLine}`;
+    case 'network_unavailable':
+      return `Switchman could not reach the auth backend. Check your connection, then try again.`;
+    case 'browser_open_failed':
+      return `Switchman could not open your browser automatically. ${manualLine}`;
+    case 'auth_code_expired':
+      return `This sign-in code expired before authorization completed. ${retryLine}`;
+    case 'token_exchange_failed':
+      return `Authorization completed, but Switchman could not store the returned session cleanly. ${retryLine}`;
+    case 'timeout':
+      return `Timed out waiting for GitHub authorization. ${manualLine}`;
+    default:
+      return reason || 'Unknown login error.';
+  }
+}
+
+export async function loginWithGitHub({
+  fetchImpl = globalThis.fetch,
+  openBrowser = null,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  pollIntervalMs = 2000,
+  maxWaitMs = 10 * 60 * 1000,
+} = {}) {
+  const open = openBrowser ?? (await import('open')).default;
 
   // ── Step 1: Generate a short human-readable code ──────────────────────────
   const adjectives = ['SWIFT', 'CLEAR', 'SAFE', 'CLEAN', 'FAST', 'BOLD', 'CALM', 'KEEN'];
@@ -241,7 +271,7 @@ export async function loginWithGitHub() {
 
   // ── Step 2: Store the pending code in Supabase ────────────────────────────
   try {
-    const insertRes = await fetch(`${SUPABASE_URL}/rest/v1/cli_auth_codes`, {
+    const insertRes = await fetchImpl(`${SUPABASE_URL}/rest/v1/cli_auth_codes`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -255,10 +285,18 @@ export async function loginWithGitHub() {
     });
 
     if (!insertRes.ok) {
-      return { success: false, error: 'Could not create auth session. Please try again.' };
+      return {
+        success: false,
+        error: humanizeLoginError('auth_session_create_failed'),
+        reason: 'auth_session_create_failed',
+      };
     }
   } catch {
-    return { success: false, error: 'Network error. Please check your connection.' };
+    return {
+      success: false,
+      error: humanizeLoginError('network_unavailable'),
+      reason: 'network_unavailable',
+    };
   }
 
   // ── Step 3: Open the activate page in the browser ─────────────────────────
@@ -272,20 +310,26 @@ export async function loginWithGitHub() {
   console.log('');
   console.log('  Waiting for authorization...');
 
-  open(activateUrl).catch(() => {
-    // Browser didn't open — user can copy the URL manually
-  });
+  try {
+    await open(activateUrl);
+  } catch {
+    return {
+      success: false,
+      error: humanizeLoginError('browser_open_failed', activateUrl, code),
+      reason: 'browser_open_failed',
+      activate_url: activateUrl,
+      code,
+    };
+  }
 
   // ── Step 4: Poll Supabase every 2 seconds for up to 10 minutes ────────────
-  const POLL_INTERVAL_MS = 2000;
-  const MAX_WAIT_MS      = 10 * 60 * 1000;
   const started          = Date.now();
 
-  while (Date.now() - started < MAX_WAIT_MS) {
-    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+  while (Date.now() - started < maxWaitMs) {
+    await sleep(pollIntervalMs);
 
     try {
-      const pollRes = await fetch(
+      const pollRes = await fetchImpl(
         `${SUPABASE_URL}/rest/v1/cli_auth_codes?code=eq.${code}&select=status,access_token,refresh_token,user_email,user_id`,
         {
           headers: {
@@ -303,7 +347,11 @@ export async function loginWithGitHub() {
       if (!row) continue;
 
       if (row.status === 'expired') {
-        return { success: false, error: 'Code expired. Please run switchman login again.' };
+        return {
+          success: false,
+          error: humanizeLoginError('auth_code_expired'),
+          reason: 'auth_code_expired',
+        };
       }
 
       if (row.status === 'authorized' && row.access_token) {
@@ -318,7 +366,7 @@ export async function loginWithGitHub() {
         clearLicenceCache();
 
         // Clean up the code row
-        fetch(`${SUPABASE_URL}/rest/v1/cli_auth_codes?code=eq.${code}`, {
+        fetchImpl(`${SUPABASE_URL}/rest/v1/cli_auth_codes?code=eq.${code}`, {
           method: 'DELETE',
           headers: { 'apikey': SUPABASE_ANON },
         }).catch(() => {});
@@ -332,7 +380,13 @@ export async function loginWithGitHub() {
     }
   }
 
-  return { success: false, error: 'timeout' };
+  return {
+    success: false,
+    error: humanizeLoginError('timeout', activateUrl, code),
+    reason: 'timeout',
+    activate_url: activateUrl,
+    code,
+  };
 }
 
 function saveSession(session) {

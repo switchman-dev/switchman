@@ -13,9 +13,11 @@ export function registerTaskCommands(program, {
   pushSyncEvent,
   retryStaleTasks,
   retryTaskViaCoordination,
+  sendSwitchmanNotification,
   startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
+  checkLicence,
 }) {
   const taskCmd = program.command('task').description('Manage the task list');
   taskCmd.addHelpText('after', `
@@ -197,6 +199,11 @@ Examples:
         }
         console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
         pushSyncEvent('task_done', { task_id: taskId }).catch(() => {});
+        sendSwitchmanNotification({
+          title: 'Agent finished a task',
+          message: `Task ${taskId} completed successfully.`,
+          checkLicence,
+        }).catch(() => {});
       } catch (err) {
         console.error(chalk.red(err.message));
         process.exitCode = 1;
@@ -211,6 +218,11 @@ Examples:
       await failTaskViaCoordination(repoRoot, { taskId, reason });
       console.log(`${chalk.red('✗')} Task ${chalk.cyan(taskId)} marked failed`);
       pushSyncEvent('task_failed', { task_id: taskId, reason: reason || null }).catch(() => {});
+      sendSwitchmanNotification({
+        title: 'Agent hit a failed task',
+        message: reason ? `Task ${taskId} failed: ${reason}` : `Task ${taskId} failed and needs review.`,
+        checkLicence,
+      }).catch(() => {});
     });
 
   taskCmd

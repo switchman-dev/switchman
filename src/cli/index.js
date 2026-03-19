@@ -52,6 +52,7 @@ import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCi
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, evaluateQueueRepoGate, resolveQueueSource, runMergeQueue } from '../core/queue.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, getChangePolicyPath, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../core/policy.js';
+import { getNotificationsConfigPath, readNotificationsConfig, sendSwitchmanNotification, writeNotificationsConfig } from '../core/notifications.js';
 import { planPipelineTasks } from '../core/planner.js';
 import { clearSchedulerState, dispatchReadyTasks, getSchedulerStatePath, readSchedulerState, writeSchedulerState } from '../core/scheduler.js';
 import {
@@ -89,6 +90,7 @@ import { registerAccountCommands } from './commands/account.js';
 import { registerGateCommands } from './commands/gate.js';
 import { registerLeaseCommands } from './commands/lease.js';
 import { registerMonitorCommands } from './commands/monitor.js';
+import { registerNotificationCommands } from './commands/notifications.js';
 import { registerOperatorCommands } from './commands/operator.js';
 import { registerPipelineCommands } from './commands/pipeline.js';
 import { registerPolicyCommands } from './commands/policy.js';
@@ -133,6 +135,7 @@ import {
   collectStatusSnapshot,
   humanizeReasonCode,
   nextStepForReason,
+  renderLiveWatchDashboard,
   renderUnifiedStatusReport,
   summarizeTeamCoordinationState,
 } from './reports.js';
@@ -1794,8 +1797,10 @@ registerTaskCommands(program, {
   listTasksViaCoordination,
   printErrorWithNext,
   pushSyncEvent,
+  sendSwitchmanNotification,
   retryStaleTasks,
   retryTaskViaCoordination,
+  checkLicence,
   startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
@@ -1821,6 +1826,7 @@ registerQueueCommands(program, {
   printErrorWithNext,
   pushSyncEvent,
   renderChip,
+  renderLiveWatchDashboard,
   renderMetricRow,
   renderPanel,
   renderSignalStrip,
@@ -2269,6 +2275,7 @@ registerPipelineCommands(program, {
   printErrorWithNext,
   publishPipelinePr,
   renderChip,
+  renderLiveWatchDashboard,
   renderMetricRow,
   renderPanel,
   renderSignalStrip,
@@ -2358,6 +2365,11 @@ Only use --force for operator-led recovery after checking switchman status or sw
         }
         console.log(chalk.dim('\nDo not use --force as a shortcut. Check status or explain the claim first, then only override if the existing claim is known-bad.'));
         console.log(`${chalk.yellow('next:')} switchman status`);
+        sendSwitchmanNotification({
+          title: 'Agent blocked by a file claim',
+          message: `${worktree} could not claim ${conflicts[0].file} because it is already owned by ${conflicts[0].claimedBy.worktree}.`,
+          checkLicence,
+        }).catch(() => {});
         process.exitCode = 1;
         return;
       }
@@ -2561,6 +2573,7 @@ registerOperatorCommands(program, {
   readCredentials,
   recoverWorkViaCoordination,
   renderChip,
+  renderLiveWatchDashboard,
   renderMetricRow,
   renderPanel,
   renderSignalStrip,
@@ -2725,6 +2738,15 @@ registerSchedulerCommands(program, {
   readSchedulerState,
   spawn,
   startBackgroundScheduler,
+});
+
+registerNotificationCommands(program, {
+  chalk,
+  checkLicence,
+  getNotificationsConfigPath,
+  readNotificationsConfig,
+  sendSwitchmanNotification,
+  writeNotificationsConfig,
 });
 
 // ── policy ───────────────────────────────────────────────────────────────────

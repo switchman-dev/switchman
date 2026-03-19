@@ -23,6 +23,7 @@ export function registerOperatorCommands(program, deps) {
     readCredentials,
     recoverWorkViaCoordination,
     renderChip,
+    renderLiveWatchDashboard,
     renderMetricRow,
     renderPanel,
     renderSignalStrip,
@@ -265,7 +266,6 @@ Use this first when the repo feels stuck.
             });
             console.log('');
           }
-          renderUnifiedStatusReport(report, { teamActivity: otherMembers, teamSummary });
           if (watch) {
             const signature = buildWatchSignature(report);
             const watchState = lastSignature === null
@@ -275,8 +275,17 @@ Use this first when the repo feels stuck.
                 : chalk.green('change detected');
             const updatedAt = formatClockTime(report.generated_at);
             lastSignature = signature;
-            console.log('');
-            console.log(chalk.dim(`Live watch • updated ${updatedAt || 'just now'} • ${watchState}${maxCycles > 0 ? ` • cycle ${cycles}/${maxCycles}` : ''} • refresh ${watchIntervalMs}ms`));
+            renderLiveWatchDashboard(report, {
+              teamActivity: otherMembers,
+              teamSummary,
+              watchState,
+              updatedAt,
+              cycles,
+              maxCycles,
+              watchIntervalMs,
+            });
+          } else {
+            renderUnifiedStatusReport(report, { teamActivity: otherMembers, teamSummary });
           }
         }
 
