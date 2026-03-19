@@ -231,20 +231,15 @@ async function createTaskViaCoordination(repoRoot, taskInput) {
     throw new Error(sharedResult.message || `Shared coordination task creation failed (${sharedResult.reason}).`);
   }
 
-  const db = getDb(repoRoot);
-  try {
-    const taskId = createTask(db, taskInput);
-    return {
-      backend: 'local',
-      task: {
-        id: taskId,
-        title: taskInput.title,
-        priority: taskInput.priority,
-      },
-    };
-  } finally {
-    db.close();
-  }
+  const taskId = createLocalTaskWithRetries(repoRoot, taskInput);
+  return {
+    backend: 'local',
+    task: {
+      id: taskId,
+      title: taskInput.title,
+      priority: taskInput.priority,
+    },
+  };
 }
 
 async function listTasksViaCoordination(repoRoot, status = null) {
@@ -786,6 +781,27 @@ function acquireNextTaskLeaseWithRetries(repoRoot, worktreeName, agent, attempts
       const result = acquireNextTaskLease(db, worktreeName, agent, attempts);
       db.close();
       return result;
+    } catch (err) {
+      lastError = err;
+      try { db?.close(); } catch { /* no-op */ }
+      if (!isBusyError(err) || attempt === attempts) {
+        throw err;
+      }
+      sleepSync(100 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+function createLocalTaskWithRetries(repoRoot, taskInput, attempts = 20) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let db = null;
+    try {
+      db = openDb(repoRoot);
+      const taskId = createTask(db, taskInput);
+      db.close();
+      return taskId;
     } catch (err) {
       lastError = err;
       try { db?.close(); } catch { /* no-op */ }
