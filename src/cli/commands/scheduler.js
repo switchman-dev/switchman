@@ -1,8 +1,7 @@
 export function registerSchedulerCommands(program, {
   chalk,
   clearSchedulerState,
-  dispatchReadyTasks,
-  getDb,
+  dispatchReadyTasksViaCoordination,
   getRepo,
   isProcessRunning,
   processExecPath,
@@ -18,14 +17,12 @@ export function registerSchedulerCommands(program, {
     .option('--agent <name>', 'Agent identifier to record on created leases', 'switchman-scheduler')
     .option('--limit <n>', 'Maximum assignments to create in this pass')
     .option('--json', 'Output raw JSON')
-    .action((opts) => {
+    .action(async (opts) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
-      const result = dispatchReadyTasks(db, {
+      const result = await dispatchReadyTasksViaCoordination(repoRoot, {
         agentName: opts.agent,
         limit: opts.limit ? Number.parseInt(opts.limit, 10) : null,
       });
-      db.close();
 
       if (opts.json) {
         console.log(JSON.stringify(result, null, 2));
@@ -80,9 +77,7 @@ export function registerSchedulerCommands(program, {
       process.on('SIGTERM', stop);
 
       while (!stopped) {
-        const db = getDb(repoRoot);
-        const result = dispatchReadyTasks(db, { agentName: opts.agent });
-        db.close();
+        const result = await dispatchReadyTasksViaCoordination(repoRoot, { agentName: opts.agent });
 
         if (!opts.daemonized) {
           for (const assignment of result.assignments) {

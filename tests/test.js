@@ -16,6 +16,7 @@ import { ensureProjectLocalMcpGitExcludes, getWindsurfMcpConfigPath, upsertCurso
 import { evaluateRepoCompliance, evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 import { clearSchedulerState, readSchedulerState } from '../src/core/scheduler.js';
+import { acquireSharedNextLease, claimSharedFiles as claimSharedFilesRemote, createSharedTask as createSharedTaskRemote } from '../src/core/shared-coordination.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 import { buildTaskSpec, planPipelineTasks } from '../src/core/planner.js';
@@ -102,13 +103,25 @@ function test(name, fn) {
   }
 }
 
-function writeProTestCredentials(homeDir, email = 'pro@test.com') {
+async function testAsync(name, fn) {
+  console.log(`\n${name}`);
+  try {
+    await fn();
+  } catch (err) {
+    console.log(`  ✗ THREW: ${err.message}`);
+    failed++;
+  }
+}
+
+function writeProTestCredentials(homeDir, email = 'pro@test.com', { userId = 'user-pro-1', teamId = null } = {}) {
   const switchmanDir = join(homeDir, '.switchman');
   mkdirSync(switchmanDir, { recursive: true });
   writeFileSync(join(switchmanDir, 'credentials.json'), JSON.stringify({
     access_token: 'test-access-token',
     refresh_token: 'test-refresh-token',
     email,
+    user_id: userId,
+    team_id: teamId,
   }, null, 2));
   writeFileSync(join(switchmanDir, 'licence-cache.json'), JSON.stringify({
     valid: true,
@@ -159,6 +172,7 @@ function stopRepoSchedulerIfRunning(repoDir) {
   }
   clearSchedulerState(repoDir);
 }
+
 
 // Setup
 mkdirSync(TEST_DIR, { recursive: true });
@@ -412,6 +426,151 @@ test('Start unlocks more than three agents for Pro users', () => {
   cleanupSiblingAgentWorktrees(repoDir, 4);
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
+});
+
+await testAsync('Pro shared coordination lets one repo add work and another repo lease and claim it safely', async () => {
+  const sharedState = {
+    tasks: [],
+    claims: new Map(),
+    leases: [],
+  };
+  const repoADir = join(tmpdir(), `sw-shared-a-${Date.now()}`);
+  const repoBDir = join(tmpdir(), `sw-shared-b-${Date.now()}`);
+  const homeADir = join(tmpdir(), `sw-shared-home-a-${Date.now()}`);
+  const homeBDir = join(tmpdir(), `sw-shared-home-b-${Date.now()}`);
+  const originalFetch = global.fetch;
+  const originalHome = process.env.HOME;
+  process.env.SWITCHMAN_SHARED_QUEUE_URL = 'https://shared.test/functions/v1/shared-coordination';
+
+  try {
+    global.fetch = async (_url, options = {}) => {
+      const payload = JSON.parse(options.body || '{}');
+      const operation = payload.operation;
+      const opPayload = payload.payload || {};
+
+      if (operation === 'create_task') {
+        const task = {
+          id: opPayload.task.id,
+          title: opPayload.task.title,
+          description: opPayload.task.description || null,
+          priority: opPayload.task.priority || 5,
+          status: 'pending',
+          worktree: null,
+        };
+        sharedState.tasks.push(task);
+        sharedState.tasks.sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
+        return new Response(JSON.stringify({ task }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      if (operation === 'acquire_next') {
+        const task = sharedState.tasks.find((entry) => entry.status === 'pending');
+        if (!task) {
+          return new Response(JSON.stringify({ task: null, lease: null, exhausted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        task.status = 'in_progress';
+        task.worktree = opPayload.worktree;
+        const lease = {
+          id: `lease-${task.id}`,
+          task_id: task.id,
+          worktree: opPayload.worktree,
+          status: 'active',
+        };
+        sharedState.leases.push(lease);
+        return new Response(JSON.stringify({ task, lease, exhausted: false }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      if (operation === 'claim_files') {
+        const conflicts = [];
+        for (const file of opPayload.files || []) {
+          const owner = sharedState.claims.get(file);
+          if (owner && owner.task_id !== opPayload.task_id) {
+            conflicts.push({ file, claimedBy: owner });
+          }
+        }
+        if (conflicts.length > 0 && !opPayload.force) {
+          return new Response(JSON.stringify({ reason: 'claim_conflict', conflicts }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+        }
+        for (const file of opPayload.files || []) {
+          sharedState.claims.set(file, {
+            task_id: opPayload.task_id,
+            worktree: opPayload.worktree,
+            task_title: sharedState.tasks.find((entry) => entry.id === opPayload.task_id)?.title || opPayload.task_id,
+          });
+        }
+        return new Response(JSON.stringify({
+          lease: {
+            id: `lease-${opPayload.task_id}`,
+            task_id: opPayload.task_id,
+            worktree: opPayload.worktree,
+          },
+          conflicts: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      return new Response(JSON.stringify({ reason: 'unknown_operation' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    };
+
+    for (const repoDir of [repoADir, repoBDir]) {
+      mkdirSync(repoDir, { recursive: true });
+      execSync('git init -b main', { cwd: repoDir });
+      execSync('git config user.email "test@test.com"', { cwd: repoDir });
+      execSync('git config user.name "Test"', { cwd: repoDir });
+      execSync('git remote add origin https://github.com/acme/shared-repo.git', { cwd: repoDir });
+      writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+      execSync('git add README.md', { cwd: repoDir });
+      execSync('git commit -m "init repo context"', { cwd: repoDir });
+    }
+
+    mkdirSync(homeADir, { recursive: true });
+    mkdirSync(homeBDir, { recursive: true });
+    writeProTestCredentials(homeADir, 'a@test.com', { userId: 'user-a', teamId: 'team-1' });
+    writeProTestCredentials(homeBDir, 'b@test.com', { userId: 'user-b', teamId: 'team-1' });
+
+    process.env.HOME = homeADir;
+    await createSharedTaskRemote(repoADir, {
+      id: 'shared-task-1',
+      title: 'Shared auth task',
+      priority: 9,
+    });
+
+    process.env.HOME = homeBDir;
+    const nextResult = await acquireSharedNextLease(repoBDir, {
+      worktree: 'agent2',
+      agent: 'codex',
+    });
+    assert(nextResult.task.id === 'shared-task-1', 'Shared queue lets a second repo lease work created elsewhere on the same team');
+
+    const firstClaim = await claimSharedFilesRemote(repoBDir, {
+      taskId: 'shared-task-1',
+      worktree: 'agent2',
+      files: ['src/auth.js'],
+      agent: 'codex',
+    });
+    assert(firstClaim.ok, 'Shared claims can be recorded against the leased task');
+
+    process.env.HOME = homeADir;
+    const secondClaim = await claimSharedFilesRemote(repoADir, {
+      taskId: 'other-task',
+      worktree: 'agent1',
+      files: ['src/auth.js'],
+      agent: 'codex',
+    });
+
+    assert(secondClaim.ok === false, 'Shared claims reject cross-repo conflicts on the same team');
+    assert(secondClaim.conflicts[0].claimedBy.worktree === 'agent2', 'Shared claim conflicts name the owning remote worktree');
+  } finally {
+    global.fetch = originalFetch;
+    if (originalHome == null) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+    delete process.env.SWITCHMAN_SHARED_QUEUE_URL;
+    rmSync(repoADir, { recursive: true, force: true });
+    rmSync(repoBDir, { recursive: true, force: true });
+    rmSync(homeADir, { recursive: true, force: true });
+    rmSync(homeBDir, { recursive: true, force: true });
+  }
 });
 
 test('Scheduler once dispatches only dependency-ready tasks onto idle workspaces', () => {

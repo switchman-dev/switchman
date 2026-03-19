@@ -1,10 +1,10 @@
 export function registerTaskCommands(program, {
-  acquireNextTaskLeaseWithRetries,
+  acquireNextTaskLeaseViaCoordination,
   analyzeTaskScope,
   chalk,
-  completeTaskWithRetries,
-  createTask,
-  failTask,
+  completeTaskViaCoordination,
+  createTaskViaCoordination,
+  failTaskViaCoordination,
   getCurrentWorktreeName,
   getDb,
   getRepo,
@@ -14,7 +14,7 @@ export function registerTaskCommands(program, {
   releaseFileClaims,
   retryStaleTasks,
   retryTask,
-  startTaskLease,
+  startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
 }) {
@@ -32,16 +32,15 @@ Examples:
     .option('-d, --description <desc>', 'Task description')
     .option('-p, --priority <n>', 'Priority 1-10 (default 5)', '5')
     .option('--id <id>', 'Custom task ID')
-    .action((title, opts) => {
+    .action(async (title, opts) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
-      const taskId = createTask(db, {
+      const result = await createTaskViaCoordination(repoRoot, {
         id: opts.id,
         title,
         description: opts.description,
         priority: parseInt(opts.priority),
       });
-      db.close();
+      const taskId = result.task.id;
       const scopeWarning = analyzeTaskScope(title, opts.description || '');
       console.log(`${chalk.green('✓')} Task created: ${chalk.cyan(taskId)}`);
       pushSyncEvent('task_added', { task_id: taskId, title, priority: parseInt(opts.priority) }).catch(() => {});
@@ -83,11 +82,9 @@ Examples:
     .command('assign <taskId> <worktree>')
     .description('Assign a task to a workspace (compatibility shim for lease acquire)')
     .option('--agent <name>', 'Agent name (e.g. claude-code)')
-    .action((taskId, worktree, opts) => {
+    .action(async (taskId, worktree, opts) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
-      const lease = startTaskLease(db, taskId, worktree, opts.agent);
-      db.close();
+      const { lease } = await startTaskLeaseViaCoordination(repoRoot, { taskId, worktree, agent: opts.agent });
       if (lease) {
         console.log(`${chalk.green('✓')} Assigned ${chalk.cyan(taskId)} → ${chalk.cyan(worktree)} (${chalk.dim(lease.id)})`);
       } else {
@@ -166,10 +163,10 @@ Examples:
   taskCmd
     .command('done <taskId>')
     .description('Mark a task as complete and release all file claims')
-    .action((taskId) => {
+    .action(async (taskId) => {
       const repoRoot = getRepo();
       try {
-        const result = completeTaskWithRetries(repoRoot, taskId);
+        const { result } = await completeTaskViaCoordination(repoRoot, taskId);
         if (result?.status === 'already_done') {
           console.log(`${chalk.yellow('!')} Task ${chalk.cyan(taskId)} was already marked done — no new changes were recorded`);
           return;
@@ -197,12 +194,9 @@ Examples:
   taskCmd
     .command('fail <taskId> [reason]')
     .description('Mark a task as failed')
-    .action((taskId, reason) => {
+    .action(async (taskId, reason) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
-      failTask(db, taskId, reason);
-      releaseFileClaims(db, taskId);
-      db.close();
+      await failTaskViaCoordination(repoRoot, { taskId, reason });
       console.log(`${chalk.red('✗')} Task ${chalk.cyan(taskId)} marked failed`);
       pushSyncEvent('task_failed', { task_id: taskId, reason: reason || null }).catch(() => {});
     });
@@ -218,10 +212,10 @@ Examples:
   switchman task next
   switchman task next --json
 `)
-    .action((opts) => {
+    .action(async (opts) => {
       const repoRoot = getRepo();
       const worktreeName = getCurrentWorktreeName(opts.worktree);
-      const { task, lease, exhausted } = acquireNextTaskLeaseWithRetries(repoRoot, worktreeName, opts.agent || null);
+      const { task, lease, exhausted } = await acquireNextTaskLeaseViaCoordination(repoRoot, worktreeName, opts.agent || null);
 
       if (!task) {
         if (opts.json) console.log(JSON.stringify({ task: null }));

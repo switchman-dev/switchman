@@ -1,5 +1,5 @@
 export function registerLeaseCommands(program, {
-  acquireNextTaskLeaseWithRetries,
+  acquireNextTaskLeaseViaCoordination,
   chalk,
   getCurrentWorktreeName,
   getDb,
@@ -10,7 +10,7 @@ export function registerLeaseCommands(program, {
   loadLeasePolicy,
   pushSyncEvent,
   reapStaleLeases,
-  startTaskLease,
+  startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
   writeLeasePolicy,
@@ -36,12 +36,13 @@ Examples:
   switchman lease acquire task-123 agent2
   switchman lease acquire task-123 agent2 --agent cursor
 `)
-    .action((taskId, worktree, opts) => {
+    .action(async (taskId, worktree, opts) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
-      const task = getTask(db, taskId);
-      const lease = startTaskLease(db, taskId, worktree, opts.agent || null);
-      db.close();
+      const { task, lease } = await startTaskLeaseViaCoordination(repoRoot, {
+        taskId,
+        worktree,
+        agent: opts.agent || null,
+      });
 
       if (!lease || !task) {
         if (opts.json) console.log(JSON.stringify({ lease: null, task: null }));
@@ -75,10 +76,10 @@ Examples:
   switchman lease next --json
   switchman lease next --worktree agent2 --agent cursor
 `)
-    .action((opts) => {
+    .action(async (opts) => {
       const repoRoot = getRepo();
       const worktreeName = getCurrentWorktreeName(opts.worktree);
-      const { task, lease, exhausted } = acquireNextTaskLeaseWithRetries(repoRoot, worktreeName, opts.agent || null);
+      const { task, lease, exhausted } = await acquireNextTaskLeaseViaCoordination(repoRoot, worktreeName, opts.agent || null);
 
       if (!task) {
         if (opts.json) console.log(JSON.stringify({ task: null, lease: null }));

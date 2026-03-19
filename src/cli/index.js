@@ -55,6 +55,17 @@ import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, getChangePolicyPath, loadC
 import { planPipelineTasks } from '../core/planner.js';
 import { clearSchedulerState, dispatchReadyTasks, getSchedulerStatePath, readSchedulerState, writeSchedulerState } from '../core/scheduler.js';
 import {
+  acquireSharedNextLease,
+  acquireSharedTaskLease,
+  claimSharedFiles,
+  completeSharedTask,
+  createSharedTask,
+  dispatchSharedReadyTasks,
+  failSharedTask,
+  getSharedCoordinationMode,
+  releaseSharedClaims,
+} from '../core/shared-coordination.js';
+import {
   captureTelemetryEvent,
   disableTelemetry,
   enableTelemetry,
@@ -202,6 +213,156 @@ function getOptionalDb(repoRoot) {
   }
 }
 
+async function createTaskViaCoordination(repoRoot, taskInput) {
+  const sharedResult = await createSharedTask(repoRoot, taskInput);
+  if (sharedResult.ok) {
+    return { backend: 'shared', task: sharedResult.task || sharedResult };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination task creation failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    const taskId = createTask(db, taskInput);
+    return {
+      backend: 'local',
+      task: {
+        id: taskId,
+        title: taskInput.title,
+        priority: taskInput.priority,
+      },
+    };
+  } finally {
+    db.close();
+  }
+}
+
+async function startTaskLeaseViaCoordination(repoRoot, { taskId, worktree, agent = null } = {}) {
+  const sharedResult = await acquireSharedTaskLease(repoRoot, { taskId, worktree, agent });
+  if (sharedResult.ok) {
+    return { backend: 'shared', task: sharedResult.task || null, lease: sharedResult.lease || null };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination lease acquisition failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    const task = getTask(db, taskId);
+    const lease = startTaskLease(db, taskId, worktree, agent || null);
+    return { backend: 'local', task, lease };
+  } finally {
+    db.close();
+  }
+}
+
+async function acquireNextTaskLeaseViaCoordination(repoRoot, worktreeName, agent) {
+  const sharedResult = await acquireSharedNextLease(repoRoot, { worktree: worktreeName, agent });
+  if (sharedResult.ok) {
+    return {
+      backend: 'shared',
+      task: sharedResult.task || null,
+      lease: sharedResult.lease || null,
+      exhausted: Boolean(sharedResult.exhausted),
+    };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination next-task acquisition failed (${sharedResult.reason}).`);
+  }
+
+  const result = acquireNextTaskLeaseWithRetries(repoRoot, worktreeName, agent);
+  return { backend: 'local', ...result };
+}
+
+async function claimFilesViaCoordination(repoRoot, { taskId, worktree, files, agent = null, force = false } = {}) {
+  const sharedResult = await claimSharedFiles(repoRoot, { taskId, worktree, files, agent, force });
+  if (sharedResult.ok) {
+    return { backend: 'shared', ...sharedResult };
+  }
+  if (sharedResult.shared) {
+    return { backend: 'shared', ok: false, conflicts: sharedResult.conflicts || [], reason: sharedResult.reason };
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    const conflicts = checkFileConflicts(db, files, worktree);
+    if (conflicts.length > 0 && !force) {
+      return { backend: 'local', ok: false, conflicts };
+    }
+    const lease = claimFiles(db, taskId, worktree, files, agent);
+    return { backend: 'local', ok: true, lease, conflicts: [] };
+  } finally {
+    db.close();
+  }
+}
+
+async function releaseClaimsViaCoordination(repoRoot, { taskId } = {}) {
+  const sharedResult = await releaseSharedClaims(repoRoot, { taskId });
+  if (sharedResult.ok) {
+    return { backend: 'shared', ...sharedResult };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination release failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    const task = getTask(db, taskId);
+    releaseFileClaims(db, taskId);
+    return { backend: 'local', ok: true, task };
+  } finally {
+    db.close();
+  }
+}
+
+async function completeTaskViaCoordination(repoRoot, taskId) {
+  const sharedResult = await completeSharedTask(repoRoot, { taskId });
+  if (sharedResult.ok) {
+    return { backend: 'shared', result: sharedResult.result || sharedResult };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination completion failed (${sharedResult.reason}).`);
+  }
+  return { backend: 'local', result: completeTaskWithRetries(repoRoot, taskId) };
+}
+
+async function failTaskViaCoordination(repoRoot, { taskId, reason = null } = {}) {
+  const sharedResult = await failSharedTask(repoRoot, { taskId, reason });
+  if (sharedResult.ok) {
+    return { backend: 'shared', ...sharedResult };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination failure reporting failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    failTask(db, taskId, reason);
+    releaseFileClaims(db, taskId);
+    return { backend: 'local', ok: true };
+  } finally {
+    db.close();
+  }
+}
+
+async function dispatchReadyTasksViaCoordination(repoRoot, { agentName = 'switchman-scheduler', limit = null } = {}) {
+  const sharedResult = await dispatchSharedReadyTasks(repoRoot, { agentName, limit });
+  if (sharedResult.ok) {
+    return { backend: 'shared', ...(sharedResult.result || sharedResult) };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination scheduler dispatch failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    return { backend: 'local', ...dispatchReadyTasks(db, { agentName, limit }) };
+  } finally {
+    db.close();
+  }
+}
+
 function assertWorkspaceRepoHasCommit(repoRoot) {
   try {
     execSync('git rev-parse HEAD', {
@@ -271,7 +432,7 @@ async function provisionAgentWorkspaces(repoRoot, {
   };
 }
 
-function createPlannedTasks(db, plannedTasks, title) {
+async function createPlannedTasks(repoRoot, db, plannedTasks, title) {
   const createdTaskIds = [];
   for (const task of plannedTasks) {
     const taskDescription = [
@@ -279,13 +440,15 @@ function createPlannedTasks(db, plannedTasks, title) {
       task.suggested_worktree ? `Suggested worktree: ${task.suggested_worktree}` : null,
       task.dependencies?.length > 0 ? `Depends on: ${task.dependencies.join(', ')}` : null,
     ].filter(Boolean).join('\n');
-    createTask(db, {
+    const created = await createTaskViaCoordination(repoRoot, {
       id: task.id,
       title: task.title,
       description: taskDescription,
       priority: planTaskPriority(task.task_spec),
     });
-    upsertTaskSpec(db, task.id, task.task_spec);
+    if (created.backend === 'local') {
+      upsertTaskSpec(db, task.id, task.task_spec);
+    }
     createdTaskIds.push(task.id);
   }
   return createdTaskIds;
@@ -1039,6 +1202,7 @@ Examples:
     }
 
     const licence = await checkLicence();
+    const sharedMode = await getSharedCoordinationMode(repoRoot);
     const requestedAgentCount = String(opts.agents || 'auto').trim().toLowerCase();
     const maxTasks = Math.max(1, Number.parseInt(String(opts.maxTasks), 10) || 6);
     const context = collectPlanContext(repoRoot, goal || null, issueContext);
@@ -1111,7 +1275,7 @@ Examples:
     console.log('');
     console.log(chalk.bold('Session plan:'));
     console.log(`  ${chalk.dim('tier:')} ${licence.valid ? chalk.green('Pro') : chalk.yellow('Free')}`);
-    console.log(`  ${chalk.dim('coordination:')} ${licence.valid ? 'local coordination with Pro agent capacity' : 'local coordination only'}`);
+    console.log(`  ${chalk.dim('coordination:')} ${sharedMode.enabled ? 'shared team queue in the cloud' : licence.valid ? 'local coordination with Pro agent capacity' : 'local coordination only'}`);
     console.log(`  ${chalk.dim('agents:')} ${desiredAgentCount}${!licence.valid ? chalk.dim(` (capped at ${FREE_AGENT_LIMIT} on free)`) : ''}`);
     console.log('');
 
@@ -1147,7 +1311,7 @@ Examples:
         monitorIntervalMs: opts.monitorIntervalMs,
       });
       db = setupResult.db;
-      createPlannedTasks(db, finalPlannedTasks, context.title);
+      await createPlannedTasks(repoRoot, db, finalPlannedTasks, context.title);
       const schedulerIntervalMs = Math.max(100, Number.parseInt(String(opts.schedulerIntervalMs), 10) || 2000);
       const schedulerState = opts.scheduler
         ? startBackgroundScheduler(repoRoot, { intervalMs: schedulerIntervalMs })
@@ -1504,7 +1668,7 @@ Examples:
       }
 
       console.log('');
-      createPlannedTasks(db, plannedTasks, context.title);
+      await createPlannedTasks(repoRoot, db, plannedTasks, context.title);
       for (const task of plannedTasks) {
         console.log(`  ${chalk.green('✓')} Created ${chalk.cyan(task.id)} ${chalk.dim(task.title)}`);
       }
@@ -1534,12 +1698,12 @@ Examples:
 // ── task ──────────────────────────────────────────────────────────────────────
 
 registerTaskCommands(program, {
-  acquireNextTaskLeaseWithRetries,
+  acquireNextTaskLeaseViaCoordination,
   analyzeTaskScope,
   chalk,
-  completeTaskWithRetries,
-  createTask,
-  failTask,
+  completeTaskViaCoordination,
+  createTaskViaCoordination,
+  failTaskViaCoordination,
   getCurrentWorktreeName,
   getDb,
   getRepo,
@@ -1549,7 +1713,7 @@ registerTaskCommands(program, {
   releaseFileClaims,
   retryStaleTasks,
   retryTask,
-  startTaskLease,
+  startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
 });
@@ -2040,7 +2204,7 @@ registerPipelineCommands(program, {
 // ── lease ────────────────────────────────────────────────────────────────────
 
 registerLeaseCommands(program, {
-  acquireNextTaskLeaseWithRetries,
+  acquireNextTaskLeaseViaCoordination,
   chalk,
   getCurrentWorktreeName,
   getDb,
@@ -2051,7 +2215,7 @@ registerLeaseCommands(program, {
   loadLeasePolicy,
   pushSyncEvent,
   reapStaleLeases,
-  startTaskLease,
+  startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
   writeLeasePolicy,
@@ -2086,17 +2250,23 @@ Examples:
 Use this before editing files in a shared repo.
 Only use --force for operator-led recovery after checking switchman status or switchman explain claim <path>.
 `)
-  .action((taskId, worktree, files, opts) => {
+  .action(async (taskId, worktree, files, opts) => {
     if (!files.length) {
       console.log(chalk.yellow('No files specified.'));
       console.log(`${chalk.yellow('next:')} switchman claim <taskId> <workspace> file1 file2`);
       return;
     }
     const repoRoot = getRepo();
-    const db = getDb(repoRoot);
 
     try {
-      const conflicts = checkFileConflicts(db, files, worktree);
+      const result = await claimFilesViaCoordination(repoRoot, {
+        taskId,
+        worktree,
+        files,
+        agent: opts.agent,
+        force: Boolean(opts.force),
+      });
+      const conflicts = result.conflicts || [];
 
       if (conflicts.length > 0 && !opts.force) {
         console.log(chalk.red(`\n⚠ Claim conflicts detected:`));
@@ -2109,7 +2279,7 @@ Only use --force for operator-led recovery after checking switchman status or sw
         return;
       }
 
-      const lease = claimFiles(db, taskId, worktree, files, opts.agent);
+      const lease = result.lease;
       console.log(`${chalk.green('✓')} Claimed ${files.length} file(s) for task ${chalk.cyan(taskId)} (${chalk.dim(lease.id)})`);
       pushSyncEvent('claim_added', {
         task_id: taskId,
@@ -2121,20 +2291,16 @@ Only use --force for operator-led recovery after checking switchman status or sw
     } catch (err) {
       printErrorWithNext(err.message, 'switchman task list --status in_progress');
       process.exitCode = 1;
-    } finally {
-      db.close();
     }
   });
 
 program
   .command('release <taskId>')
   .description('Release all file claims for a task')
-  .action((taskId) => {
+  .action(async (taskId) => {
     const repoRoot = getRepo();
-    const db = getDb(repoRoot);
-    const task = getTask(db, taskId);
-    releaseFileClaims(db, taskId);
-    db.close();
+    const result = await releaseClaimsViaCoordination(repoRoot, { taskId });
+    const task = result.task || null;
     console.log(`${chalk.green('✓')} Released all claims for task ${chalk.cyan(taskId)}`);
     pushSyncEvent('claim_released', { task_id: taskId }, { worktree: task?.worktree || null }).catch(() => {});
   });
@@ -2468,8 +2634,7 @@ registerMonitorCommands(program, {
 registerSchedulerCommands(program, {
   chalk,
   clearSchedulerState,
-  dispatchReadyTasks,
-  getDb,
+  dispatchReadyTasksViaCoordination,
   getRepo,
   isProcessRunning,
   processExecPath: process.execPath,
