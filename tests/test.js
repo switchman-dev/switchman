@@ -15,6 +15,7 @@ import { filterIgnoredPaths, isIgnoredPath, matchesPathPatterns } from '../src/c
 import { ensureProjectLocalMcpGitExcludes, getWindsurfMcpConfigPath, upsertCursorProjectMcpConfig, upsertProjectMcpConfig, upsertWindsurfMcpConfig } from '../src/core/mcp.js';
 import { evaluateRepoCompliance, evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
+import { clearSchedulerState, readSchedulerState } from '../src/core/scheduler.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 import { buildTaskSpec, planPipelineTasks } from '../src/core/planner.js';
@@ -149,6 +150,14 @@ function cleanupSiblingAgentWorktrees(repoDir, agentCount) {
   for (let i = 1; i <= agentCount; i++) {
     rmSync(join(repoDir, '..', `${repoName}-agent${i}`), { recursive: true, force: true });
   }
+}
+
+function stopRepoSchedulerIfRunning(repoDir) {
+  const state = readSchedulerState(repoDir);
+  if (state?.pid && isProcessRunning(state.pid)) {
+    process.kill(state.pid, 'SIGTERM');
+  }
+  clearSchedulerState(repoDir);
 }
 
 // Setup
@@ -300,6 +309,7 @@ test('Start boots a free repo into a real 3-agent local Switchman session', () =
     'start',
     'Add authentication',
     '--yes',
+    '--no-scheduler',
     '--no-monitor',
   ], {
     cwd: repoDir,
@@ -346,6 +356,7 @@ test('Start keeps the fourth agent behind the Pro upgrade trigger on free tier',
       '--agents',
       '4',
       '--yes',
+      '--no-scheduler',
       '--no-monitor',
     ], {
       cwd: repoDir,
@@ -384,6 +395,7 @@ test('Start unlocks more than three agents for Pro users', () => {
     '--agents',
     '4',
     '--yes',
+    '--no-scheduler',
     '--no-monitor',
   ], {
     cwd: repoDir,
@@ -398,6 +410,89 @@ test('Start unlocks more than three agents for Pro users', () => {
   db.close();
 
   cleanupSiblingAgentWorktrees(repoDir, 4);
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
+test('Scheduler once dispatches only dependency-ready tasks onto idle workspaces', () => {
+  const repoDir = join(tmpdir(), `sw-scheduler-once-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
+  registerWorktree(db, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
+
+  const plannedTasks = startPipeline(db, {
+    title: 'Add authentication',
+    description: 'Implement auth and then write tests.',
+    pipelineId: 'start-auth',
+    maxTasks: 3,
+  }).tasks;
+  db.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'scheduler',
+    'once',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  const result = JSON.parse(output);
+  assert(result.assignments.length === 1, 'Scheduler dispatches only the dependency-ready task first');
+  assert(result.assignments[0].task_id.endsWith('-01'), 'Scheduler picks the implementation task before follow-up work');
+  assert(result.blocked_task_count >= 1, 'Scheduler reports dependency-blocked follow-up work');
+
+  const scheduledDb = openDb(repoDir);
+  const inProgress = listTasks(scheduledDb, 'in_progress');
+  const pending = listTasks(scheduledDb, 'pending');
+  assert(inProgress.length === 1, 'Scheduler creates one active lease-backed assignment');
+  assert(pending.length >= 1, 'Scheduler leaves blocked follow-up tasks pending');
+  scheduledDb.close();
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Start launches the background scheduler by default', () => {
+  const repoDir = join(tmpdir(), `sw-start-scheduler-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-start-scheduler-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'start',
+    'Add authentication',
+    '--yes',
+    '--no-monitor',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  const schedulerState = readSchedulerState(repoDir);
+  assert(output.includes('switchman scheduler status'), 'Start points operators at the scheduler status command');
+  assert(Boolean(schedulerState?.pid), 'Start writes scheduler background state by default');
+  assert(isProcessRunning(schedulerState.pid), 'Start leaves the background scheduler process running');
+
+  stopRepoSchedulerIfRunning(repoDir);
+  cleanupSiblingAgentWorktrees(repoDir, 3);
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
 });

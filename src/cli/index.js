@@ -53,6 +53,7 @@ import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, mate
 import { buildQueueStatusSummary, evaluateQueueRepoGate, resolveQueueSource, runMergeQueue } from '../core/queue.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, getChangePolicyPath, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../core/policy.js';
 import { planPipelineTasks } from '../core/planner.js';
+import { clearSchedulerState, dispatchReadyTasks, getSchedulerStatePath, readSchedulerState, writeSchedulerState } from '../core/scheduler.js';
 import {
   captureTelemetryEvent,
   disableTelemetry,
@@ -80,6 +81,7 @@ import { registerQueueCommands } from './commands/queue.js';
 import { registerTaskCommands } from './commands/task.js';
 import { registerTelemetryCommands } from './commands/telemetry.js';
 import { registerWorktreeCommands } from './commands/worktree.js';
+import { registerSchedulerCommands } from './commands/scheduler.js';
 import {
   buildPlanningCommentBody,
   collectPlanContext,
@@ -272,10 +274,15 @@ async function provisionAgentWorkspaces(repoRoot, {
 function createPlannedTasks(db, plannedTasks, title) {
   const createdTaskIds = [];
   for (const task of plannedTasks) {
+    const taskDescription = [
+      `[Planned from ${title}]`,
+      task.suggested_worktree ? `Suggested worktree: ${task.suggested_worktree}` : null,
+      task.dependencies?.length > 0 ? `Depends on: ${task.dependencies.join(', ')}` : null,
+    ].filter(Boolean).join('\n');
     createTask(db, {
       id: task.id,
       title: task.title,
-      description: `Planned from: ${title}`,
+      description: taskDescription,
       priority: planTaskPriority(task.task_spec),
     });
     upsertTaskSpec(db, task.id, task.task_spec);
@@ -604,6 +611,48 @@ function startBackgroundMonitor(repoRoot, { intervalMs = 2000, quarantine = fals
   };
 }
 
+function startBackgroundScheduler(repoRoot, { intervalMs = 2000, agentName = 'switchman-scheduler' } = {}) {
+  const existingState = readSchedulerState(repoRoot);
+  if (existingState && isProcessRunning(existingState.pid)) {
+    return {
+      already_running: true,
+      state: existingState,
+      state_path: getSchedulerStatePath(repoRoot),
+    };
+  }
+
+  const logPath = join(repoRoot, '.switchman', 'scheduler.log');
+  const child = spawn(process.execPath, [
+    process.argv[1],
+    'scheduler',
+    'watch',
+    '--interval-ms',
+    String(intervalMs),
+    '--agent',
+    String(agentName),
+    '--daemonized',
+  ], {
+    cwd: repoRoot,
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+
+  const statePath = writeSchedulerState(repoRoot, {
+    pid: child.pid,
+    interval_ms: intervalMs,
+    agent_name: agentName,
+    log_path: logPath,
+    started_at: new Date().toISOString(),
+  });
+
+  return {
+    already_running: false,
+    state: readSchedulerState(repoRoot),
+    state_path: statePath,
+  };
+}
+
 function renderMonitorEvent(event) {
   const ownerText = event.owner_worktree
     ? `${event.owner_worktree}${event.owner_task_id ? ` (${event.owner_task_id})` : ''}`
@@ -790,6 +839,7 @@ const ROOT_HELP_COMMANDS = new Set([
   'session-summary',
   'recover',
   'merge',
+  'scheduler',
   'repair',
   'help',
 ]);
@@ -809,6 +859,7 @@ Start here:
   switchman status --watch
   switchman session-summary
   switchman recover
+  switchman scheduler status
   switchman gate ci && switchman queue run
 
 For you (the operator):
@@ -820,6 +871,7 @@ For you (the operator):
   switchman status
   switchman session-summary
   switchman recover
+  switchman scheduler status
   switchman merge
   switchman repair
   switchman upgrade
@@ -961,6 +1013,8 @@ program
   .option('-a, --agents <n>', 'Number of agent workspaces to create (default: auto)', 'auto')
   .option('--max-tasks <n>', 'Maximum number of suggested tasks', '6')
   .option('--prefix <prefix>', 'Branch prefix for created workspaces (default: switchman)', 'switchman')
+  .option('--no-scheduler', 'Do not start the background task scheduler')
+  .option('--scheduler-interval-ms <ms>', 'Polling interval for the background scheduler', '2000')
   .option('--no-monitor', 'Do not start the background rogue-edit monitor')
   .option('--monitor-interval-ms <ms>', 'Polling interval for the background monitor', '2000')
   .option('-y, --yes', 'Skip the confirmation prompt and start immediately')
@@ -1094,6 +1148,10 @@ Examples:
       });
       db = setupResult.db;
       createPlannedTasks(db, finalPlannedTasks, context.title);
+      const schedulerIntervalMs = Math.max(100, Number.parseInt(String(opts.schedulerIntervalMs), 10) || 2000);
+      const schedulerState = opts.scheduler
+        ? startBackgroundScheduler(repoRoot, { intervalMs: schedulerIntervalMs })
+        : null;
 
       spinner.succeed(`Switchman start is ready — ${desiredAgentCount} agent workspace${desiredAgentCount === 1 ? '' : 's'} and ${finalPlannedTasks.length} task${finalPlannedTasks.length === 1 ? '' : 's'} prepared`);
       console.log('');
@@ -1106,10 +1164,13 @@ Examples:
       console.log(`  1. Open Claude Code or Cursor in the agent workspaces above`);
       console.log(`  2. Keep the repo dashboard open:`);
       console.log(`     ${chalk.cyan('switchman status --watch')}`);
-      console.log(`  3. When the first session ends, see what Switchman prevented:`);
+      if (opts.scheduler) {
+        console.log(`  3. Scheduler: ${schedulerState?.already_running ? 'already running' : 'started'} ${chalk.dim(`(${chalk.cyan('switchman scheduler status')})`)}`);
+      }
+      console.log(`  ${opts.scheduler ? '4' : '3'}. When the first session ends, see what Switchman prevented:`);
       console.log(`     ${chalk.cyan('switchman session-summary')}`);
       if (!licence.valid) {
-        console.log(`  4. Need more than ${FREE_AGENT_LIMIT} agents or team sync?`);
+        console.log(`  ${opts.scheduler ? '5' : '4'}. Need more than ${FREE_AGENT_LIMIT} agents or team sync?`);
         console.log(`     ${chalk.cyan('switchman upgrade')}`);
       }
     } catch (err) {
@@ -2402,6 +2463,19 @@ registerMonitorCommands(program, {
   resolveMonitoredWorktrees,
   spawn,
   startBackgroundMonitor,
+});
+
+registerSchedulerCommands(program, {
+  chalk,
+  clearSchedulerState,
+  dispatchReadyTasks,
+  getDb,
+  getRepo,
+  isProcessRunning,
+  processExecPath: process.execPath,
+  readSchedulerState,
+  spawn,
+  startBackgroundScheduler,
 });
 
 // ── policy ───────────────────────────────────────────────────────────────────
