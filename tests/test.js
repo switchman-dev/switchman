@@ -23,6 +23,7 @@ import {
   getSharedStatusSnapshot,
   listSharedLeases,
   listSharedTasks,
+  recoverSharedAbandonedWork,
   retrySharedTask,
 } from '../src/core/shared-coordination.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
@@ -4467,7 +4468,7 @@ test('Telemetry send reports not-configured and disabled states clearly', async 
   rmSync(fakeHome, { recursive: true, force: true });
 });
 
-testAsync('Shared sync buffers retryable cloud failures locally and flushes them on the next successful contact', async () => {
+await testAsync('Shared sync buffers retryable cloud failures locally and flushes them on the next successful contact', async () => {
   const fakeHome = join(tmpdir(), `sw-sync-buffer-home-${Date.now()}`);
   mkdirSync(fakeHome, { recursive: true });
   writeProTestCredentials(fakeHome, 'sync@test.com', { userId: 'sync-user-1' });
@@ -7655,6 +7656,73 @@ test('Status JSON surfaces buffered shared sync state when cloud events are pend
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(fakeHome, { recursive: true, force: true });
+});
+
+await testAsync('Shared coordination can recover abandoned team work through the shared queue', async () => {
+  const repoDir = join(tmpdir(), `sw-shared-recover-${Date.now()}`);
+  const fakeHome = join(tmpdir(), `sw-shared-recover-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(fakeHome, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+  writeProTestCredentials(fakeHome, 'recover@test.com', { userId: 'recover-user', teamId: 'team-recover' });
+
+  const originalHome = process.env.HOME;
+  const originalFetch = global.fetch;
+  process.env.SWITCHMAN_SHARED_QUEUE_URL = 'https://shared.test/functions/v1/shared-coordination';
+
+  try {
+    process.env.HOME = fakeHome;
+    global.fetch = async (_url, options = {}) => {
+      const payload = JSON.parse(options.body || '{}');
+      if (payload.operation === 'recover_abandoned') {
+        return new Response(JSON.stringify({
+          report: {
+            stale_after_minutes: payload.payload.stale_after_minutes,
+            requeue_task_on_reap: true,
+            stale_leases: [{
+              kind: 'stale_lease',
+              task_id: 'shared-task-1',
+              task_title: 'Recover auth work',
+              worktree: 'agent2',
+              changed_files: ['src/auth.js'],
+              claimed_files: ['src/auth.js'],
+              recovered_to: 'pending',
+            }],
+            stranded_tasks: [],
+            repair: { repaired: false, actions: [], warnings: [], notes: [], summary: { auto_fixed: [], manual_review: [], skipped: [], counts: { auto_fixed: 0, manual_review: 0, skipped: 0 } } },
+            recovered: {
+              stale_leases: 1,
+              stranded_tasks: 0,
+              repo_actions: 0,
+            },
+            next_steps: ['switchman status', 'switchman task list --status pending'],
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      return new Response(JSON.stringify({ reason: 'unknown_operation' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const result = await recoverSharedAbandonedWork(repoDir, { staleAfterMinutes: 20 });
+    assert(result.ok === true, 'Shared recover can request abandoned-work recovery from the shared queue');
+    assert(result.report.recovered.stale_leases === 1, 'Shared recover reports recovered stale leases from team state');
+    assert(result.report.stale_leases[0].claimed_files.includes('src/auth.js'), 'Shared recover carries claimed files from the abandoned shared work');
+  } finally {
+    global.fetch = originalFetch;
+    if (originalHome == null) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    delete process.env.SWITCHMAN_SHARED_QUEUE_URL;
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
 });
 
 test('Recover command resets stale leases and stranded tasks while summarizing abandoned changes', () => {

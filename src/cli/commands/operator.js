@@ -21,6 +21,7 @@ export function registerOperatorCommands(program, deps) {
     pullActiveTeamMembers,
     pullTeamState,
     readCredentials,
+    recoverWorkViaCoordination,
     renderChip,
     renderMetricRow,
     renderPanel,
@@ -306,15 +307,13 @@ Examples:
 
 Use this when an agent crashed, a worktree was abandoned mid-task, or the repo feels stuck after interrupted work.
 `)
-    .action((opts) => {
+    .action(async (opts) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
 
       try {
-        const report = buildRecoverReport(db, repoRoot, {
+        const { report } = await recoverWorkViaCoordination(repoRoot, {
           staleAfterMinutes: opts.staleAfterMinutes || null,
         });
-        db.close();
 
         if (opts.json) {
           console.log(JSON.stringify(report, null, 2));
@@ -323,7 +322,6 @@ Use this when an agent crashed, a worktree was abandoned mid-task, or the repo f
 
         printRecoverSummary(report);
       } catch (err) {
-        db.close();
         printErrorWithNext(err.message, 'switchman status');
         process.exitCode = 1;
       }

@@ -66,6 +66,7 @@ import {
   listSharedLeases,
   listSharedTasks,
   releaseSharedClaims,
+  recoverSharedAbandonedWork,
   retrySharedTask,
 } from '../core/shared-coordination.js';
 import {
@@ -287,6 +288,35 @@ async function retryTaskViaCoordination(repoRoot, { taskId, reason = null } = {}
   const db = getDb(repoRoot);
   try {
     return { backend: 'local', task: retryTask(db, taskId, reason) };
+  } finally {
+    db.close();
+  }
+}
+
+async function recoverWorkViaCoordination(repoRoot, {
+  staleAfterMinutes = null,
+  reason = 'operator recover',
+} = {}) {
+  const sharedResult = await recoverSharedAbandonedWork(repoRoot, {
+    staleAfterMinutes,
+    reason,
+  });
+  if (sharedResult.ok) {
+    return { backend: 'shared', report: sharedResult.report || sharedResult };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination recovery failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    return {
+      backend: 'local',
+      report: buildRecoverReport(db, repoRoot, {
+        staleAfterMinutes,
+        reason,
+      }),
+    };
   } finally {
     db.close();
   }
@@ -2529,6 +2559,7 @@ registerOperatorCommands(program, {
   pullActiveTeamMembers,
   pullTeamState,
   readCredentials,
+  recoverWorkViaCoordination,
   renderChip,
   renderMetricRow,
   renderPanel,

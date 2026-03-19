@@ -186,6 +186,16 @@ export async function retrySharedTask(repoRoot, { taskId, reason = null } = {}) 
   return performSharedOperation(repoRoot, 'retry_task', { task_id: taskId, reason });
 }
 
+export async function recoverSharedAbandonedWork(repoRoot, {
+  staleAfterMinutes = null,
+  reason = 'operator recover',
+} = {}) {
+  return performSharedOperation(repoRoot, 'recover_abandoned', {
+    stale_after_minutes: staleAfterMinutes,
+    reason,
+  });
+}
+
 export async function dispatchSharedReadyTasks(repoRoot, { agentName = 'switchman-scheduler', limit = null } = {}) {
   return performSharedOperation(repoRoot, 'dispatch_ready', {
     agent_name: agentName,
