@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, posix } from 'path';
 import { execSync, spawn } from 'child_process';
+import readline from 'readline/promises';
 
 import { cleanupCrashedLandingTempWorktrees, createGitWorktree, findRepoRoot, getWorktreeChangedFiles, gitAssessBranchFreshness, gitBranchExists, listGitWorktrees } from '../core/git.js';
 import { matchesPathPatterns } from '../core/ignore.js';
@@ -150,6 +151,27 @@ function installMcpConfig(targetDirs) {
   return targetDirs.flatMap((targetDir) => upsertAllProjectMcpConfigs(targetDir));
 }
 
+async function confirmCliAction(prompt) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    return 'non_interactive';
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    const answer = String(await rl.question(prompt)).trim().toLowerCase();
+    if (!answer || answer === 'y' || answer === 'yes') return 'yes';
+    if (answer === 'n' || answer === 'no') return 'no';
+    if (answer === 'e' || answer === 'edit') return 'edit';
+    return 'no';
+  } finally {
+    rl.close();
+  }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function getRepo() {
@@ -176,6 +198,90 @@ function getOptionalDb(repoRoot) {
   } catch {
     return null;
   }
+}
+
+function assertWorkspaceRepoHasCommit(repoRoot) {
+  try {
+    execSync('git rev-parse HEAD', {
+      cwd: repoRoot,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    throw new Error('Your repo needs at least one commit before agent workspaces can be created.');
+  }
+}
+
+function createStartPlanningWorktrees(agentCount) {
+  return Array.from({ length: agentCount }, (_, index) => ({
+    name: `agent${index + 1}`,
+    path: null,
+    branch: `${index + 1}`,
+  }));
+}
+
+async function provisionAgentWorkspaces(repoRoot, {
+  agentCount,
+  prefix = 'switchman',
+  monitor = true,
+  monitorIntervalMs = 2000,
+}) {
+  assertWorkspaceRepoHasCommit(repoRoot);
+
+  const db = initDb(repoRoot);
+  const created = [];
+
+  for (let i = 1; i <= agentCount; i++) {
+    const name = `agent${i}`;
+    const branch = `${prefix}/agent${i}`;
+    try {
+      const wtPath = createGitWorktree(repoRoot, name, branch);
+      registerWorktree(db, { name, path: wtPath, branch });
+      created.push({ name, path: wtPath, branch });
+    } catch {
+      const repoName = repoRoot.split('/').pop();
+      const wtPath = join(repoRoot, '..', `${repoName}-${name}`);
+      registerWorktree(db, { name, path: wtPath, branch });
+      created.push({ name, path: wtPath, branch, existed: true });
+    }
+  }
+
+  const gitWorktrees = listGitWorktrees(repoRoot);
+  for (const wt of gitWorktrees) {
+    registerWorktree(db, { name: wt.name, path: wt.path, branch: wt.branch || 'unknown' });
+  }
+
+  const mcpConfigWrites = installMcpConfig([...new Set([repoRoot, ...created.map((wt) => wt.path)])]);
+  const mcpExclude = ensureProjectLocalMcpGitExcludes(repoRoot);
+
+  const effectiveMonitorIntervalMs = Math.max(100, Number.parseInt(String(monitorIntervalMs), 10) || 2000);
+  const monitorState = monitor
+    ? startBackgroundMonitor(repoRoot, { intervalMs: effectiveMonitorIntervalMs, quarantine: false })
+    : null;
+
+  return {
+    db,
+    created,
+    gitWorktrees,
+    mcpConfigWrites,
+    mcpExclude,
+    monitorState,
+    monitorIntervalMs: effectiveMonitorIntervalMs,
+  };
+}
+
+function createPlannedTasks(db, plannedTasks, title) {
+  const createdTaskIds = [];
+  for (const task of plannedTasks) {
+    createTask(db, {
+      id: task.id,
+      title: task.title,
+      description: `Planned from: ${title}`,
+      priority: planTaskPriority(task.task_spec),
+    });
+    upsertTaskSpec(db, task.id, task.task_spec);
+    createdTaskIds.push(task.id);
+  }
+  return createdTaskIds;
 }
 
 function retryStaleTasks(db, { pipelineId = null, reason = 'bulk stale retry' } = {}) {
@@ -673,6 +779,7 @@ const ROOT_HELP_COMMANDS = new Set([
   'advanced',
   'claude',
   'demo',
+  'start',
   'setup',
   'verify-setup',
   'login',
@@ -696,6 +803,7 @@ program.configureHelp({
 program.addHelpText('after', `
 Start here:
   switchman demo
+  switchman start "Add authentication"
   switchman setup --agents 3
   switchman task add "Your task" --priority 8
   switchman status --watch
@@ -705,6 +813,7 @@ Start here:
 
 For you (the operator):
   switchman demo
+  switchman start "Add authentication"
   switchman setup
   switchman claude refresh
   switchman task add
@@ -842,6 +951,176 @@ program
   });
 
 
+// ── start ────────────────────────────────────────────────────────────────────
+
+program
+  .command('start [goal]')
+  .description('Boot a Switchman session: infer context, propose work, and spin up agent workspaces')
+  .option('--issue <number>', 'Read planning context from a GitHub issue via gh')
+  .option('--gh-command <command>', 'Executable to use for GitHub CLI', 'gh')
+  .option('-a, --agents <n>', 'Number of agent workspaces to create (default: auto)', 'auto')
+  .option('--max-tasks <n>', 'Maximum number of suggested tasks', '6')
+  .option('--prefix <prefix>', 'Branch prefix for created workspaces (default: switchman)', 'switchman')
+  .option('--no-monitor', 'Do not start the background rogue-edit monitor')
+  .option('--monitor-interval-ms <ms>', 'Polling interval for the background monitor', '2000')
+  .option('-y, --yes', 'Skip the confirmation prompt and start immediately')
+  .addHelpText('after', `
+Examples:
+  switchman start "Add authentication"
+  switchman start --issue 47
+  switchman start "Ship the billing flow" --agents 4 --yes
+`)
+  .action(async (goal, opts) => {
+    const repoRoot = getRepo();
+
+    let issueContext = null;
+    if (opts.issue) {
+      try {
+        issueContext = fetchGitHubIssueContext(repoRoot, opts.issue, opts.ghCommand);
+      } catch (err) {
+        printErrorWithNext(err.message, 'switchman start "Add authentication"');
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    const licence = await checkLicence();
+    const requestedAgentCount = String(opts.agents || 'auto').trim().toLowerCase();
+    const maxTasks = Math.max(1, Number.parseInt(String(opts.maxTasks), 10) || 6);
+    const context = collectPlanContext(repoRoot, goal || null, issueContext);
+
+    let desiredAgentCount = requestedAgentCount === 'auto'
+      ? Math.min(maxTasks, licence.valid ? maxTasks : FREE_AGENT_LIMIT)
+      : Number.parseInt(requestedAgentCount, 10);
+
+    if (!Number.isInteger(desiredAgentCount) || desiredAgentCount < 1) {
+      console.error(chalk.red('--agents must be a positive number or "auto"'));
+      process.exit(1);
+    }
+
+    if (!licence.valid && desiredAgentCount > FREE_AGENT_LIMIT) {
+      console.log('');
+      console.log(chalk.red(`  ✗ Agent limit reached (${FREE_AGENT_LIMIT}/${FREE_AGENT_LIMIT})`));
+      console.log('');
+      console.log(`  You need ${chalk.cyan(`agent${desiredAgentCount}`)} right now.`);
+      console.log('');
+      console.log(`  Unlock unlimited agents in 60 seconds -> ${chalk.cyan('switchman upgrade')}`);
+      console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+      console.log('');
+      process.exitCode = 1;
+      return;
+    }
+
+    const planningWorktrees = createStartPlanningWorktrees(desiredAgentCount);
+    const pipelineId = `start-${slugifyValue(context.title)}-${Date.now().toString(36)}`;
+    const plannedTasks = planPipelineTasks({
+      pipelineId,
+      title: context.title,
+      description: context.description,
+      worktrees: planningWorktrees,
+      maxTasks,
+      repoRoot,
+    });
+
+    if (requestedAgentCount === 'auto') {
+      desiredAgentCount = Math.max(1, Math.min(
+        plannedTasks.length || 1,
+        licence.valid ? Math.max(plannedTasks.length || 1, 1) : FREE_AGENT_LIMIT,
+      ));
+    }
+
+    const finalPlanningWorktrees = createStartPlanningWorktrees(desiredAgentCount);
+    const finalPlannedTasks = planPipelineTasks({
+      pipelineId,
+      title: context.title,
+      description: context.description,
+      worktrees: finalPlanningWorktrees,
+      maxTasks,
+      repoRoot,
+    });
+
+    console.log(chalk.bold('Reading repo context...'));
+    if (context.found.length > 0) {
+      console.log(`${chalk.dim('Found:')} ${context.found.join(', ')}`);
+    } else {
+      console.log(chalk.dim('Found: local repo context only'));
+    }
+    console.log('');
+    console.log(`${chalk.bold('Suggested plan based on:')} ${context.used.length > 0 ? formatHumanList(context.used) : 'available repo context'}`);
+    console.log('');
+
+    finalPlannedTasks.forEach((task, index) => {
+      const worktreeLabel = task.suggested_worktree ? chalk.cyan(task.suggested_worktree) : chalk.dim('unassigned');
+      console.log(`  ${chalk.green('✓')} ${chalk.bold(`${index + 1}.`)} ${task.title}  ${chalk.dim('→')} ${worktreeLabel}`);
+    });
+
+    console.log('');
+    console.log(chalk.bold('Session plan:'));
+    console.log(`  ${chalk.dim('tier:')} ${licence.valid ? chalk.green('Pro') : chalk.yellow('Free')}`);
+    console.log(`  ${chalk.dim('coordination:')} ${licence.valid ? 'local coordination with Pro agent capacity' : 'local coordination only'}`);
+    console.log(`  ${chalk.dim('agents:')} ${desiredAgentCount}${!licence.valid ? chalk.dim(` (capped at ${FREE_AGENT_LIMIT} on free)`) : ''}`);
+    console.log('');
+
+    if (!opts.yes) {
+      const answer = await confirmCliAction('Does this look right? [Y/n/edit] ');
+      if (answer === 'non_interactive') {
+        console.log(chalk.dim('Non-interactive shell detected — rerun with `switchman start --yes` to create the session.'));
+        process.exitCode = 1;
+        return;
+      }
+      if (answer === 'edit') {
+        console.log(chalk.dim('Edit the goal or issue context, then rerun `switchman start` with the updated prompt.'));
+        return;
+      }
+      if (answer !== 'yes') {
+        console.log(chalk.dim('Start cancelled.'));
+        return;
+      }
+    }
+
+    const spinner = ora('Starting Switchman session...').start();
+    let db = null;
+
+    try {
+      if (!existsSync(join(repoRoot, 'CLAUDE.md'))) {
+        writeFileSync(join(repoRoot, 'CLAUDE.md'), renderClaudeGuide(repoRoot), 'utf8');
+      }
+
+      const setupResult = await provisionAgentWorkspaces(repoRoot, {
+        agentCount: desiredAgentCount,
+        prefix: opts.prefix,
+        monitor: opts.monitor,
+        monitorIntervalMs: opts.monitorIntervalMs,
+      });
+      db = setupResult.db;
+      createPlannedTasks(db, finalPlannedTasks, context.title);
+
+      spinner.succeed(`Switchman start is ready — ${desiredAgentCount} agent workspace${desiredAgentCount === 1 ? '' : 's'} and ${finalPlannedTasks.length} task${finalPlannedTasks.length === 1 ? '' : 's'} prepared`);
+      console.log('');
+      console.log(chalk.bold('Open your agents here:'));
+      for (const wt of setupResult.created) {
+        console.log(`  ${chalk.green('✓')} ${chalk.cyan(wt.name)}  ${chalk.dim(wt.path)}`);
+      }
+      console.log('');
+      console.log(chalk.bold('Next steps:'));
+      console.log(`  1. Open Claude Code or Cursor in the agent workspaces above`);
+      console.log(`  2. Keep the repo dashboard open:`);
+      console.log(`     ${chalk.cyan('switchman status --watch')}`);
+      console.log(`  3. When the first session ends, see what Switchman prevented:`);
+      console.log(`     ${chalk.cyan('switchman session-summary')}`);
+      if (!licence.valid) {
+        console.log(`  4. Need more than ${FREE_AGENT_LIMIT} agents or team sync?`);
+        console.log(`     ${chalk.cyan('switchman upgrade')}`);
+      }
+    } catch (err) {
+      spinner.fail(err.message);
+      process.exitCode = 1;
+    } finally {
+      try { db?.close(); } catch { /* no-op */ }
+    }
+  });
+
+
 // ── setup ─────────────────────────────────────────────────────────────────────
 
 program
@@ -859,8 +1138,8 @@ Examples:
   .action(async (opts) => {
     const agentCount = parseInt(opts.agents);
 
-    if (isNaN(agentCount) || agentCount < 1 || agentCount > 10) {
-      console.error(chalk.red('--agents must be a number between 1 and 10'));
+    if (isNaN(agentCount) || agentCount < 1) {
+      console.error(chalk.red('--agents must be a positive number'));
       process.exit(1);
     }
 
@@ -886,53 +1165,19 @@ Examples:
     const spinner = ora('Setting up Switchman...').start();
 
     try {
-      // git worktree add requires at least one commit
-      try {
-        execSync('git rev-parse HEAD', {
-          cwd: repoRoot,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-      } catch {
-        spinner.fail('Your repo needs at least one commit before agent workspaces can be created.');
-        console.log(chalk.dim('  Run: git commit --allow-empty -m "init"  then try again'));
-        process.exit(1);
-      }
-
-      // Init the switchman database
-      const db = initDb(repoRoot);
-
-      // Create one workspace (git worktree) per agent
-      const created = [];
-      for (let i = 1; i <= agentCount; i++) {
-        const name = `agent${i}`;
-        const branch = `${opts.prefix}/agent${i}`;
-        spinner.text = `Creating worktree ${i}/${agentCount}...`;
-        try {
-          const wtPath = createGitWorktree(repoRoot, name, branch);
-          registerWorktree(db, { name, path: wtPath, branch });
-          created.push({ name, path: wtPath, branch });
-        } catch {
-          // Worktree already exists — register it without failing
-          const repoName = repoRoot.split('/').pop();
-          const wtPath = join(repoRoot, '..', `${repoName}-${name}`);
-          registerWorktree(db, { name, path: wtPath, branch });
-          created.push({ name, path: wtPath, branch, existed: true });
-        }
-      }
-
-      // Register the main worktree too
-      const gitWorktrees = listGitWorktrees(repoRoot);
-      for (const wt of gitWorktrees) {
-        registerWorktree(db, { name: wt.name, path: wt.path, branch: wt.branch || 'unknown' });
-      }
-
-      const mcpConfigWrites = installMcpConfig([...new Set([repoRoot, ...created.map((wt) => wt.path)])]);
-      const mcpExclude = ensureProjectLocalMcpGitExcludes(repoRoot);
-
-      const monitorIntervalMs = Math.max(100, Number.parseInt(opts.monitorIntervalMs, 10) || 2000);
-      const monitorState = opts.monitor
-        ? startBackgroundMonitor(repoRoot, { intervalMs: monitorIntervalMs, quarantine: false })
-        : null;
+      const {
+        db,
+        created,
+        mcpConfigWrites,
+        mcpExclude,
+        monitorIntervalMs,
+        monitorState,
+      } = await provisionAgentWorkspaces(repoRoot, {
+        agentCount,
+        prefix: opts.prefix,
+        monitor: opts.monitor,
+        monitorIntervalMs: opts.monitorIntervalMs,
+      });
 
       db.close();
 
@@ -1198,14 +1443,8 @@ Examples:
       }
 
       console.log('');
+      createPlannedTasks(db, plannedTasks, context.title);
       for (const task of plannedTasks) {
-        createTask(db, {
-          id: task.id,
-          title: task.title,
-          description: `Planned from: ${context.title}`,
-          priority: planTaskPriority(task.task_spec),
-        });
-        upsertTaskSpec(db, task.id, task.task_spec);
         console.log(`  ${chalk.green('✓')} Created ${chalk.cyan(task.id)} ${chalk.dim(task.title)}`);
       }
 

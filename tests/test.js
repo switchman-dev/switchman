@@ -144,6 +144,13 @@ function cleanupPipelineExecRepo(repoDir, agentPath) {
   rmSync(repoDir, { recursive: true, force: true });
 }
 
+function cleanupSiblingAgentWorktrees(repoDir, agentCount) {
+  const repoName = repoDir.split('/').pop();
+  for (let i = 1; i <= agentCount; i++) {
+    rmSync(join(repoDir, '..', `${repoName}-agent${i}`), { recursive: true, force: true });
+  }
+}
+
 // Setup
 mkdirSync(TEST_DIR, { recursive: true });
 
@@ -270,6 +277,127 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
   assert(plannedTasks.length >= 2, 'Plan apply creates multiple planned tasks');
   assert(getTaskSpec(appliedDb, plannedTasks[0].id)?.pipeline_id?.startsWith('plan-add-authentication-'), 'Plan apply stores a structured task spec for created tasks');
   appliedDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
+test('Start boots a free repo into a real 3-agent local Switchman session', () => {
+  const repoDir = join(tmpdir(), `sw-start-free-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-start-free-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+  execSync('git checkout -b feature/47-add-auth', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "harden auth middleware"', { cwd: repoDir });
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'start',
+    'Add authentication',
+    '--yes',
+    '--no-monitor',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  assert(output.includes('Reading repo context...'), 'Start reads repo context before booting the session');
+  assert(output.includes('Suggested plan based on:'), 'Start explains the context it used for the proposed work');
+  assert(output.includes('local coordination only'), 'Start explains the free-tier coordination mode');
+  assert(output.includes('Open your agents here:'), 'Start prints the handoff section once the session is ready');
+  assert(existsSync(join(repoDir, 'CLAUDE.md')), 'Start creates a repo-aware CLAUDE.md when one does not exist');
+
+  const db = openDb(repoDir);
+  const worktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
+  const tasks = listTasks(db);
+  assert(worktrees.length === 3, 'Free start creates three agent workspaces');
+  assert(tasks.length >= 2, 'Start creates planned tasks automatically');
+  db.close();
+
+  cleanupSiblingAgentWorktrees(repoDir, 3);
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
+test('Start keeps the fourth agent behind the Pro upgrade trigger on free tier', () => {
+  const repoDir = join(tmpdir(), `sw-start-cap-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-start-cap-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+
+  let output = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'start',
+      'Add authentication',
+      '--agents',
+      '4',
+      '--yes',
+      '--no-monitor',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir },
+    });
+  } catch (err) {
+    output = err.stdout || '';
+  }
+
+  assert(output.includes('Agent limit reached (3/3)'), 'Start blocks the fourth agent on free tier');
+  assert(output.includes('switchman upgrade'), 'Start points the fourth-agent moment at the upgrade flow');
+
+  cleanupSiblingAgentWorktrees(repoDir, 4);
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
+test('Start unlocks more than three agents for Pro users', () => {
+  const repoDir = join(tmpdir(), `sw-start-pro-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-start-pro-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+  writeProTestCredentials(homeDir);
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'start',
+    'Add authentication',
+    '--agents',
+    '4',
+    '--yes',
+    '--no-monitor',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  assert(output.includes('tier: Pro'), 'Start reports the Pro tier when a valid licence is present');
+  const db = openDb(repoDir);
+  const worktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
+  assert(worktrees.length === 4, 'Pro start can create more than three agent workspaces');
+  db.close();
+
+  cleanupSiblingAgentWorktrees(repoDir, 4);
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
 });
@@ -6890,6 +7018,7 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
   assert(helpOutput.includes('For you (the operator):'), 'Top-level help includes an operator section');
   assert(helpOutput.includes('For your agents (via CLAUDE.md or MCP):'), 'Top-level help includes an agent section');
+  assert(helpOutput.includes('switchman start "Add authentication"'), 'Top-level help includes the one-command start entrypoint');
   assert(helpOutput.includes('switchman claude refresh'), 'Top-level help includes the Claude guide refresh command');
   assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the explicit first task step');
   assert(helpOutput.includes('switchman plan "Add authentication"   (Pro)'), 'Top-level help marks planning as a Pro operator command');
