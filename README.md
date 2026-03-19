@@ -37,7 +37,7 @@ switchman advanced brew-formula --sha256 <release-tarball-sha> --output Formula/
 
 ---
 
-## 2 minute proof
+## Try It In 2 Minutes
 
 ```bash
 switchman demo
@@ -57,32 +57,6 @@ cd /tmp/switchman-demo-...
 switchman status
 switchman queue status
 ```
-
----
-
-## Switchman Pro
-
-> **Unlimited agents · Team coordination · AI planning · $25/month**  
-> [switchman.dev/pro](https://switchman.dev/pro) · or run `switchman upgrade`
-
-Pro removes the 3-agent limit, adds cloud-synced team coordination, AI task planning, and 90-day history. Free tier stays fully featured and MIT licensed forever.
-
-```bash
-switchman upgrade        # open switchman.dev/pro
-switchman login          # activate after subscribing
-switchman login --status # check your plan
-```
-
-**What's in Pro:**
-
-- Unlimited concurrent agents (free: up to 3)
-- Cloud-synced team activity across machines
-- Team invites — `switchman team invite alice@example.com`
-- AI task planning — `switchman plan "Add authentication" --apply`, `switchman plan --issue 47`, and optionally `--comment` back to the issue or PR
-- 90-day audit trail (free: 7 days)
-- Email support within 48 hours
-
-**$25/month or $250/year per seat** · [switchman.dev/pro](https://switchman.dev/pro)
 
 ---
 
@@ -125,6 +99,33 @@ Editor setup guides:
 - [Claude Code](docs/setup-claude-code.md)
 - [Cursor](docs/setup-cursor.md)
 - [Windsurf](docs/setup-windsurf.md)
+
+---
+
+## Switchman Pro
+
+> **Unlimited agents · Team coordination · AI planning · $19/month**  
+> [switchman.dev/pro](https://switchman.dev/pro) · or run `switchman upgrade`
+
+Pro removes the 3-agent limit, adds shared cloud coordination, AI task planning, and longer audit history. Free stays fully featured for local runs with up to 3 agents.
+
+```bash
+switchman upgrade        # open switchman.dev/pro
+switchman login          # activate after subscribing
+switchman login --status # check your plan
+```
+
+**What's in Pro:**
+
+- Unlimited concurrent agents (free: up to 3)
+- Shared cloud coordination across machines
+- AI task planning — `switchman plan "Add authentication" --apply`, `switchman plan --issue 47`, and optionally `--comment` back to the issue or PR
+- Session summaries with counterfactuals
+- Slack notifications
+- 90-day audit trail (free: 7 days)
+- Email support within 48 hours
+
+**$19/month per seat** · [switchman.dev/pro](https://switchman.dev/pro)
 
 ---
 
