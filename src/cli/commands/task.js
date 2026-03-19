@@ -8,12 +8,11 @@ export function registerTaskCommands(program, {
   getCurrentWorktreeName,
   getDb,
   getRepo,
-  listTasks,
+  listTasksViaCoordination,
   printErrorWithNext,
   pushSyncEvent,
-  releaseFileClaims,
   retryStaleTasks,
-  retryTask,
+  retryTaskViaCoordination,
   startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
@@ -56,11 +55,16 @@ Examples:
     .command('list')
     .description('List all tasks')
     .option('-s, --status <status>', 'Filter by status (pending|in_progress|done|failed)')
-    .action((opts) => {
+    .action(async (opts) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
-      const tasks = listTasks(db, opts.status);
-      db.close();
+      let tasks;
+      try {
+        ({ tasks } = await listTasksViaCoordination(repoRoot, opts.status || null));
+      } catch (err) {
+        printErrorWithNext(err.message, 'switchman login --status');
+        process.exitCode = 1;
+        return;
+      }
 
       if (!tasks.length) {
         console.log(chalk.dim('No tasks found.'));
@@ -97,11 +101,19 @@ Examples:
     .description('Return a failed or stale completed task to pending so it can be revalidated')
     .option('--reason <text>', 'Reason to record for the retry')
     .option('--json', 'Output raw JSON')
-    .action((taskId, opts) => {
+    .action(async (taskId, opts) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
-      const task = retryTask(db, taskId, opts.reason || 'manual retry');
-      db.close();
+      let task;
+      try {
+        ({ task } = await retryTaskViaCoordination(repoRoot, {
+          taskId,
+          reason: opts.reason || 'manual retry',
+        }));
+      } catch (err) {
+        printErrorWithNext(err.message, 'switchman login --status');
+        process.exitCode = 1;
+        return;
+      }
 
       if (!task) {
         printErrorWithNext(`Task ${taskId} is not retryable.`, 'switchman task list --status failed');

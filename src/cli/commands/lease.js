@@ -6,7 +6,7 @@ export function registerLeaseCommands(program, {
   getRepo,
   getTask,
   heartbeatLease,
-  listLeases,
+  listLeasesViaCoordination,
   loadLeasePolicy,
   pushSyncEvent,
   reapStaleLeases,
@@ -112,11 +112,16 @@ Examples:
     .command('list')
     .description('List leases, newest first')
     .option('-s, --status <status>', 'Filter by status (active|completed|failed|expired)')
-    .action((opts) => {
+    .action(async (opts) => {
       const repoRoot = getRepo();
-      const db = getDb(repoRoot);
-      const leases = listLeases(db, opts.status);
-      db.close();
+      let leases;
+      try {
+        ({ leases } = await listLeasesViaCoordination(repoRoot, opts.status || null));
+      } catch (err) {
+        console.log(chalk.red(err.message));
+        process.exitCode = 1;
+        return;
+      }
 
       if (!leases.length) {
         console.log(chalk.dim('No leases found.'));

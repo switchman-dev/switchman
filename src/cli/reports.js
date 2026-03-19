@@ -28,6 +28,7 @@ import { loadChangePolicy, loadLeasePolicy } from '../core/policy.js';
 import { getPipelineLandingExplainReport, getPipelineStatus, summarizePipelinePolicyState } from '../core/pipeline.js';
 import { buildQueueStatusSummary, resolveQueueSource } from '../core/queue.js';
 import { cleanupOldSyncEvents, getPendingQueueStatus } from '../core/sync.js';
+import { getSharedStatusSnapshot } from '../core/shared-coordination.js';
 import {
   colorForHealth,
   formatRelativePolicy,
@@ -1101,6 +1102,7 @@ function buildUnifiedStatusReport({
   recentQueueEvents,
   retentionDays = 7,
   syncState = null,
+  sharedSummary = null,
   upgradeHints = [],
 }) {
   const queueAttention = [
@@ -1213,6 +1215,7 @@ function buildUnifiedStatusReport({
     ])].slice(0, 6),
     suggested_commands: [...new Set(attention.length > 0 ? suggestedCommands : defaultSuggestedCommands)].slice(0, 6),
     retention_days: retentionDays,
+    shared_summary: sharedSummary,
     sync_state: syncState || {
       pending: 0,
       oldest_queued_at: null,
@@ -1237,10 +1240,21 @@ export async function collectStatusSnapshot(repoRoot) {
       });
     }
 
-    const tasks = listTasks(db);
-    const activeLeases = listLeases(db, 'active');
-    const staleLeases = getStaleLeases(db, leasePolicy.stale_after_minutes);
-    const claims = getActiveFileClaims(db);
+    let tasks = listTasks(db);
+    let activeLeases = listLeases(db, 'active');
+    let staleLeases = getStaleLeases(db, leasePolicy.stale_after_minutes);
+    let claims = getActiveFileClaims(db);
+    const sharedSnapshot = await getSharedStatusSnapshot(repoRoot);
+    if (sharedSnapshot.shared && !sharedSnapshot.ok) {
+      throw new Error(sharedSnapshot.message || `Shared coordination status snapshot failed (${sharedSnapshot.reason}).`);
+    }
+    const sharedSummary = sharedSnapshot.ok ? (sharedSnapshot.summary || null) : null;
+    if (sharedSnapshot.ok) {
+      tasks = sharedSnapshot.tasks || [];
+      activeLeases = sharedSnapshot.active_leases || [];
+      staleLeases = sharedSnapshot.stale_leases || [];
+      claims = sharedSnapshot.claims || [];
+    }
     const queueItems = listMergeQueue(db);
     const queueSummary = buildQueueStatusSummary(queueItems);
     const syncState = getPendingQueueStatus();
@@ -1284,6 +1298,7 @@ export async function collectStatusSnapshot(repoRoot) {
       recentQueueEvents,
       retentionDays,
       syncState,
+      sharedSummary,
       upgradeHints,
     });
   } finally {
@@ -1426,6 +1441,9 @@ export function renderUnifiedStatusReport(report, { teamActivity = [], teamSumma
   console.log(`${chalk.dim('why:')} ${nextStepLine}`);
   console.log(chalk.dim(`policy: ${formatRelativePolicy(report.lease_policy)} • requeue on reap ${report.lease_policy.requeue_task_on_reap ? 'on' : 'off'}`));
   console.log(chalk.dim(`history retention: ${report.retention_days || 7} days`));
+  if (report.shared_summary?.mode === 'shared') {
+    console.log(chalk.dim(`coordination source: shared team queue • ${report.shared_summary.team_id || 'team'} • ${report.shared_summary.repo_key || 'repo'}`));
+  }
   if ((report.sync_state?.pending || 0) > 0) {
     const retryNote = report.sync_state.next_retry_at
       ? ` • next retry ${report.sync_state.next_retry_at}`

@@ -130,6 +130,22 @@ export async function createSharedTask(repoRoot, task) {
   return performSharedOperation(repoRoot, 'create_task', { task });
 }
 
+export async function listSharedTasks(repoRoot, { status = null } = {}) {
+  return performSharedOperation(repoRoot, 'list_tasks', { status });
+}
+
+export async function listSharedLeases(repoRoot, { status = null } = {}) {
+  return performSharedOperation(repoRoot, 'list_leases', { status });
+}
+
+export async function listSharedClaims(repoRoot) {
+  return performSharedOperation(repoRoot, 'list_claims');
+}
+
+export async function getSharedStatusSnapshot(repoRoot) {
+  return performSharedOperation(repoRoot, 'status_snapshot');
+}
+
 export async function acquireSharedNextLease(repoRoot, { worktree, agent = null } = {}) {
   return performSharedOperation(repoRoot, 'acquire_next', { worktree, agent });
 }
@@ -164,6 +180,10 @@ export async function completeSharedTask(repoRoot, { taskId } = {}) {
 
 export async function failSharedTask(repoRoot, { taskId, reason = null } = {}) {
   return performSharedOperation(repoRoot, 'fail_task', { task_id: taskId, reason });
+}
+
+export async function retrySharedTask(repoRoot, { taskId, reason = null } = {}) {
+  return performSharedOperation(repoRoot, 'retry_task', { task_id: taskId, reason });
 }
 
 export async function dispatchSharedReadyTasks(repoRoot, { agentName = 'switchman-scheduler', limit = null } = {}) {

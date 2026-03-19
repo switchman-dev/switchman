@@ -16,7 +16,15 @@ import { ensureProjectLocalMcpGitExcludes, getWindsurfMcpConfigPath, upsertCurso
 import { evaluateRepoCompliance, evaluateWorktreeCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, installCommitHook, installGateHooks, monitorWorktreesOnce, runCommitGate, runWrappedCommand, validateWriteAccess, writeEnforcementPolicy } from '../src/core/enforcement.js';
 import { clearMonitorState, isProcessRunning, readMonitorState, writeMonitorState } from '../src/core/monitor.js';
 import { clearSchedulerState, readSchedulerState } from '../src/core/scheduler.js';
-import { acquireSharedNextLease, claimSharedFiles as claimSharedFilesRemote, createSharedTask as createSharedTaskRemote } from '../src/core/shared-coordination.js';
+import {
+  acquireSharedNextLease,
+  claimSharedFiles as claimSharedFilesRemote,
+  createSharedTask as createSharedTaskRemote,
+  getSharedStatusSnapshot,
+  listSharedLeases,
+  listSharedTasks,
+  retrySharedTask,
+} from '../src/core/shared-coordination.js';
 import { evaluateTaskOutcome } from '../src/core/outcome.js';
 import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipeline.js';
 import { buildTaskSpec, planPipelineTasks } from '../src/core/planner.js';
@@ -508,6 +516,59 @@ await testAsync('Pro shared coordination lets one repo add work and another repo
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
 
+      if (operation === 'list_tasks') {
+        const tasks = sharedState.tasks
+          .filter((task) => !opPayload.status || task.status === opPayload.status)
+          .map((task) => ({ ...task }));
+        return new Response(JSON.stringify({ tasks }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      if (operation === 'list_leases') {
+        const leases = sharedState.leases
+          .filter((lease) => !opPayload.status || lease.status === opPayload.status)
+          .map((lease) => ({
+            ...lease,
+            task_title: sharedState.tasks.find((task) => task.id === lease.task_id)?.title || lease.task_id,
+          }));
+        return new Response(JSON.stringify({ leases }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      if (operation === 'retry_task') {
+        const task = sharedState.tasks.find((entry) => entry.id === opPayload.task_id);
+        if (!task || !['failed', 'done', 'in_progress'].includes(task.status)) {
+          return new Response(JSON.stringify({ reason: 'not_retryable' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+        }
+        task.status = 'pending';
+        task.worktree = null;
+        sharedState.leases = sharedState.leases.filter((lease) => lease.task_id !== task.id);
+        for (const [file, owner] of sharedState.claims.entries()) {
+          if (owner.task_id === task.id) sharedState.claims.delete(file);
+        }
+        return new Response(JSON.stringify({ task: { ...task } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      if (operation === 'status_snapshot') {
+        return new Response(JSON.stringify({
+          tasks: sharedState.tasks.map((task) => ({ ...task })),
+          active_leases: sharedState.leases.filter((lease) => lease.status === 'active').map((lease) => ({
+            ...lease,
+            task_title: sharedState.tasks.find((task) => task.id === lease.task_id)?.title || lease.task_id,
+          })),
+          stale_leases: [],
+          claims: [...sharedState.claims.entries()].map(([file_path, owner]) => ({
+            file_path,
+            task_id: owner.task_id,
+            task_title: owner.task_title,
+            worktree: owner.worktree,
+          })),
+          summary: {
+            mode: 'shared',
+            team_id: payload.team_id,
+            repo_key: payload.repo_key,
+          },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
       return new Response(JSON.stringify({ reason: 'unknown_operation' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     };
 
@@ -556,9 +617,23 @@ await testAsync('Pro shared coordination lets one repo add work and another repo
       files: ['src/auth.js'],
       agent: 'codex',
     });
+    const sharedTasks = await listSharedTasks(repoADir, {});
+    const sharedLeases = await listSharedLeases(repoBDir, { status: 'active' });
+    const sharedStatus = await getSharedStatusSnapshot(repoADir);
 
     assert(secondClaim.ok === false, 'Shared claims reject cross-repo conflicts on the same team');
     assert(secondClaim.conflicts[0].claimedBy.worktree === 'agent2', 'Shared claim conflicts name the owning remote worktree');
+    assert(sharedTasks.tasks.length === 1 && sharedTasks.tasks[0].status === 'in_progress', 'Shared task listing reads the team task state from the shared queue');
+    assert(sharedLeases.leases.length === 1 && sharedLeases.leases[0].worktree === 'agent2', 'Shared lease listing reads the team lease state from the shared queue');
+    assert(sharedStatus.summary.mode === 'shared', 'Shared status snapshot reports the shared team queue mode');
+    assert(sharedStatus.claims.length === 1 && sharedStatus.claims[0].file_path === 'src/auth.js', 'Shared status snapshot includes active team file claims');
+
+    sharedState.tasks[0].status = 'failed';
+    const retried = await retrySharedTask(repoADir, { taskId: 'shared-task-1', reason: 'manual retry' });
+    const afterRetry = await getSharedStatusSnapshot(repoADir);
+    assert(retried.task?.status === 'pending', 'Shared retry resets a shared task back to pending');
+    assert(afterRetry.active_leases.length === 0, 'Shared retry clears active team leases');
+    assert(afterRetry.claims.length === 0, 'Shared retry clears active team claims');
   } finally {
     global.fetch = originalFetch;
     if (originalHome == null) {

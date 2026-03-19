@@ -63,7 +63,10 @@ import {
   dispatchSharedReadyTasks,
   failSharedTask,
   getSharedCoordinationMode,
+  listSharedLeases,
+  listSharedTasks,
   releaseSharedClaims,
+  retrySharedTask,
 } from '../core/shared-coordination.js';
 import {
   captureTelemetryEvent,
@@ -233,6 +236,57 @@ async function createTaskViaCoordination(repoRoot, taskInput) {
         priority: taskInput.priority,
       },
     };
+  } finally {
+    db.close();
+  }
+}
+
+async function listTasksViaCoordination(repoRoot, status = null) {
+  const sharedResult = await listSharedTasks(repoRoot, { status });
+  if (sharedResult.ok) {
+    return { backend: 'shared', tasks: sharedResult.tasks || [] };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination task listing failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    return { backend: 'local', tasks: listTasks(db, status) };
+  } finally {
+    db.close();
+  }
+}
+
+async function listLeasesViaCoordination(repoRoot, status = null) {
+  const sharedResult = await listSharedLeases(repoRoot, { status });
+  if (sharedResult.ok) {
+    return { backend: 'shared', leases: sharedResult.leases || [] };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination lease listing failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    return { backend: 'local', leases: listLeases(db, status) };
+  } finally {
+    db.close();
+  }
+}
+
+async function retryTaskViaCoordination(repoRoot, { taskId, reason = null } = {}) {
+  const sharedResult = await retrySharedTask(repoRoot, { taskId, reason });
+  if (sharedResult.ok) {
+    return { backend: 'shared', task: sharedResult.task || null };
+  }
+  if (sharedResult.shared) {
+    throw new Error(sharedResult.message || `Shared coordination retry failed (${sharedResult.reason}).`);
+  }
+
+  const db = getDb(repoRoot);
+  try {
+    return { backend: 'local', task: retryTask(db, taskId, reason) };
   } finally {
     db.close();
   }
@@ -1707,12 +1761,11 @@ registerTaskCommands(program, {
   getCurrentWorktreeName,
   getDb,
   getRepo,
-  listTasks,
+  listTasksViaCoordination,
   printErrorWithNext,
   pushSyncEvent,
-  releaseFileClaims,
   retryStaleTasks,
-  retryTask,
+  retryTaskViaCoordination,
   startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
@@ -2211,7 +2264,7 @@ registerLeaseCommands(program, {
   getRepo,
   getTask,
   heartbeatLease,
-  listLeases,
+  listLeasesViaCoordination,
   loadLeasePolicy,
   pushSyncEvent,
   reapStaleLeases,
