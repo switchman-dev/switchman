@@ -1,6 +1,6 @@
 {
   "name": "switchman-dev",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "Project manager for AI coding assistants running safely on one codebase",
   "type": "module",
   "main": "src/index.js",
