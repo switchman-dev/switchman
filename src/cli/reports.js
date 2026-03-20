@@ -1704,6 +1704,17 @@ export function renderLiveWatchDashboard(report, {
   const queueLoad = queueCounts.queued + queueCounts.retrying + queueCounts.blocked + queueCounts.merging;
   const syncPending = Number(report.sync_state?.pending || 0);
   const teamMembers = Number(teamSummary?.members || 0);
+  const focusItem = blockedItems[0] || warningItems[0] || report.next_up[0] || null;
+  const focusLine = focusItem
+    ? ('command' in focusItem
+      ? `${focusItem.title}${focusItem.detail ? ` ${chalk.dim(`• ${focusItem.detail}`)}` : ''}`
+      : `${focusItem.title} ${chalk.dim(`(${focusItem.id})`)}`)
+    : report.counts.pending === 0 && report.counts.in_progress === 0
+      ? 'Nothing active yet. Safe to add work or run the demo.'
+      : 'Nothing urgent. Safe to keep work moving.';
+  const primaryCommand = ('command' in (focusItem || {}) && focusItem?.command)
+    ? focusItem.command
+    : report.suggested_commands[0] || 'switchman status';
   const sourceLine = report.shared_summary?.mode === 'shared'
     ? `shared team queue • ${report.shared_summary.team_id || 'team'} • ${report.shared_summary.repo_key || 'repo'}`
     : 'local coordination only';
@@ -1716,12 +1727,15 @@ export function renderLiveWatchDashboard(report, {
 
   const agentLines = report.active_work.length > 0
     ? report.active_work.slice(0, 6).map((item) => {
-      const claimedFiles = report.claims
-        .filter((claim) => claim.worktree === item.worktree)
+      const worktreeClaims = report.claims.filter((claim) => claim.worktree === item.worktree);
+      const claimedFiles = worktreeClaims
         .slice(0, 2)
         .map((claim) => claim.file_path);
+      const lastSeenMinutes = item.heartbeat_at
+        ? Math.max(0, Math.round((Date.now() - new Date(item.heartbeat_at).getTime()) / 60000))
+        : null;
       const claimSuffix = claimedFiles.length > 0
-        ? ` ${chalk.dim(`claims: ${claimedFiles.join(', ')}${report.claims.filter((claim) => claim.worktree === item.worktree).length > 2 ? ' +' : ''}`)}`
+        ? ` ${chalk.dim(`claims ${claimedFiles.join(', ')}${worktreeClaims.length > 2 ? ' +' : ''}`)}`
         : '';
       const boundary = item.boundary_validation
         ? ` ${renderChip('validation', item.boundary_validation.status, item.boundary_validation.status === 'accepted' ? chalk.green : chalk.yellow)}`
@@ -1729,13 +1743,19 @@ export function renderLiveWatchDashboard(report, {
       const stale = (item.dependency_invalidations?.length || 0) > 0
         ? ` ${renderChip('stale', item.dependency_invalidations.length, chalk.yellow)}`
         : '';
-      return `${statusBadge('busy')} ${chalk.cyan(item.worktree)} ${chalk.dim('->')} ${item.task_title} ${chalk.dim(item.task_id)}${boundary}${stale}${claimSuffix}`;
+      const scope = item.scope_summary ? ` ${chalk.dim(item.scope_summary)}` : '';
+      const age = lastSeenMinutes !== null
+        ? ` ${chalk.dim(`seen ${lastSeenMinutes}m ago`)}`
+        : '';
+      return `${statusBadge('busy')} ${chalk.cyan(item.worktree)} ${chalk.dim('->')} ${item.task_title} ${chalk.dim(item.task_id)}${boundary}${stale}${scope}${age}${claimSuffix}`;
     })
     : [chalk.dim('No agent work is active right now.')];
 
   const focusLines = [
-    ...(blockedItems.slice(0, 2).map((item) => `${renderChip('BLOCKED', item.kind || 'item', chalk.red)} ${item.title}`)),
-    ...(warningItems.slice(0, 2).map((item) => `${renderChip('WATCH', item.kind || 'item', chalk.yellow)} ${item.title}`)),
+    `${chalk.bold('Attention now:')} ${focusLine}`,
+    `${chalk.bold('Run next:')} ${chalk.cyan(primaryCommand)}`,
+    ...(blockedItems.slice(0, 2).map((item) => `${renderChip('BLOCKED', item.kind || 'item', chalk.red)} ${item.title}${item.detail ? ` ${chalk.dim(`• ${item.detail}`)}` : ''}`)),
+    ...(warningItems.slice(0, 2).map((item) => `${renderChip('WATCH', item.kind || 'item', chalk.yellow)} ${item.title}${item.detail ? ` ${chalk.dim(`• ${item.detail}`)}` : ''}`)),
     ...(report.next_up.slice(0, 2).map((task) => `${renderChip('NEXT', `p${task.priority}`, chalk.green)} ${task.title} ${chalk.dim(task.id)}`)),
   ];
   if (focusLines.length === 0) {
@@ -1745,10 +1765,10 @@ export function renderLiveWatchDashboard(report, {
   const queueLines = [];
   if (report.queue?.summary?.next) {
     const next = report.queue.summary.next;
-    queueLines.push(`${renderChip('NEXT', next.id, chalk.blue)} ${next.source_type}:${next.source_ref} ${chalk.dim(`retries:${next.retry_count}/${next.max_retries}`)}`);
+    queueLines.push(`${chalk.bold('Land next:')} ${renderChip('NEXT', next.id, chalk.blue)} ${next.source_type}:${next.source_ref} ${chalk.dim(`retries:${next.retry_count}/${next.max_retries}`)}`);
   }
   for (const item of report.queue.items.filter((entry) => ['blocked', 'retrying', 'merging'].includes(entry.status)).slice(0, 3)) {
-    queueLines.push(`${renderChip(item.status.toUpperCase(), item.id, item.status === 'blocked' ? chalk.red : item.status === 'retrying' ? chalk.yellow : chalk.blue)} ${item.source_type}:${item.source_ref}`);
+    queueLines.push(`${renderChip(item.status.toUpperCase(), item.id, item.status === 'blocked' ? chalk.red : item.status === 'retrying' ? chalk.yellow : chalk.blue)} ${item.source_type}:${item.source_ref}${item.last_error_summary ? ` ${chalk.dim(`• ${item.last_error_summary}`)}` : ''}`);
   }
   if (queueLines.length === 0) {
     queueLines.push(chalk.dim('No active landing queue pressure.'));
@@ -1791,6 +1811,7 @@ export function renderLiveWatchDashboard(report, {
     { label: 'warnings', value: warningItems.length, color: warningItems.length > 0 ? chalk.yellow : chalk.green },
     { label: 'history', value: `${report.retention_days || 7}d`, color: chalk.white },
   ]));
+  console.log(`${chalk.bold('Summary:')} ${report.summary}`);
   console.log(chalk.dim(watcherLine));
   console.log('');
 

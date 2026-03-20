@@ -25,7 +25,7 @@ export function collectSetupVerification(repoRoot, { homeDir = null } = {}) {
     detail: dbExists ? '.switchman/switchman.db is ready' : 'Switchman database is missing',
   });
   if (!dbExists) {
-    nextSteps.push('Run `switchman init` or `switchman setup --agents 3` in this repo.');
+    nextSteps.push('Run `switchman start "Add authentication"` for the fastest setup, or `switchman setup --agents 3` for the manual path.');
   }
 
   if (dbExists) {
@@ -56,7 +56,7 @@ export function collectSetupVerification(repoRoot, { homeDir = null } = {}) {
       : 'No agent workspaces are registered yet',
   });
   if (!workspaceReady) {
-    nextSteps.push('Run `switchman setup --agents 3` to create agent workspaces.');
+    nextSteps.push('Run `switchman start "Add authentication"` to create agent workspaces automatically, or `switchman setup --agents 3` for manual setup.');
   }
 
   const rootMcpExists = existsSync(rootMcpPath);
@@ -67,7 +67,7 @@ export function collectSetupVerification(repoRoot, { homeDir = null } = {}) {
     detail: rootMcpExists ? '.mcp.json is present in the repo root' : '.mcp.json is missing from the repo root',
   });
   if (!rootMcpExists) {
-    nextSteps.push('Re-run `switchman setup --agents 3` to restore the repo-local MCP config.');
+    nextSteps.push('Run `switchman start "Add authentication"` to self-heal the repo-local MCP config, or re-run `switchman setup --agents 3`.');
   }
 
   const cursorMcpExists = existsSync(cursorMcpPath);
@@ -78,7 +78,7 @@ export function collectSetupVerification(repoRoot, { homeDir = null } = {}) {
     detail: cursorMcpExists ? '.cursor/mcp.json is present in the repo root' : '.cursor/mcp.json is missing from the repo root',
   });
   if (!cursorMcpExists) {
-    nextSteps.push('Re-run `switchman setup --agents 3` if you want Cursor to attach automatically.');
+    nextSteps.push('Run `switchman start "Add authentication"` to self-heal local editor wiring, or re-run `switchman setup --agents 3` if you want Cursor to attach automatically.');
   }
 
   const claudeGuideExists = existsSync(claudeGuidePath);
@@ -358,21 +358,39 @@ switchman_scan()
 }
 
 export function renderSetupVerification(report, { compact = false } = {}) {
-  console.log(chalk.bold(compact ? 'First-run check:' : 'Setup verification:'));
+  console.log(chalk.bold(compact ? 'First-run check:' : 'Ready check:'));
   for (const check of report.checks) {
     const badge = boolBadge(check.ok);
     console.log(`  ${badge} ${check.label} ${chalk.dim(`— ${check.detail}`)}`);
   }
   if (report.next_steps.length > 0) {
     console.log('');
-    console.log(chalk.bold('Fix next:'));
+    console.log(chalk.bold('Needs attention:'));
     for (const step of report.next_steps) {
       console.log(`  - ${step}`);
     }
   }
   console.log('');
-  console.log(chalk.bold('Try next:'));
+  console.log(chalk.bold('Run next:'));
   for (const command of report.suggested_commands.slice(0, 4)) {
     console.log(`  ${chalk.cyan(command)}`);
+  }
+}
+
+export function renderQuickcheck(report) {
+  console.log(chalk.bold('Quickcheck:'));
+  for (const check of report.checks) {
+    const badge = boolBadge(check.ok);
+    console.log(`  ${badge} ${check.label} ${chalk.dim(`— ${check.detail}`)}`);
+  }
+  console.log('');
+  console.log(chalk.bold('Run this next:'));
+  console.log(`  ${chalk.cyan(report.next_command)}`);
+  if (report.follow_up) {
+    console.log('');
+    console.log(chalk.bold('Then:'));
+    for (const command of report.follow_up) {
+      console.log(`  ${chalk.cyan(command)}`);
+    }
   }
 }

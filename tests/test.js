@@ -417,6 +417,51 @@ test('Start allows more than three local agents on free tier', () => {
   rmSync(homeDir, { recursive: true, force: true });
 });
 
+test('Start self-heals missing local MCP wiring and reports it', () => {
+  const repoDir = join(tmpdir(), `sw-start-self-heal-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-start-self-heal-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init repo context"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  execFileSync(process.execPath, [cliPath, 'setup', '--agents', '1', '--no-monitor'], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+  rmSync(join(repoDir, '.mcp.json'), { force: true });
+  rmSync(join(repoDir, '.cursor'), { recursive: true, force: true });
+
+  const output = execFileSync(process.execPath, [
+    cliPath,
+    'start',
+    'Add authentication',
+    '--agents',
+    '1',
+    '--yes',
+    '--no-scheduler',
+    '--no-monitor',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+
+  assert(existsSync(join(repoDir, '.mcp.json')), 'Start recreates the repo-local MCP config when it is missing');
+  assert(existsSync(join(repoDir, '.cursor', 'mcp.json')), 'Start recreates the Cursor MCP config when it is missing');
+  assert(output.includes('Repaired local MCP wiring for this repo'), 'Start reports that it repaired local MCP wiring');
+
+  cleanupSiblingAgentWorktrees(repoDir, 1);
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
 test('Start unlocks more than three agents for Pro users', () => {
   const repoDir = join(tmpdir(), `sw-start-pro-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-start-pro-home-${Date.now()}`);
@@ -3986,7 +4031,7 @@ test('Setup prints a first-run verification summary', () => {
   assert(output.includes('Project database'), 'Setup verification checks the project database');
   assert(output.includes('Cursor MCP'), 'Setup verification checks local editor config');
   assert(output.includes('Monitor:'), 'Setup reports the background monitor status');
-  assert(output.includes('Try next:'), 'Setup verification suggests exact next commands');
+  assert(output.includes('Run next:'), 'Setup verification suggests exact next commands');
   assert(output.includes('switchman status --watch'), 'Setup points the operator at the live status dashboard');
   assert(output.includes('switchman monitor status'), 'Setup points the operator at monitor follow-up commands');
   assert(!output.includes('ExperimentalWarning'), 'Setup hides the SQLite experimental warning from first-run output');
@@ -3997,6 +4042,34 @@ test('Setup prints a first-run verification summary', () => {
     clearMonitorState(repoDir);
   }
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Quickcheck gives one clear first-run path in a fresh repo', () => {
+  const repoDir = join(tmpdir(), `sw-quickcheck-${Date.now()}`);
+  const fakeHome = join(tmpdir(), `sw-quickcheck-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(fakeHome, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const output = execFileSync(process.execPath, [cliPath, 'quickcheck', '--home', fakeHome], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(output.includes('Quickcheck:'), 'Quickcheck prints the onboarding summary heading');
+  assert(output.includes('Login'), 'Quickcheck reports whether login is needed');
+  assert(output.includes('Not required for local start'), 'Quickcheck keeps local-first login messaging calm');
+  assert(output.includes('Run this next:'), 'Quickcheck ends with one exact next command');
+  assert(output.includes('switchman start "Add authentication"'), 'Quickcheck points first-time users at switchman start');
+  assert(output.includes('switchman status --watch'), 'Quickcheck includes the live dashboard follow-up');
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(fakeHome, { recursive: true, force: true });
 });
 
 test('Fix 1c: CLI task done succeeds while a transient SQLite write lock is present', () => {
@@ -7507,9 +7580,12 @@ test('Status watch renders the compact live terminal dashboard', () => {
   assert(output.includes('Focus'), 'Watch mode includes the live focus panel');
   assert(output.includes('Queue'), 'Watch mode includes the live queue panel');
   assert(output.includes('Team + sync'), 'Watch mode includes the team and sync panel');
+  assert(output.includes('Summary:'), 'Watch mode includes a repo-level summary line');
+  assert(output.includes('Attention now:'), 'Watch mode includes an at-a-glance focus line');
+  assert(output.includes('Run next:'), 'Watch mode includes one exact next command');
   assert(output.includes('Last event:'), 'Watch mode includes the ticker line');
   assert(output.includes('refresh 100ms'), 'Watch mode shows the live refresh cadence');
-  assert(output.includes('claims: src/auth.js'), 'Watch mode shows claimed files under the active agent');
+  assert(output.includes('claims src/auth.js'), 'Watch mode shows claimed files under the active agent');
   rmSync(repoDir, { recursive: true, force: true });
 });
 
@@ -7525,6 +7601,7 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
   assert(helpOutput.includes('For you (the operator):'), 'Top-level help includes an operator section');
   assert(helpOutput.includes('For your agents (via CLAUDE.md or MCP):'), 'Top-level help includes an agent section');
+  assert(helpOutput.includes('switchman quickcheck'), 'Top-level help includes the quick onboarding check');
   assert(helpOutput.includes('switchman start "Add authentication"'), 'Top-level help includes the one-command start entrypoint');
   assert(helpOutput.includes('switchman claude refresh'), 'Top-level help includes the Claude guide refresh command');
   assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the explicit first task step');
@@ -8282,6 +8359,7 @@ test('Verify-setup reports missing local editor config clearly', () => {
 
   assert(failed, 'verify-setup exits non-zero when required setup pieces are missing');
   assert(jsonOutput.checks.some((item) => item.key === 'cursor_mcp' && item.ok === false), 'verify-setup reports missing Cursor config');
+  assert(jsonOutput.next_steps.some((step) => step.includes('`switchman start "Add authentication"`')), 'verify-setup points users at start as the self-healing path');
   assert(jsonOutput.next_steps.some((step) => step.includes('`switchman setup --agents 3`')), 'verify-setup suggests how to restore local editor config');
   assert(jsonOutput.next_steps.some((step) => step.includes('`switchman claude refresh`')), 'verify-setup suggests generating a repo-aware CLAUDE guide');
   rmSync(repoDir, { recursive: true, force: true });

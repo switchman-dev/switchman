@@ -116,6 +116,7 @@ import {
 import {
   collectSetupVerification,
   renderClaudeGuide,
+  renderQuickcheck,
   renderSetupVerification,
 } from './setup.js';
 import {
@@ -1096,6 +1097,7 @@ const ROOT_HELP_COMMANDS = new Set([
   'advanced',
   'claude',
   'demo',
+  'quickcheck',
   'start',
   'setup',
   'verify-setup',
@@ -1121,6 +1123,7 @@ program.configureHelp({
 program.addHelpText('after', `
 Start here:
   switchman demo
+  switchman quickcheck
   switchman start "Add authentication"
   switchman setup --agents 3
   switchman task add "Your task" --priority 8
@@ -1132,6 +1135,7 @@ Start here:
 
 For you (the operator):
   switchman demo
+  switchman quickcheck
   switchman start "Add authentication"
   switchman setup
   switchman claude refresh
@@ -1409,6 +1413,7 @@ Examples:
       const schedulerState = opts.scheduler
         ? startBackgroundScheduler(repoRoot, { intervalMs: schedulerIntervalMs })
         : null;
+      const repairedMcpWrites = setupResult.mcpConfigWrites.filter((result) => result.created || result.changed);
 
       spinner.succeed(`Switchman start is ready — ${desiredAgentCount} agent workspace${desiredAgentCount === 1 ? '' : 's'} and ${finalPlannedTasks.length} task${finalPlannedTasks.length === 1 ? '' : 's'} prepared`);
       console.log('');
@@ -1417,14 +1422,25 @@ Examples:
         console.log(`  ${chalk.green('✓')} ${chalk.cyan(wt.name)}  ${chalk.dim(wt.path)}`);
       }
       console.log('');
-      console.log(chalk.bold('Next steps:'));
+      console.log(chalk.bold('What just happened:'));
+      console.log(`  ${chalk.green('✓')} Planned ${finalPlannedTasks.length} task${finalPlannedTasks.length === 1 ? '' : 's'} from your goal`);
+      console.log(`  ${chalk.green('✓')} Prepared ${desiredAgentCount} linked workspace${desiredAgentCount === 1 ? '' : 's'}`);
+      console.log(`  ${chalk.green('✓')} Repo guide is ready for your agents`);
+      if (repairedMcpWrites.length > 0 || setupResult.mcpExclude.changed) {
+        console.log(`  ${chalk.green('✓')} Repaired local MCP wiring for this repo${setupResult.mcpExclude.changed ? chalk.dim(' (and kept it out of merge paths)') : ''}`);
+      }
+      if (opts.scheduler) {
+        console.log(`  ${chalk.green('✓')} Scheduler ${schedulerState?.already_running ? 'was already running' : 'started'} in the background`);
+      }
+      console.log('');
+      console.log(chalk.bold('Do this next:'));
       console.log(`  1. Open Claude Code or Cursor in the agent workspaces above`);
       console.log(`  2. Keep the repo dashboard open:`);
       console.log(`     ${chalk.cyan('switchman status --watch')}`);
       if (opts.scheduler) {
-        console.log(`  3. Scheduler: ${schedulerState?.already_running ? 'already running' : 'started'} ${chalk.dim(`(${chalk.cyan('switchman scheduler status')})`)}`);
+        console.log(`  3. Scheduler is ${schedulerState?.already_running ? 'already running' : 'started'} ${chalk.dim(`(${chalk.cyan('switchman scheduler status')})`)}`);
       }
-      console.log(`  ${opts.scheduler ? '4' : '3'}. When the first session ends, see what Switchman prevented:`);
+      console.log(`  ${opts.scheduler ? '4' : '3'}. When the first session ends, see what Switchman coordinated:`);
       console.log(`     ${chalk.cyan('switchman session-summary')}`);
       if (!licence.valid) {
         console.log(`  ${opts.scheduler ? '5' : '4'}. Need deeper session analysis, more history, or full team coordination?`);
@@ -1513,17 +1529,17 @@ Examples:
       }
 
       console.log('');
-      console.log(chalk.bold('Next steps:'));
-      console.log(`  1. Add a first task:`);
+      console.log(chalk.bold('Do this next:'));
+      console.log(`  1. Open Claude Code or Cursor in the workspaces above`);
+      console.log(`  2. Add the first task when you are ready:`);
       console.log(`     ${chalk.cyan('switchman task add "Your first task" --priority 8')}`);
-      console.log(`  2. Open Claude Code or Cursor in the workspaces above — the local MCP config will attach Switchman automatically`);
       console.log(`  3. Keep the repo dashboard open while work starts:`);
       console.log(`     ${chalk.cyan('switchman status --watch')}`);
-      console.log(`  4. Run the final check and land finished work:`);
+      console.log(`  4. When work finishes, run the final check and land it:`);
       console.log(`     ${chalk.cyan('switchman gate ci')}`);
       console.log(`     ${chalk.cyan('switchman queue run')}`);
       if (opts.monitor) {
-        console.log(`  5. Watch for rogue edits or direct writes in real time:`);
+        console.log(`  5. If you want the live write-safety view:`);
         console.log(`     ${chalk.cyan('switchman monitor status')}`);
       }
       console.log('');
@@ -1539,6 +1555,108 @@ Examples:
       spinner.fail(err.message);
       process.exit(1);
     }
+  });
+
+program
+  .command('quickcheck')
+  .description('Show the fastest next step to get value from Switchman in this repo')
+  .option('--json', 'Output raw JSON')
+  .option('--home <path>', 'Override the home directory for editor config checks')
+  .addHelpText('after', `
+Examples:
+  switchman quickcheck
+  switchman quickcheck --json
+
+Use this right after install when you want one clear next command.
+`)
+  .action(async (opts) => {
+    const repoRoot = getRepo();
+    const verification = collectSetupVerification(repoRoot, { homeDir: opts.home || null });
+    const previousHome = process.env.HOME;
+    if (opts.home) process.env.HOME = opts.home;
+    let creds = null;
+    let licence = null;
+    try {
+      creds = readCredentials();
+      licence = creds?.access_token ? await checkLicence() : null;
+    } finally {
+      if (opts.home) process.env.HOME = previousHome;
+    }
+    const workspaceCount = verification.workspaces.filter((entry) => entry.name !== 'main').length;
+    const mcpCheck = verification.checks.find((item) => item.key === 'claude_mcp');
+    const cursorCheck = verification.checks.find((item) => item.key === 'cursor_mcp');
+    const claudeGuideCheck = verification.checks.find((item) => item.key === 'claude_md');
+    const report = {
+      ok: true,
+      repo_root: repoRoot,
+      checks: [
+        {
+          key: 'repo',
+          ok: true,
+          label: 'Repo ready',
+          detail: 'Git repo detected',
+        },
+        {
+          key: 'login',
+          ok: true,
+          label: 'Login',
+          detail: licence?.valid
+            ? 'Signed in with Pro — shared team coordination is ready'
+            : creds?.access_token
+              ? 'Signed in on Free — one shared cloud project is available'
+              : 'Not required for local start',
+        },
+        {
+          key: 'workspaces',
+          ok: true,
+          label: 'Agent workspaces',
+          detail: workspaceCount > 0
+            ? `${workspaceCount} workspace(s) already prepared`
+            : 'None yet — `switchman start` will create them for you',
+        },
+        {
+          key: 'claude_mcp',
+          ok: true,
+          label: 'Claude Code MCP',
+          detail: mcpCheck?.ok
+            ? '.mcp.json is already wired'
+            : 'Optional — `switchman start` or `switchman setup` can create it',
+        },
+        {
+          key: 'cursor_mcp',
+          ok: true,
+          label: 'Cursor MCP',
+          detail: cursorCheck?.ok
+            ? '.cursor/mcp.json is already wired'
+            : 'Optional — run `switchman setup` if you want Cursor to attach automatically',
+        },
+        {
+          key: 'claude_md',
+          ok: true,
+          label: 'Repo guide',
+          detail: claudeGuideCheck?.ok
+            ? 'CLAUDE.md is already present'
+            : 'Optional — `switchman start` will create CLAUDE.md if it is missing',
+        },
+      ],
+      next_command: 'switchman start "Add authentication"',
+      follow_up: [
+        'switchman status --watch',
+        'switchman session-summary',
+      ],
+    };
+
+    if (opts.json) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+
+    renderQuickcheck(report);
+    await maybeCaptureTelemetry('quickcheck_ran', {
+      workspace_count: workspaceCount,
+      has_login: Boolean(creds?.access_token),
+      pro: Boolean(licence?.valid),
+    }, { homeDir: opts.home || null });
   });
 
 program

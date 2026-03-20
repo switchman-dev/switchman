@@ -64,6 +64,7 @@ switchman queue status
 
 ```bash
 cd my-project
+switchman quickcheck
 switchman start "Implement auth helper"
 switchman status --watch
 switchman gate ci
@@ -86,13 +87,14 @@ switchman task add "Implement auth helper" --priority 9
 
 Fastest path to success:
 
-1. Use Claude Code for the first run
-2. Run `switchman verify-setup` to confirm editor wiring
-3. Run `switchman claude refresh` if you want to regenerate the repo-aware `CLAUDE.md`
-4. Open one Claude Code window per generated workspace
-5. Use `switchman start` for the shortest path, or add tasks manually if you want tighter control
-6. Keep `switchman status --watch` open in a separate terminal
-7. Run `switchman gate ci && switchman queue run` when tasks finish
+1. Run `switchman quickcheck` if you want one clear readiness check and one exact next command
+2. Use `switchman start` for the shortest path
+3. Open one Claude Code window per generated workspace
+4. Keep `switchman status --watch` open in a separate terminal
+5. Run `switchman session-summary` after the first session to see what Switchman coordinated
+6. Run `switchman gate ci && switchman queue run` when tasks finish
+
+If editor wiring feels off later, run `switchman verify-setup`. If you want to regenerate the repo-aware guide, run `switchman claude refresh`.
 
 Editor setup guides:
 
