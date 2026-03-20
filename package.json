@@ -26,6 +26,22 @@
     "type": "git",
     "url": "git+https://github.com/switchman-dev/switchman.git"
   },
+  "homepage": "https://switchman.dev/",
+  "bugs": {
+    "url": "https://github.com/switchman-dev/switchman/issues"
+  },
+  "keywords": [
+    "ai coding agents",
+    "multi-agent coding",
+    "claude code",
+    "cursor",
+    "windsurf",
+    "worktrees",
+    "merge queue",
+    "task queue",
+    "file locking",
+    "developer tools"
+  ],
   "scripts": {
     "start": "node src/cli/index.js",
     "mcp": "node src/mcp/server.js",
@@ -44,5 +60,5 @@
     "ora": "^8.0.1",
     "zod": "^4.3.6"
   },
-  "license": "Apache-2.0"
+  "license": "MIT"
 }

@@ -1,13 +1,17 @@
 # Switchman
 
-**The operating system for parallel AI development.**
+**More AI agents. Less repo chaos. One command to start.**
 
 [![CI](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml/badge.svg)](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/switchman-dev.svg)](https://www.npmjs.com/package/switchman-dev)
 
 <img src="docs/demo.png" width="600" alt="Switchman demo — agent2 blocked from src/auth.js, rerouted safely, both branches landed cleanly">
 
-When you run multiple AI agents on the same repo, they collide, duplicate work, and create risky merges. Switchman gives them leases, scoped ownership, policy gates, queue planning, and governed landing workflows so they can move in parallel without stepping on each other.
+Switchman coordinates multi-agent coding sessions. It plans the work, creates workspaces, prevents file collisions, and gives you one safe path to `main`.
+
+Run 10+ AI coding agents on one codebase safely. Switchman acts like mission control for parallel agents: it hands out tasks, stops overlapping edits early, keeps work visible, and lands finished branches through checks instead of merge chaos.
+
+Built for teams using Claude Code, Cursor, Windsurf, Aider, and other CLI-first coding agents on real repos.
 
 Questions or feedback? Join the [Discord](https://discord.gg/pnT8BEC4D) · [hello@switchman.dev](mailto:hello@switchman.dev)
 
@@ -25,12 +29,6 @@ Homebrew release path:
 
 ```bash
 brew install switchman-dev/tap/switchman-dev
-```
-
-If you're cutting a release, generate the formula with:
-
-```bash
-switchman advanced brew-formula --sha256 <release-tarball-sha> --output Formula/switchman-dev.rb
 ```
 
 > Switchman uses the built-in `node:sqlite` runtime — no extra database to install or manage.
@@ -91,7 +89,7 @@ Fastest path to success:
 
 1. Run `switchman quickcheck` if you want one clear readiness check and one exact next command
 2. Use `switchman start` for the shortest path
-3. Open one Claude Code window per generated workspace
+3. Open one agent/editor window per generated workspace
 4. Keep `switchman status --watch` open in a separate terminal
 5. Run `switchman session-summary` after the first session to see what Switchman coordinated
 6. Run `switchman gate ci && switchman queue run` when tasks finish
@@ -103,6 +101,7 @@ Editor setup guides:
 - [Claude Code](docs/setup-claude-code.md)
 - [Cursor](docs/setup-cursor.md)
 - [Windsurf](docs/setup-windsurf.md)
+- [CLI agents like Aider and Cline](docs/setup-cli-agents.md)
 
 ---
 
@@ -262,7 +261,7 @@ switchman policy show-change
 
 - Zero-argument `switchman plan` — reads full repo context automatically
 - Live web dashboard for repo and agent visibility
-- Homebrew install path
+- Broader install and release distribution
 
 ---
 
