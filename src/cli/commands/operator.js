@@ -70,11 +70,11 @@ Examples:
         console.log('');
         console.log(chalk.dim(`Estimated coordination time saved: ~${report.estimated_minutes_saved} minute${report.estimated_minutes_saved === 1 ? '' : 's'}`));
       }
-      if (report.upgrade_cta) {
+      if (report.depth_hint) {
         console.log('');
-        console.log(chalk.yellow(report.upgrade_cta.title));
-        console.log(`  ${chalk.dim(report.upgrade_cta.detail)}`);
-        console.log(`  ${chalk.cyan(report.upgrade_cta.command)}`);
+        console.log(chalk.yellow(report.depth_hint.title));
+        console.log(`  ${chalk.dim(report.depth_hint.detail)}`);
+        console.log(`  ${chalk.cyan(report.depth_hint.command)}`);
       }
       console.log('');
     });

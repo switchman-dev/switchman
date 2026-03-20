@@ -1,7 +1,7 @@
 import { basename } from 'path';
 import { execSync } from 'child_process';
 
-import { checkLicence, readCredentials } from './licence.js';
+import { checkLicence, readCredentials, resolveFreeCloudProjectAccess } from './licence.js';
 
 const SUPABASE_URL = process.env.SWITCHMAN_SUPABASE_URL
   ?? 'https://afilbolhlkiingnsupgr.supabase.co';
@@ -53,13 +53,27 @@ async function resolveSharedContext(repoRoot) {
   }
 
   const licence = await checkLicence();
-  if (!licence.valid) {
-    return { enabled: false, reason: 'not_pro' };
-  }
-
   const creds = readCredentials();
   if (!creds?.access_token || !creds?.user_id) {
     return { enabled: false, reason: 'missing_credentials' };
+  }
+
+  const repoKey = deriveRepoKey(repoRoot);
+  if (!licence.valid) {
+    const freeProject = resolveFreeCloudProjectAccess(repoKey);
+    if (!freeProject.allowed) {
+      return { enabled: false, reason: freeProject.reason || 'free_project_limit', active_projects: freeProject.active_projects || [] };
+    }
+
+    return {
+      enabled: true,
+      accessToken: creds.access_token,
+      userId: creds.user_id,
+      teamId: freeProject.scope_id,
+      repoKey,
+      plan: 'free',
+      firstUse: freeProject.first_use,
+    };
   }
 
   const teamId = process.env.SWITCHMAN_TEAM_ID || creds.team_id || null;
@@ -72,7 +86,8 @@ async function resolveSharedContext(repoRoot) {
     accessToken: creds.access_token,
     userId: creds.user_id,
     teamId,
-    repoKey: deriveRepoKey(repoRoot),
+    repoKey,
+    plan: 'pro',
   };
 }
 

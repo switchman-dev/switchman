@@ -104,10 +104,10 @@ Editor setup guides:
 
 ## Switchman Pro
 
-> **Unlimited agents · Team coordination · AI planning · $19/month**  
+> **Shared coordination depth · AI planning · 90-day history · $19/month**  
 > [switchman.dev/pro](https://switchman.dev/pro) · or run `switchman upgrade`
 
-Pro removes the 3-agent limit, adds shared cloud coordination, AI task planning, and longer audit history. Free stays fully featured for local runs with up to 3 agents.
+Free now includes unlimited local agents, Slack notifications, read-only session summaries, and one shared cloud project for logged-in users. Pro adds deeper shared coordination, richer analysis, AI planning, and longer audit history.
 
 ```bash
 switchman upgrade        # open switchman.dev/pro
@@ -117,12 +117,11 @@ switchman login --status # check your plan
 
 **What's in Pro:**
 
-- Unlimited concurrent agents (free: up to 3)
-- Shared cloud coordination across machines
+- Deeper shared cloud coordination across machines
 - AI task planning — `switchman plan "Add authentication" --apply`, `switchman plan --issue 47`, and optionally `--comment` back to the issue or PR
-- Session summaries with counterfactuals
-- Slack notifications
+- Counterfactual session analysis
 - 90-day audit trail (free: 7 days)
+- Full team coordination beyond the free shared-project limit
 - Email support within 48 hours
 
 **$19/month per seat** · [switchman.dev/pro](https://switchman.dev/pro)

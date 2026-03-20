@@ -1,6 +1,5 @@
 export function registerNotificationCommands(program, {
   chalk,
-  checkLicence,
   getNotificationsConfigPath,
   readNotificationsConfig,
   sendSwitchmanNotification,
@@ -46,20 +45,10 @@ export function registerNotificationCommands(program, {
 
   notificationsCmd
     .command('slack')
-    .description('Configure Slack webhook notifications (Pro)')
+    .description('Configure Slack webhook notifications')
     .requiredOption('--webhook <url>', 'Incoming Slack webhook URL')
     .option('--disable', 'Disable Slack notifications after saving the webhook')
     .action(async (opts) => {
-      const licence = await checkLicence();
-      if (!licence.valid) {
-        console.log('');
-        console.log(chalk.yellow('  ⚠  Slack notifications are a Pro feature.'));
-        console.log(`  ${chalk.dim('Run:')} ${chalk.cyan('switchman upgrade')}`);
-        console.log('');
-        process.exitCode = 1;
-        return;
-      }
-
       const config = writeNotificationsConfig({
         slack_enabled: !opts.disable,
         slack_webhook_url: opts.webhook,
@@ -82,7 +71,6 @@ export function registerNotificationCommands(program, {
       const result = await sendSwitchmanNotification({
         title: 'Switchman test notification',
         message: 'Your agents can now notify you when work finishes or gets blocked.',
-        checkLicence,
       });
       if (!result.deliveries.length) {
         console.log(chalk.yellow('No notification channels are enabled yet.'));

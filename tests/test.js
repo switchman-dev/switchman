@@ -20,6 +20,7 @@ import {
   acquireSharedNextLease,
   claimSharedFiles as claimSharedFilesRemote,
   createSharedTask as createSharedTaskRemote,
+  getSharedCoordinationMode,
   getSharedStatusSnapshot,
   listSharedLeases,
   listSharedTasks,
@@ -137,6 +138,24 @@ function writeProTestCredentials(homeDir, email = 'pro@test.com', { userId = 'us
   writeFileSync(join(switchmanDir, 'licence-cache.json'), JSON.stringify({
     valid: true,
     plan: 'pro',
+    email,
+    cached_at: Date.now(),
+  }, null, 2));
+}
+
+function writeFreeLoggedInCredentials(homeDir, email = 'free@test.com', { userId = 'user-free-1', teamId = null } = {}) {
+  const switchmanDir = join(homeDir, '.switchman');
+  mkdirSync(switchmanDir, { recursive: true });
+  writeFileSync(join(switchmanDir, 'credentials.json'), JSON.stringify({
+    access_token: 'test-access-token',
+    refresh_token: 'test-refresh-token',
+    email,
+    user_id: userId,
+    team_id: teamId,
+  }, null, 2));
+  writeFileSync(join(switchmanDir, 'licence-cache.json'), JSON.stringify({
+    valid: false,
+    plan: 'free',
     email,
     cached_at: Date.now(),
   }, null, 2));
@@ -360,9 +379,9 @@ test('Start boots a free repo into a real 3-agent local Switchman session', () =
   rmSync(homeDir, { recursive: true, force: true });
 });
 
-test('Start keeps the fourth agent behind the Pro upgrade trigger on free tier', () => {
-  const repoDir = join(tmpdir(), `sw-start-cap-${Date.now()}`);
-  const homeDir = join(tmpdir(), `sw-start-cap-home-${Date.now()}`);
+test('Start allows more than three local agents on free tier', () => {
+  const repoDir = join(tmpdir(), `sw-start-free-local-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-start-free-local-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   mkdirSync(homeDir, { recursive: true });
   execSync('git init -b main', { cwd: repoDir });
@@ -372,28 +391,26 @@ test('Start keeps the fourth agent behind the Pro upgrade trigger on free tier',
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init repo context"', { cwd: repoDir });
 
-  let output = '';
-  try {
-    execFileSync(process.execPath, [
-      join(process.cwd(), 'src/cli/index.js'),
-      'start',
-      'Add authentication',
-      '--agents',
-      '4',
-      '--yes',
-      '--no-scheduler',
-      '--no-monitor',
-    ], {
-      cwd: repoDir,
-      encoding: 'utf8',
-      env: { ...process.env, HOME: homeDir },
-    });
-  } catch (err) {
-    output = err.stdout || '';
-  }
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'start',
+    'Add authentication',
+    '--agents',
+    '4',
+    '--yes',
+    '--no-scheduler',
+    '--no-monitor',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
 
-  assert(output.includes('Agent limit reached (3/3)'), 'Start blocks the fourth agent on free tier');
-  assert(output.includes('switchman upgrade'), 'Start points the fourth-agent moment at the upgrade flow');
+  assert(output.includes('local coordination only'), 'Free start keeps larger local runs on local coordination');
+  const db = openDb(repoDir);
+  const worktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
+  assert(worktrees.length === 4, 'Free start can create more than three local agent workspaces');
+  db.close();
 
   cleanupSiblingAgentWorktrees(repoDir, 4);
   rmSync(repoDir, { recursive: true, force: true });
@@ -439,7 +456,7 @@ test('Start unlocks more than three agents for Pro users', () => {
   rmSync(homeDir, { recursive: true, force: true });
 });
 
-await testAsync('Pro shared coordination lets one repo add work and another repo lease and claim it safely', async () => {
+await testAsync('Free logged-in users can use shared coordination for one real project', async () => {
   const sharedState = {
     tasks: [],
     claims: new Map(),
@@ -587,8 +604,8 @@ await testAsync('Pro shared coordination lets one repo add work and another repo
 
     mkdirSync(homeADir, { recursive: true });
     mkdirSync(homeBDir, { recursive: true });
-    writeProTestCredentials(homeADir, 'a@test.com', { userId: 'user-a', teamId: 'team-1' });
-    writeProTestCredentials(homeBDir, 'b@test.com', { userId: 'user-b', teamId: 'team-1' });
+    writeFreeLoggedInCredentials(homeADir, 'a@test.com', { userId: 'user-a' });
+    writeFreeLoggedInCredentials(homeBDir, 'b@test.com', { userId: 'user-b' });
 
     process.env.HOME = homeADir;
     await createSharedTaskRemote(repoADir, {
@@ -602,7 +619,7 @@ await testAsync('Pro shared coordination lets one repo add work and another repo
       worktree: 'agent2',
       agent: 'codex',
     });
-    assert(nextResult.task.id === 'shared-task-1', 'Shared queue lets a second repo lease work created elsewhere on the same team');
+    assert(nextResult.task.id === 'shared-task-1', 'Free shared coordination lets a second repo lease work created elsewhere on the same project');
 
     const firstClaim = await claimSharedFilesRemote(repoBDir, {
       taskId: 'shared-task-1',
@@ -623,11 +640,11 @@ await testAsync('Pro shared coordination lets one repo add work and another repo
     const sharedLeases = await listSharedLeases(repoBDir, { status: 'active' });
     const sharedStatus = await getSharedStatusSnapshot(repoADir);
 
-    assert(secondClaim.ok === false, 'Shared claims reject cross-repo conflicts on the same team');
+    assert(secondClaim.ok === false, 'Shared claims reject cross-repo conflicts on the same free shared project');
     assert(secondClaim.conflicts[0].claimedBy.worktree === 'agent2', 'Shared claim conflicts name the owning remote worktree');
     assert(sharedTasks.tasks.length === 1 && sharedTasks.tasks[0].status === 'in_progress', 'Shared task listing reads the team task state from the shared queue');
     assert(sharedLeases.leases.length === 1 && sharedLeases.leases[0].worktree === 'agent2', 'Shared lease listing reads the team lease state from the shared queue');
-    assert(sharedStatus.summary.mode === 'shared', 'Shared status snapshot reports the shared team queue mode');
+    assert(sharedStatus.summary.mode === 'shared', 'Shared status snapshot reports the shared queue mode');
     assert(sharedStatus.claims.length === 1 && sharedStatus.claims[0].file_path === 'src/auth.js', 'Shared status snapshot includes active team file claims');
 
     sharedState.tasks[0].status = 'failed';
@@ -635,7 +652,7 @@ await testAsync('Pro shared coordination lets one repo add work and another repo
     const afterRetry = await getSharedStatusSnapshot(repoADir);
     assert(retried.task?.status === 'pending', 'Shared retry resets a shared task back to pending');
     assert(afterRetry.active_leases.length === 0, 'Shared retry clears active team leases');
-    assert(afterRetry.claims.length === 0, 'Shared retry clears active team claims');
+    assert(afterRetry.claims.length === 0, 'Shared retry clears active shared claims');
   } finally {
     global.fetch = originalFetch;
     if (originalHome == null) {
@@ -648,6 +665,49 @@ await testAsync('Pro shared coordination lets one repo add work and another repo
     rmSync(repoBDir, { recursive: true, force: true });
     rmSync(homeADir, { recursive: true, force: true });
     rmSync(homeBDir, { recursive: true, force: true });
+  }
+});
+
+await testAsync('Free shared coordination stays limited to one project key per logged-in user', async () => {
+  const repoADir = join(tmpdir(), `sw-free-cloud-limit-a-${Date.now()}`);
+  const repoBDir = join(tmpdir(), `sw-free-cloud-limit-b-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-free-cloud-limit-home-${Date.now()}`);
+  const originalHome = process.env.HOME;
+
+  try {
+    for (const [repoDir, remoteUrl] of [
+      [repoADir, 'https://github.com/acme/project-a.git'],
+      [repoBDir, 'https://github.com/acme/project-b.git'],
+    ]) {
+      mkdirSync(repoDir, { recursive: true });
+      execSync('git init -b main', { cwd: repoDir });
+      execSync('git config user.email "test@test.com"', { cwd: repoDir });
+      execSync('git config user.name "Test"', { cwd: repoDir });
+      execSync(`git remote add origin ${remoteUrl}`, { cwd: repoDir });
+      writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
+      execSync('git add README.md', { cwd: repoDir });
+      execSync('git commit -m "init repo context"', { cwd: repoDir });
+    }
+
+    mkdirSync(homeDir, { recursive: true });
+    writeFreeLoggedInCredentials(homeDir, 'free@test.com', { userId: 'user-free-limit' });
+    process.env.HOME = homeDir;
+
+    const firstMode = await getSharedCoordinationMode(repoADir);
+    const secondMode = await getSharedCoordinationMode(repoBDir);
+
+    assert(firstMode.enabled === true, 'Free shared coordination allows one logged-in project');
+    assert(secondMode.enabled === false, 'Free shared coordination blocks a second distinct project');
+    assert(secondMode.reason === 'free_project_limit', 'Second free shared project reports the project limit reason');
+  } finally {
+    if (originalHome == null) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+    rmSync(repoADir, { recursive: true, force: true });
+    rmSync(repoBDir, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
   }
 });
 
@@ -967,9 +1027,9 @@ test('Planner keeps API documentation updates docs-only and treats payments work
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Setup turns the fourth-agent limit into an urgent upgrade prompt', () => {
-  const repoDir = join(tmpdir(), `sw-setup-upgrade-${Date.now()}`);
-  const homeDir = join(tmpdir(), `sw-setup-upgrade-home-${Date.now()}`);
+test('Setup allows more than three local agents on free tier', () => {
+  const repoDir = join(tmpdir(), `sw-setup-free-local-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-setup-free-local-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   mkdirSync(homeDir, { recursive: true });
   execSync('git init -b main', { cwd: repoDir });
@@ -979,25 +1039,22 @@ test('Setup turns the fourth-agent limit into an urgent upgrade prompt', () => {
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init"', { cwd: repoDir });
 
-  let output = '';
-  try {
-    execFileSync(process.execPath, [
-      join(process.cwd(), 'src/cli/index.js'),
-      'setup',
-      '--agents',
-      '4',
-    ], {
-      cwd: repoDir,
-      encoding: 'utf8',
-      env: { ...process.env, HOME: homeDir },
-    });
-  } catch (err) {
-    output = err.stdout || '';
-  }
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'setup',
+    '--agents',
+    '4',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
 
-  assert(output.includes('Agent limit reached (3/3)'), 'Setup reports the free agent limit as an urgent blocker');
-  assert(output.includes('You need agent4 right now.'), 'Setup makes the fourth-agent need feel immediate');
-  assert(output.includes('Unlock unlimited agents in 60 seconds -> switchman upgrade'), 'Setup points the blocked operator straight at upgrade');
+  assert(output.includes('First-run check:'), 'Setup still completes the first-run flow for larger local free runs');
+  const db = openDb(repoDir);
+  const worktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
+  assert(worktrees.length === 4, 'Setup creates four local workspaces on free tier');
+  db.close();
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
@@ -7500,7 +7557,7 @@ test('README install section includes the Homebrew path', () => {
   assert(readme.includes('switchman advanced brew-formula --sha256'), 'README includes the formula generation command for releases');
 });
 
-test('Session summary shows recent coordination value and a Pro handoff prompt on free tier', () => {
+test('Session summary stays readable on free tier and keeps deeper counterfactuals for Pro', () => {
   const repoDir = join(tmpdir(), `sw-session-summary-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-session-summary-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -7554,7 +7611,8 @@ test('Session summary shows recent coordination value and a Pro handoff prompt o
   assert(output.includes('rogue write'), 'Session summary reports blocked rogue edits');
   assert(output.includes('retry / recovery handoff'), 'Session summary reports recovery activity');
   assert(output.includes('risky landing issue'), 'Session summary reports landing issues caught');
-  assert(output.includes('switchman upgrade'), 'Session summary includes the upgrade call to action on free tier');
+  assert(!output.includes('Estimated coordination time saved'), 'Free session summary stays read-only and hides counterfactual time-saved analysis');
+  assert(output.includes('Want deeper counterfactual analysis?'), 'Free session summary points at Pro for deeper analysis');
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
@@ -7635,31 +7693,18 @@ test('Desktop notifications on free tier fire for finished tasks and blocked cla
   rmSync(sinkPath, { force: true });
 });
 
-test('Slack notifications are Pro-only and can be delivered for failed tasks', () => {
-  const repoDir = join(tmpdir(), `sw-notify-pro-${Date.now()}`);
-  const homeDir = join(tmpdir(), `sw-notify-pro-home-${Date.now()}`);
-  const switchmanDir = join(homeDir, '.switchman');
-  const sinkPath = join(tmpdir(), `sw-notify-pro-sink-${Date.now()}.jsonl`);
+test('Slack notifications are available on free tier and can be delivered for failed tasks', () => {
+  const repoDir = join(tmpdir(), `sw-notify-slack-free-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-notify-slack-free-home-${Date.now()}`);
+  const sinkPath = join(tmpdir(), `sw-notify-slack-free-sink-${Date.now()}.jsonl`);
   mkdirSync(repoDir, { recursive: true });
-  mkdirSync(switchmanDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
   execSync('git init', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
   writeFileSync(join(repoDir, 'README.md'), 'init\n');
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init"', { cwd: repoDir });
-
-  writeFileSync(join(switchmanDir, 'credentials.json'), JSON.stringify({
-    access_token: 'pro-token',
-    refresh_token: 'refresh-token',
-    expires_at: Date.now() + 60 * 60 * 1000,
-    email: 'pro@test.com',
-  }, null, 2));
-  writeFileSync(join(switchmanDir, 'licence-cache.json'), JSON.stringify({
-    valid: true,
-    plan: 'pro',
-    cached_at: Date.now(),
-  }, null, 2));
 
   execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
@@ -7691,7 +7736,7 @@ test('Slack notifications are Pro-only and can be delivered for failed tasks', (
   });
 
   const notifications = readFileSync(sinkPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-  assert(notifications.some((entry) => entry.channel === 'slack' && entry.title === 'Agent hit a failed task'), 'Pro Slack notifications fire when an agent fails a task');
+  assert(notifications.some((entry) => entry.channel === 'slack' && entry.title === 'Agent hit a failed task'), 'Free Slack notifications fire when an agent fails a task');
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });

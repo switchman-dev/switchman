@@ -81,7 +81,7 @@ import {
   maybePromptForTelemetry,
   sendTelemetryEvent,
 } from '../core/telemetry.js';
-import { checkLicence, clearCredentials, FREE_AGENT_LIMIT, getRetentionDaysForCurrentPlan, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
+import { checkLicence, clearCredentials, getRetentionDaysForCurrentPlan, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
 import { homedir } from 'os';
 import { cleanupOldSyncEvents, getPendingQueueStatus, pullActiveTeamMembers, pullTeamState, pushSyncEvent } from '../core/sync.js';
 import { registerClaudeCommands } from './commands/claude.js';
@@ -1314,25 +1314,12 @@ Examples:
     const context = collectPlanContext(repoRoot, goal || null, issueContext);
 
     let desiredAgentCount = requestedAgentCount === 'auto'
-      ? Math.min(maxTasks, licence.valid ? maxTasks : FREE_AGENT_LIMIT)
+      ? maxTasks
       : Number.parseInt(requestedAgentCount, 10);
 
     if (!Number.isInteger(desiredAgentCount) || desiredAgentCount < 1) {
       console.error(chalk.red('--agents must be a positive number or "auto"'));
       process.exit(1);
-    }
-
-    if (!licence.valid && desiredAgentCount > FREE_AGENT_LIMIT) {
-      console.log('');
-      console.log(chalk.red(`  ✗ Agent limit reached (${FREE_AGENT_LIMIT}/${FREE_AGENT_LIMIT})`));
-      console.log('');
-      console.log(`  You need ${chalk.cyan(`agent${desiredAgentCount}`)} right now.`);
-      console.log('');
-      console.log(`  Unlock unlimited agents in 60 seconds -> ${chalk.cyan('switchman upgrade')}`);
-      console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
-      console.log('');
-      process.exitCode = 1;
-      return;
     }
 
     const planningWorktrees = createStartPlanningWorktrees(desiredAgentCount);
@@ -1349,7 +1336,7 @@ Examples:
     if (requestedAgentCount === 'auto') {
       desiredAgentCount = Math.max(1, Math.min(
         plannedTasks.length || 1,
-        licence.valid ? Math.max(plannedTasks.length || 1, 1) : FREE_AGENT_LIMIT,
+        Math.max(plannedTasks.length || 1, 1),
       ));
     }
 
@@ -1381,8 +1368,8 @@ Examples:
     console.log('');
     console.log(chalk.bold('Session plan:'));
     console.log(`  ${chalk.dim('tier:')} ${licence.valid ? chalk.green('Pro') : chalk.yellow('Free')}`);
-    console.log(`  ${chalk.dim('coordination:')} ${sharedMode.enabled ? 'shared team queue in the cloud' : licence.valid ? 'local coordination with Pro agent capacity' : 'local coordination only'}`);
-    console.log(`  ${chalk.dim('agents:')} ${desiredAgentCount}${!licence.valid ? chalk.dim(` (capped at ${FREE_AGENT_LIMIT} on free)`) : ''}`);
+    console.log(`  ${chalk.dim('coordination:')} ${sharedMode.enabled ? (licence.valid ? 'shared team queue in the cloud' : 'shared cloud coordination for one free project') : 'local coordination only'}`);
+    console.log(`  ${chalk.dim('agents:')} ${desiredAgentCount}${!sharedMode.enabled && !licence.valid ? chalk.dim(' (local unlimited)') : ''}`);
     console.log('');
 
     if (!opts.yes) {
@@ -1440,7 +1427,7 @@ Examples:
       console.log(`  ${opts.scheduler ? '4' : '3'}. When the first session ends, see what Switchman prevented:`);
       console.log(`     ${chalk.cyan('switchman session-summary')}`);
       if (!licence.valid) {
-        console.log(`  ${opts.scheduler ? '5' : '4'}. Need more than ${FREE_AGENT_LIMIT} agents or team sync?`);
+        console.log(`  ${opts.scheduler ? '5' : '4'}. Need deeper session analysis, more history, or full team coordination?`);
         console.log(`     ${chalk.cyan('switchman upgrade')}`);
       }
     } catch (err) {
@@ -1472,24 +1459,6 @@ Examples:
     if (isNaN(agentCount) || agentCount < 1) {
       console.error(chalk.red('--agents must be a positive number'));
       process.exit(1);
-    }
-
-        if (agentCount > FREE_AGENT_LIMIT) {
-      const licence = await checkLicence();
-      if (!licence.valid) {
-        console.log('');
-        console.log(chalk.red(`  ✗ Agent limit reached (${FREE_AGENT_LIMIT}/${FREE_AGENT_LIMIT})`));
-        console.log('');
-        console.log(`  You need ${chalk.cyan(`agent${agentCount}`)} right now.`);
-        console.log('');
-        console.log(`  Unlock unlimited agents in 60 seconds -> ${chalk.cyan('switchman upgrade')}`);
-        console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
-        console.log('');
-        process.exit(1);
-      }
-      if (licence.offline) {
-        console.log(chalk.dim(`  Pro licence verified (offline cache · ${Math.ceil((7 * 24 * 60 * 60 * 1000 - (Date.now() - (licence.cached_at ?? 0))) / (24 * 60 * 60 * 1000))}d remaining)`));
-      }
     }
 
     const repoRoot = getRepo();

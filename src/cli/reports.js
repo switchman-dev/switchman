@@ -1331,11 +1331,15 @@ export async function buildSessionSummary(repoRoot, { hours = 8 } = {}) {
       queue_blocks_avoided: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && ['blocked', 'retrying', 'wave_blocked', 'escalated', 'held'].includes(event.status)).length,
     };
 
-    const estimatedMinutesSaved =
-      metrics.rogue_writes_blocked * 12 +
-      metrics.retries_scheduled * 10 +
-      metrics.queue_blocks_avoided * 8 +
-      metrics.queue_merges_completed * 4;
+    const isProDepth = retentionDays > FREE_RETENTION_DAYS;
+    const estimatedMinutesSaved = isProDepth
+      ? (
+        metrics.rogue_writes_blocked * 12 +
+        metrics.retries_scheduled * 10 +
+        metrics.queue_blocks_avoided * 8 +
+        metrics.queue_merges_completed * 4
+      )
+      : 0;
 
     return {
       generated_at: new Date().toISOString(),
@@ -1343,11 +1347,13 @@ export async function buildSessionSummary(repoRoot, { hours = 8 } = {}) {
       retention_days: retentionDays,
       metrics,
       estimated_minutes_saved: estimatedMinutesSaved,
-      upgrade_cta: retentionDays === FREE_RETENTION_DAYS
+      upgrade_cta: null,
+      counterfactual_depth: isProDepth ? 'full' : 'read_only',
+      depth_hint: !isProDepth
         ? {
-          title: 'Running a bigger team or longer agent sessions?',
+          title: 'Want deeper counterfactual analysis?',
           command: 'switchman upgrade',
-          detail: 'Pro adds unlimited agents, shared cloud state, and 90-day history.',
+          detail: 'Pro adds richer counterfactual session analysis, longer history, and shared cloud coordination.',
         }
         : null,
     };

@@ -142,10 +142,7 @@ export async function sendSwitchmanNotification({
   }
 
   if (allowSlack && config.slack_enabled && config.slack_webhook_url) {
-    const licence = await checkLicence();
-    if (licence.valid) {
-      attempts.push(postSlackNotification(config.slack_webhook_url, title, message));
-    }
+    attempts.push(postSlackNotification(config.slack_webhook_url, title, message));
   }
 
   if (attempts.length === 0) {

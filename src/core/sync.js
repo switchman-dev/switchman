@@ -19,7 +19,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { readCredentials } from './licence.js';
+import { checkLicence, readCredentials, resolveFreeCloudProjectAccess } from './licence.js';
+import { basename } from 'path';
+import { execSync } from 'child_process';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -124,6 +126,62 @@ async function getTeamId(accessToken, userId) {
   } catch {
     return null;
   }
+}
+
+function deriveRepoKey(repoRoot = process.cwd()) {
+  try {
+    const remoteUrl = execSync('git config --get remote.origin.url', {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (remoteUrl) return remoteUrl;
+  } catch {
+    // fall back to repo basename
+  }
+  return basename(repoRoot);
+}
+
+async function resolveSyncScope(repoRoot = process.cwd()) {
+  const creds = readCredentials();
+  if (!creds?.access_token || !creds?.user_id) {
+    return { ok: false, reason: 'not_logged_in' };
+  }
+
+  const licence = await checkLicence();
+  if (licence.valid) {
+    const teamId = await getTeamId(creds.access_token, creds.user_id);
+    if (!teamId) return { ok: false, reason: 'no_team' };
+    return {
+      ok: true,
+      accessToken: creds.access_token,
+      userId: creds.user_id,
+      email: creds.email ?? null,
+      teamId,
+      repoKey: deriveRepoKey(repoRoot),
+      plan: 'pro',
+    };
+  }
+
+  const repoKey = deriveRepoKey(repoRoot);
+  const freeProject = resolveFreeCloudProjectAccess(repoKey);
+  if (!freeProject.allowed) {
+    return {
+      ok: false,
+      reason: freeProject.reason || 'free_project_limit',
+      active_projects: freeProject.active_projects || [],
+    };
+  }
+
+  return {
+    ok: true,
+    accessToken: creds.access_token,
+    userId: creds.user_id,
+    email: creds.email ?? null,
+    teamId: freeProject.scope_id,
+    repoKey,
+    plan: 'free',
+  };
 }
 
 // ─── Core push with retry ─────────────────────────────────────────────────────
@@ -237,35 +295,34 @@ async function flushQueue(accessToken) {
  * eventType: 'task_added' | 'task_done' | 'task_failed' | 'lease_acquired' |
  *            'claim_added' | 'claim_released' | 'status_ping'
  */
-export async function pushSyncEvent(eventType, payload, { worktree = null } = {}) {
+export async function pushSyncEvent(eventType, payload, { worktree = null, repoRoot = process.cwd() } = {}) {
   try {
-    const creds = readCredentials();
-    if (!creds?.access_token || !creds?.user_id) return { ok: false, reason: 'not_logged_in' };
-
-    const teamId = await getTeamId(creds.access_token, creds.user_id);
-    if (!teamId) return { ok: false, reason: 'no_team' };
+    const scope = await resolveSyncScope(repoRoot);
+    if (!scope.ok) return { ok: false, reason: scope.reason };
 
     const resolvedWorktree = worktree
       ?? process.cwd().split('/').pop()
       ?? 'unknown';
 
     const row = {
-      team_id:    teamId,
-      user_id:    creds.user_id,
+      team_id:    scope.teamId,
+      user_id:    scope.userId,
       worktree:   resolvedWorktree,
       event_type: eventType,
       payload: {
         ...payload,
-        email:     creds.email ?? null,
+        email:     scope.email,
         synced_at: new Date().toISOString(),
+        repo_key:  scope.repoKey,
+        plan:      scope.plan,
       },
     };
 
-    const result = await pushEventWithRetry(row, creds.access_token);
+    const result = await pushEventWithRetry(row, scope.accessToken);
 
     if (result.ok) {
       // Flush any previously queued offline events now that we're back online
-      flushQueue(creds.access_token).catch(() => {});
+      flushQueue(scope.accessToken).catch(() => {});
       return { ok: true, queued: false, attempts: result.attempts };
     }
 
@@ -290,23 +347,20 @@ export async function pushSyncEvent(eventType, payload, { worktree = null } = {}
  */
 export async function pullTeamState() {
   try {
-    const creds = readCredentials();
-    if (!creds?.access_token || !creds?.user_id) return [];
+    const scope = await resolveSyncScope(process.cwd());
+    if (!scope.ok) return [];
 
-    const teamId = await getTeamId(creds.access_token, creds.user_id);
-    if (!teamId) return [];
-
-    await flushQueue(creds.access_token).catch(() => {});
+    await flushQueue(scope.accessToken).catch(() => {});
 
     const since = new Date(Date.now() - 5 * 60 * 1000).toISOString();
 
     const res = await fetchWithTimeout(
       `${SUPABASE_URL}/rest/v1/sync_state` +
-      `?team_id=eq.${teamId}` +
+      `?team_id=eq.${scope.teamId}` +
       `&created_at=gte.${since}` +
       `&order=created_at.desc` +
       `&limit=50`,
-      { headers: getHeaders(creds.access_token) }
+      { headers: getHeaders(scope.accessToken) }
     );
 
     if (!res.ok) return [];
@@ -323,23 +377,20 @@ export async function pullTeamState() {
  */
 export async function pullActiveTeamMembers() {
   try {
-    const creds = readCredentials();
-    if (!creds?.access_token || !creds?.user_id) return [];
+    const scope = await resolveSyncScope(process.cwd());
+    if (!scope.ok) return [];
 
-    const teamId = await getTeamId(creds.access_token, creds.user_id);
-    if (!teamId) return [];
-
-    await flushQueue(creds.access_token).catch(() => {});
+    await flushQueue(scope.accessToken).catch(() => {});
 
     const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
 
     const res = await fetchWithTimeout(
       `${SUPABASE_URL}/rest/v1/sync_state` +
-      `?team_id=eq.${teamId}` +
+      `?team_id=eq.${scope.teamId}` +
       `&created_at=gte.${since}` +
       `&order=created_at.desc` +
       `&limit=100`,
-      { headers: getHeaders(creds.access_token) }
+      { headers: getHeaders(scope.accessToken) }
     );
 
     if (!res.ok) return [];
@@ -348,7 +399,7 @@ export async function pullActiveTeamMembers() {
     // Deduplicate — keep most recent event per user+worktree, exclude self
     const seen = new Map();
     for (const event of events) {
-      if (event.user_id === creds.user_id) continue;
+      if (event.user_id === scope.userId) continue;
       const key = `${event.user_id}:${event.worktree}`;
       if (!seen.has(key)) seen.set(key, event);
     }
@@ -367,8 +418,8 @@ export async function pullActiveTeamMembers() {
  */
 export async function cleanupOldSyncEvents({ retentionDays = 7 } = {}) {
   try {
-    const creds = readCredentials();
-    if (!creds?.access_token || !creds?.user_id) return;
+    const scope = await resolveSyncScope(process.cwd());
+    if (!scope.ok) return;
 
     const cutoff = new Date(
       Date.now() - Math.max(1, Number.parseInt(retentionDays, 10) || 7) * 24 * 60 * 60 * 1000
@@ -376,9 +427,9 @@ export async function cleanupOldSyncEvents({ retentionDays = 7 } = {}) {
 
     await fetchWithTimeout(
       `${SUPABASE_URL}/rest/v1/sync_state` +
-      `?user_id=eq.${creds.user_id}` +
+      `?user_id=eq.${scope.userId}` +
       `&created_at=lt.${cutoff}`,
-      { method: 'DELETE', headers: getHeaders(creds.access_token) }
+      { method: 'DELETE', headers: getHeaders(scope.accessToken) }
     );
 
     // Purge queue entries older than 24 hours — too stale to be useful

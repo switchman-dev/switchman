@@ -10,6 +10,7 @@
  * if anything goes wrong it returns { valid: false }.
  */
 
+import { createHash } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -33,6 +34,7 @@ const PRO_PAGE_URL      = 'https://switchman.dev/pro';
 const FREE_AGENT_LIMIT  = 3;
 const FREE_RETENTION_DAYS = 7;
 const PRO_RETENTION_DAYS = 90;
+const FREE_CLOUD_PROJECT_LIMIT = 1;
 const CACHE_TTL_MS      = 24 * 60 * 60 * 1000;   // 24 hours
 const OFFLINE_GRACE_MS  = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -48,6 +50,10 @@ function getCredentialsPath() {
 
 function getLicenceCachePath() {
   return join(getSwitchmanConfigDir(), 'licence-cache.json');
+}
+
+function getFreeCloudProjectsPath() {
+  return join(getSwitchmanConfigDir(), 'free-cloud-projects.json');
 }
 
 function ensureConfigDir() {
@@ -108,6 +114,77 @@ function clearLicenceCache() {
     const path = getLicenceCachePath();
     if (existsSync(path)) writeFileSync(path, '{}');
   } catch { /* no-op */ }
+}
+
+function readFreeCloudProjects() {
+  try {
+    const path = getFreeCloudProjectsPath();
+    if (!existsSync(path)) return [];
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    return Array.isArray(parsed?.projects)
+      ? parsed.projects.filter((entry) => typeof entry === 'string' && entry.trim())
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeFreeCloudProjects(projects) {
+  try {
+    ensureConfigDir();
+    const uniqueProjects = [...new Set(projects.map((entry) => String(entry || '').trim()).filter(Boolean))];
+    writeFileSync(getFreeCloudProjectsPath(), JSON.stringify({
+      limit: FREE_CLOUD_PROJECT_LIMIT,
+      projects: uniqueProjects.slice(0, FREE_CLOUD_PROJECT_LIMIT),
+    }, null, 2), { mode: 0o600 });
+  } catch {
+    // Best effort
+  }
+}
+
+function buildFreeCloudScopeId(projectKey) {
+  const digest = createHash('sha256').update(String(projectKey || '')).digest('hex').slice(0, 16);
+  return `free-project-${digest}`;
+}
+
+export function resolveFreeCloudProjectAccess(projectKey) {
+  const normalizedKey = String(projectKey || '').trim();
+  if (!normalizedKey) {
+    return { allowed: false, reason: 'missing_project_key', active_projects: [] };
+  }
+
+  const activeProjects = readFreeCloudProjects();
+  if (activeProjects.includes(normalizedKey)) {
+    return {
+      allowed: true,
+      reason: null,
+      first_use: false,
+      project_key: normalizedKey,
+      active_projects: activeProjects,
+      scope_id: buildFreeCloudScopeId(normalizedKey),
+    };
+  }
+
+  if (activeProjects.length >= FREE_CLOUD_PROJECT_LIMIT) {
+    return {
+      allowed: false,
+      reason: 'free_project_limit',
+      project_key: normalizedKey,
+      active_projects: activeProjects,
+      limit: FREE_CLOUD_PROJECT_LIMIT,
+    };
+  }
+
+  const nextProjects = [...activeProjects, normalizedKey];
+  writeFreeCloudProjects(nextProjects);
+  return {
+    allowed: true,
+    reason: null,
+    first_use: true,
+    project_key: normalizedKey,
+    active_projects: nextProjects,
+    scope_id: buildFreeCloudScopeId(normalizedKey),
+  };
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────
@@ -403,4 +480,10 @@ function saveSession(session) {
 
 // ─── Helpers for CLI commands ─────────────────────────────────────────────────
 
-export { FREE_AGENT_LIMIT, FREE_RETENTION_DAYS, PRO_PAGE_URL, PRO_RETENTION_DAYS };
+export {
+  FREE_AGENT_LIMIT,
+  FREE_CLOUD_PROJECT_LIMIT,
+  FREE_RETENTION_DAYS,
+  PRO_PAGE_URL,
+  PRO_RETENTION_DAYS,
+};
