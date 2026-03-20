@@ -7631,7 +7631,7 @@ test('Advanced Homebrew formula command renders a release-ready formula', () => 
 test('README install section includes the Homebrew path', () => {
   const readme = readFileSync(join(process.cwd(), 'README.md'), 'utf8');
   assert(readme.includes('brew install switchman-dev/tap/switchman-dev'), 'README includes the Homebrew install command');
-  assert(readme.includes('switchman advanced brew-formula --sha256'), 'README includes the formula generation command for releases');
+  assert(readme.includes('Requirements: Node.js 22.5+ · Git 2.5+'), 'README install section includes the runtime requirements');
 });
 
 test('Session summary stays readable on free tier and keeps deeper counterfactuals for Pro', () => {
