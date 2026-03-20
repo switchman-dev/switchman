@@ -19,11 +19,12 @@
 import { Help, program } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, posix } from 'path';
 import { execSync, spawn } from 'child_process';
 import readline from 'readline/promises';
+import { ReadStream as TtyReadStream, WriteStream as TtyWriteStream } from 'tty';
 
 import { cleanupCrashedLandingTempWorktrees, createGitWorktree, findRepoRoot, getWorktreeChangedFiles, gitAssessBranchFreshness, gitBranchExists, listGitWorktrees } from '../core/git.js';
 import { matchesPathPatterns } from '../core/ignore.js';
@@ -174,14 +175,40 @@ function installMcpConfig(targetDirs) {
   return targetDirs.flatMap((targetDir) => upsertAllProjectMcpConfigs(targetDir));
 }
 
+function getInteractivePromptStreams(env = process.env) {
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    return { input: process.stdin, output: process.stdout };
+  }
+
+  if (env.CI || process.platform === 'win32') {
+    return null;
+  }
+
+  try {
+    const input = new TtyReadStream(openSync('/dev/tty', 'r'));
+    const output = new TtyWriteStream(openSync('/dev/tty', 'w'));
+    return {
+      input,
+      output,
+      close() {
+        input.destroy();
+        output.destroy();
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function confirmCliAction(prompt) {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  const streams = getInteractivePromptStreams();
+  if (!streams) {
     return 'non_interactive';
   }
 
   const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
+    input: streams.input,
+    output: streams.output,
   });
 
   try {
@@ -192,6 +219,7 @@ async function confirmCliAction(prompt) {
     return 'no';
   } finally {
     rl.close();
+    streams.close?.();
   }
 }
 

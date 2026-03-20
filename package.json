@@ -1,7 +1,7 @@
 {
   "name": "switchman-dev",
   "version": "0.1.20",
-  "description": "Project manager for AI coding assistants running safely on one codebase",
+  "description": "Coordinate parallel AI coding agents - file locking, task queues, and governed merges for Claude Code, Cursor, and Windsurf",
   "type": "module",
   "main": "src/index.js",
   "bin": {
@@ -20,7 +20,6 @@
     "examples/teardown.sh",
     "examples/walkthrough.sh",
     "examples/taskapi/package.json",
-    "examples/taskapi/package-lock.json",
     "examples/taskapi/src/"
   ],
   "repository": {

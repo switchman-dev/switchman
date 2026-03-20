@@ -78,6 +78,8 @@ What `switchman start` gives you:
 - a shared Switchman database in `.switchman/`
 - a repo-aware `CLAUDE.md` when one does not exist
 
+If your shell is running non-interactively, `switchman start` will ask you to rerun with `--yes` instead of hanging for confirmation. In a normal terminal, Switchman now falls back to the controlling TTY when stdin/stdout were piped.
+
 Prefer the older explicit flow when you want full manual control:
 
 ```bash
