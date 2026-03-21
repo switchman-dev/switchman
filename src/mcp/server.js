@@ -867,7 +867,7 @@ Args:
 Returns JSON:
   {
     "ok": boolean,
-    "status": "pass" | "warn" | "blocked",
+    "status": "pass" | "warn" | "blocked" | "uncertain",
     "summary": string,
     "worktrees": [{ "worktree": string, "score": number, "findings": string[] }],
     "pairs": [{ "worktree_a": string, "worktree_b": string, "status": string, "score": number, "reasons": string[] }]

@@ -182,17 +182,37 @@ function summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations, d
   const warnedValidations = boundaryValidations.filter((item) => item.severity === 'warn');
   const blockedInvalidations = dependencyInvalidations.filter((item) => item.severity === 'blocked');
   const warnedInvalidations = dependencyInvalidations.filter((item) => item.severity === 'warn');
+  const activeWorktrees = worktreeAnalyses.filter((item) => item.changed_files.length > 0);
+  const totalChangedFiles = activeWorktrees.reduce((sum, item) => sum + item.changed_files.length, 0);
+  const largeWorktrees = activeWorktrees.filter((item) => item.changed_files.length >= 8).length;
+  const broadAreas = new Set(activeWorktrees.flatMap((item) => item.areas)).size;
+  const ambiguityReasons = [];
 
   if (blockedPairs.length > 0 || blockedValidations.length > 0 || blockedInvalidations.length > 0) {
     return {
       status: 'blocked',
       summary: `AI merge gate blocked: ${blockedPairs.length} risky pair(s), ${blockedValidations.length} boundary validation issue(s), and ${blockedInvalidations.length} stale dependency issue(s) need resolution.`,
+      uncertain_reasons: [],
     };
   }
   if (warnedPairs.length > 0 || warnedValidations.length > 0 || warnedInvalidations.length > 0) {
     return {
       status: 'warn',
       summary: `AI merge gate warns: ${warnedPairs.length} pair(s), ${warnedValidations.length} boundary validation issue(s), or ${warnedInvalidations.length} stale dependency issue(s) need review.`,
+      uncertain_reasons: [],
+    };
+  }
+  if (activeWorktrees.length >= 3 && totalChangedFiles >= 18) {
+    ambiguityReasons.push(`significant changes span ${activeWorktrees.length} worktrees and ${totalChangedFiles} files`);
+  }
+  if (largeWorktrees >= 2 && broadAreas >= 3) {
+    ambiguityReasons.push(`large worktrees fan out across ${broadAreas} shared code areas`);
+  }
+  if (ambiguityReasons.length > 0) {
+    return {
+      status: 'uncertain',
+      summary: `AI merge gate is uncertain: ${ambiguityReasons.join('; ')}. Manual review recommended.`,
+      uncertain_reasons: ambiguityReasons,
     };
   }
   return {
@@ -200,6 +220,39 @@ function summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations, d
     summary: riskyWorktrees.length > 0
       ? `AI merge gate passed: no cross-worktree merge risks detected. ${riskyWorktrees.length} worktree(s) still have local risk signals worth reviewing if you are about to merge them.`
       : 'AI merge gate passed: no elevated semantic merge risks detected.',
+    uncertain_reasons: [],
+  };
+}
+
+function summarizeHotspots(pairAnalyses = [], worktreeAnalyses = []) {
+  const areaCounts = new Map();
+  const riskTagCounts = new Map();
+  const riskyPairs = pairAnalyses.filter((item) => item.status !== 'pass');
+  const riskyWorktrees = worktreeAnalyses.filter((item) => item.findings.length > 0);
+
+  const bump = (map, values = []) => {
+    for (const value of values) {
+      if (!value) continue;
+      map.set(value, (map.get(value) || 0) + 1);
+    }
+  };
+
+  for (const pair of riskyPairs) {
+    bump(areaCounts, pair.shared_areas || []);
+    bump(riskTagCounts, pair.shared_risk_tags || []);
+  }
+  for (const worktree of riskyWorktrees) {
+    bump(areaCounts, worktree.areas || []);
+    bump(riskTagCounts, worktree.risk_tags || []);
+  }
+
+  const sortCounts = (map) => [...map.entries()]
+    .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+    .map(([name, count]) => ({ name, count }));
+
+  return {
+    shared_areas: sortCounts(areaCounts),
+    shared_risk_tags: sortCounts(riskTagCounts),
   };
 }
 
@@ -287,10 +340,14 @@ export async function runAiMergeGate(db, repoRoot) {
   const boundaryValidations = evaluateBoundaryValidations(db);
   const dependencyInvalidations = evaluateDependencyInvalidations(db);
   const overall = summarizeOverall(pairAnalyses, worktreeAnalyses, boundaryValidations, dependencyInvalidations);
+  const hotspots = summarizeHotspots(pairAnalyses, worktreeAnalyses);
   const result = {
     ok: overall.status === 'pass',
     status: overall.status,
     summary: overall.summary,
+    uncertain_reasons: overall.uncertain_reasons || [],
+    shared_areas: hotspots.shared_areas,
+    shared_risk_tags: hotspots.shared_risk_tags,
     worktrees: worktreeAnalyses,
     pairs: pairAnalyses,
     boundary_validations: boundaryValidations,
@@ -305,10 +362,13 @@ export async function runAiMergeGate(db, repoRoot) {
 
   logAuditEvent(db, {
     eventType: 'ai_merge_gate',
-    status: overall.status === 'blocked' ? 'denied' : (overall.status === 'warn' ? 'warn' : 'allowed'),
-    reasonCode: overall.status === 'blocked' ? 'semantic_merge_risk' : null,
+    status: overall.status === 'blocked' ? 'denied' : (overall.status === 'warn' || overall.status === 'uncertain' ? 'warn' : 'allowed'),
+    reasonCode: overall.status === 'blocked' ? 'semantic_merge_risk' : (overall.status === 'uncertain' ? 'semantic_merge_uncertain' : null),
     details: JSON.stringify({
       status: result.status,
+      uncertain_reasons: result.uncertain_reasons,
+      shared_areas: result.shared_areas,
+      shared_risk_tags: result.shared_risk_tags,
       blocked_pairs: pairAnalyses.filter((item) => item.status === 'blocked').length,
       warned_pairs: pairAnalyses.filter((item) => item.status === 'warn').length,
       blocked_boundary_validations: boundaryValidations.filter((item) => item.severity === 'blocked').length,

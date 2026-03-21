@@ -1,9 +1,14 @@
 export function registerOperatorCommands(program, deps) {
   const {
+    buildTeamReviewShareReport,
+    buildSessionHistoryReport,
+    buildInsightsReport,
     buildSessionSummary,
+    buildUsageReport,
     buildDoctorReport,
     buildRecoverReport,
     chalk,
+    checkLicence,
     collectStatusSnapshot,
     colorForHealth,
     formatClockTime,
@@ -18,7 +23,9 @@ export function registerOperatorCommands(program, deps) {
     printErrorWithNext,
     printRecoverSummary,
     printRepairSummary,
+    pushSyncEvent,
     pullActiveTeamMembers,
+    pullTeamReviewShares,
     pullTeamState,
     readCredentials,
     recoverWorkViaCoordination,
@@ -29,29 +36,69 @@ export function registerOperatorCommands(program, deps) {
     renderSignalStrip,
     renderUnifiedStatusReport,
     repairRepoState,
+    recordUsageEvent,
     runAiMergeGate,
     scanAllWorktrees,
     sleepSync,
     statusBadge,
     summarizeTeamCoordinationState,
     buildWatchSignature,
+    PRO_PAGE_URL,
   } = deps;
 
-  program
-    .command('session-summary')
-    .description('Show what Switchman prevented, recovered, and landed in this recent session')
-    .option('--hours <n>', 'How many recent hours to summarize', '8')
+  const ensureProUsageAccess = async () => {
+    const licence = await checkLicence();
+    if (licence.valid) return true;
+
+    console.log('');
+    console.log(chalk.red('  ✗ switchman usage is a Pro feature'));
+    console.log(`  ${chalk.dim('Track token and cost usage by session, agent, and time window.')}`);
+    console.log(`  ${chalk.dim('Try it free for 30 days ->')} ${chalk.cyan('switchman upgrade')}`);
+    console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+    console.log('');
+    process.exitCode = 1;
+    return false;
+  };
+
+  const ensureProReviewSharingAccess = async () => {
+    const licence = await checkLicence();
+    if (licence.valid) return true;
+
+    console.log('');
+    console.log(chalk.red('  ✗ team review sharing is a Pro feature'));
+    console.log(`  ${chalk.dim('Share one Switchman review with teammates before the PR and pull recent teammate reviews back into this repo.')}`);
+    console.log(`  ${chalk.dim('Try it free for 30 days ->')} ${chalk.cyan('switchman upgrade')}`);
+    console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
+    console.log('');
+    process.exitCode = 1;
+    return false;
+  };
+
+  const usageCmd = program
+    .command('usage')
+    .description('Pro: show token and cost usage per session, per agent, and over time')
+    .option('--days <n>', 'How many recent days to analyze', '90')
+    .option('--session <id>', 'Filter to one session id')
+    .option('--agent <name>', 'Filter to one agent name')
+    .option('--task <id>', 'Filter to one task id')
     .option('--json', 'Output raw JSON')
     .addHelpText('after', `
 Examples:
-  switchman session-summary
-  switchman session-summary --hours 24
-  switchman session-summary --json
+  switchman usage
+  switchman usage --days 30
+  switchman usage --session sprint-42
+  switchman usage --agent claude-code
+  switchman usage record --session sprint-42 --task task-auth --model gpt-5 --prompt-tokens 1200 --completion-tokens 800 --cost-usd 0.04
 `)
     .action(async (opts) => {
+      if (!(await ensureProUsageAccess())) return;
+
       const repoRoot = getRepo();
-      const report = await buildSessionSummary(repoRoot, {
-        hours: Math.max(1, Number.parseInt(opts.hours, 10) || 8),
+      const report = await buildUsageReport(repoRoot, {
+        days: Math.max(1, Number.parseInt(opts.days, 10) || 90),
+        sessionId: opts.session || null,
+        agent: opts.agent || null,
+        taskId: opts.task || null,
       });
 
       if (opts.json) {
@@ -60,12 +107,305 @@ Examples:
       }
 
       console.log('');
-      console.log(chalk.bold('Session summary'));
+      console.log(chalk.bold('Switchman usage'));
+      console.log(chalk.dim(`Last ${report.days_analyzed} day(s) • retention ${report.retention_days} day(s)`));
+      console.log(`  ${chalk.cyan('tokens')} ${report.totals.total_tokens.toLocaleString()} total (${report.totals.prompt_tokens.toLocaleString()} prompt • ${report.totals.completion_tokens.toLocaleString()} completion)`);
+      console.log(`  ${chalk.cyan('cost')} $${Number(report.totals.cost_usd || 0).toFixed(2)}`);
+      console.log(`  ${chalk.cyan('sessions')} ${report.totals.tracked_sessions}`);
+      console.log(`  ${chalk.cyan('agents')} ${report.totals.tracked_agents}`);
+      console.log(`  ${chalk.cyan('events')} ${report.totals.events}`);
+
+      if (report.sessions.length > 0) {
+        console.log('');
+        console.log(chalk.bold('Top sessions'));
+        for (const session of report.sessions.slice(0, 5)) {
+          console.log(`  ${chalk.cyan(session.session_id)} ${chalk.dim(`${session.total_tokens.toLocaleString()} tokens • $${Number(session.cost_usd || 0).toFixed(2)} • ${session.agents.length} agent${session.agents.length === 1 ? '' : 's'} • ${session.task_ids.length} task${session.task_ids.length === 1 ? '' : 's'}`)}`);
+        }
+      }
+
+      if (report.agents.length > 0) {
+        console.log('');
+        console.log(chalk.bold('By agent'));
+        for (const agentEntry of report.agents.slice(0, 5)) {
+          console.log(`  ${chalk.cyan(agentEntry.agent)} ${chalk.dim(`${agentEntry.total_tokens.toLocaleString()} tokens • $${Number(agentEntry.cost_usd || 0).toFixed(2)} • ${agentEntry.sessions.length} session${agentEntry.sessions.length === 1 ? '' : 's'}`)}`);
+        }
+      }
+
+      if (report.models.length > 0) {
+        console.log('');
+        console.log(chalk.bold('By model'));
+        for (const modelEntry of report.models.slice(0, 5)) {
+          console.log(`  ${chalk.cyan(modelEntry.model)} ${chalk.dim(`${modelEntry.total_tokens.toLocaleString()} tokens • $${Number(modelEntry.cost_usd || 0).toFixed(2)}`)}`);
+        }
+      }
+
+      if (report.recent_events.length === 0) {
+        console.log('');
+        console.log(chalk.dim('No usage events recorded yet. Use `switchman usage record ...` or pass SWITCHMAN_USAGE_* env vars when finishing tasks.'));
+      }
+
+      console.log('');
+    });
+
+  usageCmd
+    .command('record')
+    .description('Pro: record token and cost usage for one agent event')
+    .requiredOption('--session <id>', 'Session identifier to group related usage')
+    .option('--task <id>', 'Task id associated with this usage event')
+    .option('--lease <id>', 'Lease id associated with this usage event')
+    .option('--worktree <name>', 'Worktree name for this usage event')
+    .option('--agent <name>', 'Agent name for this usage event')
+    .option('--provider <name>', 'Provider name, for example openai or anthropic')
+    .option('--model <name>', 'Model name, for example gpt-5 or claude-sonnet')
+    .option('--prompt-tokens <n>', 'Prompt tokens consumed', '0')
+    .option('--completion-tokens <n>', 'Completion tokens consumed', '0')
+    .option('--total-tokens <n>', 'Total tokens consumed')
+    .option('--cost-usd <n>', 'Estimated spend in USD', '0')
+    .option('--source <name>', 'How this event was recorded', 'manual')
+    .option('--json', 'Output raw JSON')
+    .action(async (opts) => {
+      if (!(await ensureProUsageAccess())) return;
+
+      const repoRoot = getRepo();
+      const db = getDb(repoRoot);
+      try {
+        const event = recordUsageEvent(db, {
+          sessionId: opts.session,
+          taskId: opts.task || null,
+          leaseId: opts.lease || null,
+          worktree: opts.worktree || null,
+          agent: opts.agent || null,
+          provider: opts.provider || null,
+          model: opts.model || null,
+          promptTokens: opts.promptTokens,
+          completionTokens: opts.completionTokens,
+          totalTokens: opts.totalTokens,
+          costUsd: opts.costUsd,
+          source: opts.source || 'manual',
+        });
+
+        if (opts.json) {
+          console.log(JSON.stringify(event, null, 2));
+          return;
+        }
+
+        console.log(`${chalk.green('✓')} Recorded usage for ${chalk.cyan(event.session_id)}`);
+        console.log(`  ${chalk.dim('tokens:')} ${Number(event.total_tokens || 0).toLocaleString()}  ${chalk.dim('cost:')} $${Number(event.cost_usd || 0).toFixed(2)}`);
+      } finally {
+        db.close();
+      }
+    });
+
+  program
+    .command('insights')
+    .description('Show recurring cross-session merge and coordination patterns in this repo')
+    .option('--days <n>', 'How many recent days to analyze', '90')
+    .option('--json', 'Output raw JSON')
+    .addHelpText('after', `
+Examples:
+  switchman insights
+  switchman insights --days 30
+  switchman insights --json
+`)
+    .action(async (opts) => {
+      const repoRoot = getRepo();
+      const report = await buildInsightsReport(repoRoot, {
+        days: Math.max(1, Number.parseInt(opts.days, 10) || 90),
+      });
+
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+        return;
+      }
+
+      console.log('');
+      console.log(chalk.bold('Switchman insights'));
+      console.log(chalk.dim(`Last ${report.days_analyzed} day(s) • retention ${report.retention_days} day(s)`));
+      console.log(`  ${chalk.yellow('watch')} AI gate warn: ${report.signal_counts.ai_gate_warn}`);
+      console.log(`  ${chalk.red('block')} AI gate blocked: ${report.signal_counts.ai_gate_blocked}`);
+      console.log(`  ${chalk.yellow('uncertain')} AI gate uncertain: ${report.signal_counts.ai_gate_uncertain}`);
+      console.log(`  ${chalk.yellow('stale')} dependency invalidations: ${report.signal_counts.dependency_invalidations}`);
+      console.log(`  ${chalk.yellow('validation')} boundary validation gaps: ${report.signal_counts.boundary_validation_pending}`);
+
+      if (report.recurring_hotspots.length > 0) {
+        console.log('');
+        console.log(chalk.bold('Recurring hotspots'));
+        for (const hotspot of report.recurring_hotspots) {
+          console.log(`  ${chalk.cyan(hotspot.label)} ${chalk.dim(`${hotspot.kind} • seen ${hotspot.observations}x • warn ${hotspot.warn_count} • blocked ${hotspot.blocked_count} • uncertain ${hotspot.uncertain_count}`)}`);
+        }
+      } else {
+        console.log('');
+        console.log(chalk.green('No recurring amber patterns detected yet.'));
+      }
+
+      console.log('');
+      console.log(chalk.bold('Recommendation'));
+      console.log(`  ${report.recommendation}`);
+
+      if (report.depth_hint) {
+        console.log('');
+        console.log(chalk.yellow(report.depth_hint.title));
+        console.log(`  ${chalk.dim(report.depth_hint.detail)}`);
+        console.log(`  ${chalk.cyan(report.depth_hint.command)}`);
+      }
+
+      console.log('');
+    });
+
+  program
+    .command('review')
+    .alias('session-summary')
+    .description('Show the full Switchman session review for recent work')
+    .option('--hours <n>', 'How many recent hours to summarize', '8')
+    .option('--history', 'List recent retained sessions instead of only the latest window')
+    .option('--days <n>', 'How many recent days of retained history to inspect', '90')
+    .option('--search <query>', 'Filter retained sessions by a text query')
+    .option('--share', 'Publish this review to your Switchman Pro team')
+    .option('--team', 'Show recent teammate reviews shared for this repo')
+    .option('--json', 'Output raw JSON')
+    .addHelpText('after', `
+Examples:
+  switchman review
+  switchman review --hours 24
+  switchman review --history
+  switchman review --history --search auth
+  switchman review --share
+  switchman review --team
+  switchman review --json
+`)
+    .action(async (opts) => {
+      const repoRoot = getRepo();
+      const reviewHours = Math.max(1, Number.parseInt(opts.hours, 10) || 8);
+      const reviewDays = Math.max(1, Number.parseInt(opts.days, 10) || 90);
+
+      if (opts.team) {
+        if (!(await ensureProReviewSharingAccess())) return;
+        const reviews = buildTeamReviewShareReport(await pullTeamReviewShares({
+          hours: reviewHours,
+          repoRoot,
+        }));
+
+        if (opts.json) {
+          console.log(JSON.stringify({
+            generated_at: new Date().toISOString(),
+            hours: reviewHours,
+            reviews,
+          }, null, 2));
+          return;
+        }
+
+        console.log('');
+        console.log(chalk.bold('Shared team reviews'));
+        console.log(chalk.dim(`Last ${reviewHours} hour(s)`));
+        if (reviews.length === 0) {
+          console.log(chalk.dim('No teammate reviews have been shared for this repo yet.'));
+          console.log(`  ${chalk.cyan('switchman review --share')}`);
+          console.log('');
+          return;
+        }
+
+        for (const review of reviews) {
+          const confidenceColor = review.merge_confidence === 'green'
+            ? chalk.green
+            : review.merge_confidence === 'amber'
+              ? chalk.yellow
+              : review.merge_confidence === 'red'
+                ? chalk.red
+                : chalk.yellow;
+          console.log(`  ${chalk.cyan(review.email)} ${confidenceColor(review.merge_confidence)} ${chalk.dim(review.shared_at || '')}`);
+          console.log(`  ${review.narrative}`);
+          console.log(`  ${chalk.dim(`tasks ${review.metrics.tasks_completed || 0} • retries ${review.metrics.retries_scheduled || 0} • blocked writes ${review.metrics.rogue_writes_blocked || 0}`)}`);
+          console.log('');
+        }
+        return;
+      }
+
+      if (opts.history) {
+        const report = await buildSessionHistoryReport(repoRoot, {
+          days: reviewDays,
+          search: opts.search || null,
+        });
+
+        if (opts.json) {
+          console.log(JSON.stringify(report, null, 2));
+          return;
+        }
+
+        console.log('');
+        console.log(chalk.bold('Session history'));
+        console.log(chalk.dim(`Last ${report.days_analyzed} day(s) • retention ${report.retention_days} day(s)`));
+        if (opts.search) {
+          console.log(chalk.dim(`Search: ${opts.search}`));
+        }
+        if (report.sessions.length === 0) {
+          console.log(chalk.dim('No retained sessions matched this query.'));
+          console.log('');
+          return;
+        }
+
+        for (const session of report.sessions.slice(0, 12)) {
+          const confidenceColor = session.merge_confidence === 'green'
+            ? chalk.green
+            : session.merge_confidence === 'amber'
+              ? chalk.yellow
+              : session.merge_confidence === 'red'
+                ? chalk.red
+                : chalk.yellow;
+          console.log(`  ${chalk.cyan(session.id)} ${confidenceColor(session.merge_confidence)} ${chalk.dim(session.started_at || '')}`);
+          console.log(`  ${session.narrative}`);
+          console.log(`  ${chalk.dim(`events ${session.audit_event_count + session.queue_event_count} • tasks ${session.metrics.tasks_completed || 0} • merges ${session.metrics.queue_merges_completed || 0}`)}`);
+          console.log('');
+        }
+        return;
+      }
+
+      const report = await buildSessionSummary(repoRoot, {
+        hours: reviewHours,
+      });
+      let shareResult = null;
+      if (opts.share) {
+        if (!(await ensureProReviewSharingAccess())) return;
+        shareResult = await pushSyncEvent('session_review_shared', {
+          review: {
+            generated_at: report.generated_at,
+            hours: report.hours,
+            merge_confidence: report.merge_confidence,
+            metrics: report.metrics,
+            narrative: report.narrative,
+          },
+        }, { repoRoot });
+      }
+
+      if (opts.json) {
+        console.log(JSON.stringify({
+          ...report,
+          shared: opts.share ? shareResult : null,
+        }, null, 2));
+        return;
+      }
+
+      console.log('');
+      console.log(chalk.bold('Switchman review'));
       console.log(chalk.dim(`Last ${report.hours} hour(s)`));
+      const confidenceColor = report.merge_confidence === 'green'
+        ? chalk.green
+        : report.merge_confidence === 'amber'
+          ? chalk.yellow
+          : report.merge_confidence === 'red'
+            ? chalk.red
+            : chalk.yellow;
+      console.log(`  ${chalk.bold('Narrative')} ${report.narrative}`);
+      console.log(`  ${chalk.bold('Merge confidence')} ${confidenceColor(report.merge_confidence)}`);
       console.log(`  ${chalk.green('✓')} ${report.metrics.rogue_writes_blocked} rogue write${report.metrics.rogue_writes_blocked === 1 ? '' : 's'} blocked`);
       console.log(`  ${chalk.green('✓')} ${report.metrics.retries_scheduled} retry / recovery handoff${report.metrics.retries_scheduled === 1 ? '' : 's'} recorded`);
       console.log(`  ${chalk.green('✓')} ${report.metrics.queue_blocks_avoided} risky landing issue${report.metrics.queue_blocks_avoided === 1 ? '' : 's'} caught`);
       console.log(`  ${chalk.green('✓')} ${report.metrics.queue_merges_completed} safe merge${report.metrics.queue_merges_completed === 1 ? '' : 's'} completed`);
+      if (opts.share) {
+        console.log('');
+        if (shareResult?.ok) console.log(`${chalk.green('✓')} Shared this review with your team`);
+        else if (shareResult?.queued) console.log(`${chalk.yellow('!')} Review sharing queued locally until sync comes back`);
+        else console.log(`${chalk.yellow('!')} Review sharing did not complete${shareResult?.reason ? ` (${shareResult.reason})` : ''}`);
+      }
       if (report.estimated_minutes_saved > 0) {
         console.log('');
         console.log(chalk.dim(`Estimated coordination time saved: ~${report.estimated_minutes_saved} minute${report.estimated_minutes_saved === 1 ? '' : 's'}`));
@@ -437,7 +777,7 @@ Examples:
       ]));
       console.log(renderMetricRow([
         { label: 'tasks', value: `${report.counts.pending}/${report.counts.in_progress}/${report.counts.done}/${report.counts.failed}`, color: chalk.white },
-        { label: 'AI gate', value: report.merge_readiness.ai_gate_status, color: report.merge_readiness.ai_gate_status === 'blocked' ? chalk.red : report.merge_readiness.ai_gate_status === 'warn' ? chalk.yellow : chalk.green },
+        { label: 'AI gate', value: report.merge_readiness.ai_gate_status, color: report.merge_readiness.ai_gate_status === 'blocked' ? chalk.red : report.merge_readiness.ai_gate_status === 'warn' || report.merge_readiness.ai_gate_status === 'uncertain' ? chalk.yellow : chalk.green },
       ]));
       console.log(`${chalk.bold('Focus now:')} ${focusLine}`);
 

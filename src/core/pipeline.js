@@ -1424,7 +1424,8 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
     && status.counts.in_progress === 0
     && status.counts.done > 0
     && ciGateOk
-    && aiGate.status !== 'blocked';
+    && aiGate.status !== 'blocked'
+    && aiGate.status !== 'uncertain';
 
   const markdown = [
     `# PR Summary: ${status.title}`,
@@ -1534,7 +1535,7 @@ export async function buildPipelinePrSummary(db, repoRoot, pipelineId) {
       summary: ciGateOk ? 'Repo gate passed.' : 'Repo gate blocked by conflicts, unmanaged changes, or stale worktrees.',
     },
     ai_gate: {
-      ok: aiGate.status !== 'blocked',
+      ok: aiGate.status !== 'blocked' && aiGate.status !== 'uncertain',
       status: aiGate.status,
       summary: aiGate.summary,
     },

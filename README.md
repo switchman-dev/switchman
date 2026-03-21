@@ -91,7 +91,7 @@ Fastest path to success:
 2. Use `switchman start` for the shortest path
 3. Open one agent/editor window per generated workspace
 4. Keep `switchman status --watch` open in a separate terminal
-5. Run `switchman session-summary` after the first session to see what Switchman coordinated
+5. Run `switchman review` after the first session to see what Switchman coordinated
 6. Run `switchman gate ci && switchman queue run` when tasks finish
 
 If editor wiring feels off later, run `switchman verify-setup`. If you want to regenerate the repo-aware guide, run `switchman claude refresh`.
@@ -105,12 +105,30 @@ Editor setup guides:
 
 ---
 
-## Switchman Pro
+## Pricing
 
-> **Shared coordination depth · AI planning · 90-day history · $19/month**  
+### Free
+
+> **The complete individual experience**  
+> Same two-command flow: `switchman start "goal"` -> agents run -> `switchman review`
+
+Free is fully functional with no lobotomy. You can run unlimited local agents, coordinate a complex session, and get a merge recommendation forever without paying.
+
+**What's in Free:**
+
+- `switchman start` reads the repo, creates workspaces, writes MCP config, and generates `CLAUDE.md`
+- `switchman review` gives the full session summary, semantic overlap and interface mismatch detection, and a merge confidence outcome
+- `switchman status --watch` gives the live dashboard during a session
+- `switchman scan` gives a lightweight pre-merge conflict check
+- `switchman demo` proves the flow in a throwaway repo
+- Session history for 14 days
+
+### Pro
+
+> **90-day searchable history · cross-session insights · sharing · planning · $19/month**  
 > [switchman.dev/pro](https://switchman.dev/pro) · or run `switchman upgrade`
 
-Free now includes unlimited local agents, Slack notifications, read-only session summaries, and one shared cloud project for logged-in users. Pro adds deeper shared coordination, richer analysis, AI planning, and longer audit history.
+Pro starts where the buying moment starts: you want the session summary back after the free window is gone, and you want Switchman to learn from how your repo behaves over time.
 
 ```bash
 switchman upgrade        # open switchman.dev/pro
@@ -120,10 +138,12 @@ switchman login --status # check your plan
 
 **What's in Pro:**
 
-- Deeper shared cloud coordination across machines
+- 90-day searchable session history
+- Cross-session pattern detection and repo insights
+- Team session sharing — `switchman review --share` to publish a review, `switchman review --team` to read teammate reviews before the PR
 - AI task planning — `switchman plan "Add authentication" --apply`, `switchman plan --issue 47`, and optionally `--comment` back to the issue or PR
-- Counterfactual session analysis
-- 90-day audit trail (free: 7 days)
+- Cost and token tracking over time — `switchman usage`, `switchman usage --days 30`, and `switchman usage record --session <id> ...`
+- Progressive codebase intelligence on the roadmap
 - Full team coordination beyond the free shared-project limit
 - Email support within 48 hours
 
@@ -149,6 +169,7 @@ Switchman adds:
 - **Live status** — see what's running, blocked, or stale
 - **Stale recovery** — abandoned work gets detected and requeued
 - **Governed landing** — finished work reaches `main` one item at a time with retries and policy checks
+- **Honest merge confidence** — green, amber, red, or uncertain when Switchman cannot make a trustworthy call
 
 Switchman is for the point where "we can manage this by hand" stops being true.
 

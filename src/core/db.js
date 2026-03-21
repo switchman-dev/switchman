@@ -14,7 +14,7 @@ const SWITCHMAN_DIR = '.switchman';
 const DB_FILE = 'switchman.db';
 const AUDIT_KEY_FILE = 'audit.key';
 const MIGRATION_STATE_FILE = 'migration-state.json';
-const CURRENT_SCHEMA_VERSION = 6;
+const CURRENT_SCHEMA_VERSION = 7;
 
 // How long (ms) a writer will wait for a lock before giving up.
 // 5 seconds is generous for a CLI tool with 3-10 concurrent agents.
@@ -543,6 +543,36 @@ function applySchemaVersion6(db) {
   `);
 }
 
+function applySchemaVersion7(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS usage_events (
+      id                TEXT PRIMARY KEY,
+      session_id        TEXT NOT NULL,
+      task_id           TEXT,
+      lease_id          TEXT,
+      worktree          TEXT,
+      agent             TEXT,
+      provider          TEXT,
+      model             TEXT,
+      prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens      INTEGER NOT NULL DEFAULT 0,
+      cost_usd          REAL NOT NULL DEFAULT 0,
+      source            TEXT NOT NULL DEFAULT 'manual',
+      details           TEXT,
+      created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL,
+      FOREIGN KEY(lease_id) REFERENCES leases(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_usage_events_created_at ON usage_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_session_id ON usage_events(session_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_agent ON usage_events(agent, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_task_id ON usage_events(task_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events(model, created_at);
+  `);
+}
+
 function ensureSchemaMigrated(db) {
   const repoRoot = db.__switchmanRepoRoot;
   if (!repoRoot) {
@@ -593,6 +623,9 @@ function ensureSchemaMigrated(db) {
       }
       if (currentVersion < 6) {
         applySchemaVersion6(db);
+      }
+      if (currentVersion < 7) {
+        applySchemaVersion7(db);
       }
       setSchemaVersion(db, CURRENT_SCHEMA_VERSION);
     });
@@ -923,6 +956,19 @@ function getActiveLeaseForTaskTx(db, taskId) {
   `).get(taskId);
 }
 
+function getMostRecentLeaseForTaskTx(db, taskId) {
+  return db.prepare(`
+    SELECT *
+    FROM leases
+    WHERE task_id=?
+    ORDER BY
+      CASE status WHEN 'active' THEN 0 ELSE 1 END ASC,
+      datetime(COALESCE(finished_at, heartbeat_at, started_at)) DESC,
+      id DESC
+    LIMIT 1
+  `).get(taskId);
+}
+
 function createLeaseTx(db, { id, taskId, worktree, agent, status = 'active', failureReason = null }) {
   const leaseId = id || makeId('lease');
   db.prepare(`
@@ -992,6 +1038,72 @@ function logAuditEventTx(db, { eventType, status = 'info', reasonCode = null, wo
     entryHash,
     signature,
   );
+}
+
+function normalizeUsageInteger(value, fieldName) {
+  if (value == null || value === '') return 0;
+  const normalized = Number.parseInt(value, 10);
+  if (!Number.isFinite(normalized) || normalized < 0) {
+    throw new Error(`${fieldName} must be a non-negative integer.`);
+  }
+  return normalized;
+}
+
+function normalizeUsageFloat(value, fieldName) {
+  if (value == null || value === '') return 0;
+  const normalized = Number.parseFloat(value);
+  if (!Number.isFinite(normalized) || normalized < 0) {
+    throw new Error(`${fieldName} must be a non-negative number.`);
+  }
+  return Number(normalized.toFixed(6));
+}
+
+function normalizeUsageText(value) {
+  const normalized = String(value || '').trim();
+  return normalized ? normalized : null;
+}
+
+function normalizeUsageDetails(details = null) {
+  if (details == null) return null;
+  if (typeof details === 'string') return details;
+  return JSON.stringify(details);
+}
+
+function resolveUsageContextTx(db, payload = {}) {
+  const taskId = normalizeUsageText(payload.taskId);
+  const leaseId = normalizeUsageText(payload.leaseId);
+  const task = taskId ? getTaskTx(db, taskId) : null;
+  const lease = leaseId
+    ? getLeaseTx(db, leaseId)
+    : taskId
+      ? getMostRecentLeaseForTaskTx(db, taskId)
+      : null;
+  const promptTokens = normalizeUsageInteger(payload.promptTokens, 'prompt tokens');
+  const completionTokens = normalizeUsageInteger(payload.completionTokens, 'completion tokens');
+  const totalTokens = Math.max(
+    normalizeUsageInteger(payload.totalTokens, 'total tokens'),
+    promptTokens + completionTokens,
+  );
+  const costUsd = normalizeUsageFloat(payload.costUsd, 'cost usd');
+  const sessionId = normalizeUsageText(payload.sessionId)
+    || (taskId ? `task:${taskId}` : leaseId ? `lease:${leaseId}` : 'standalone');
+
+  return {
+    id: normalizeUsageText(payload.id) || makeId('usage'),
+    sessionId,
+    taskId,
+    leaseId: lease?.id || leaseId || null,
+    worktree: normalizeUsageText(payload.worktree) || lease?.worktree || task?.worktree || null,
+    agent: normalizeUsageText(payload.agent) || lease?.agent || task?.agent || null,
+    provider: normalizeUsageText(payload.provider),
+    model: normalizeUsageText(payload.model),
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    costUsd,
+    source: normalizeUsageText(payload.source) || 'manual',
+    details: normalizeUsageDetails(payload.details),
+  };
 }
 
 function migrateLegacyAuditLog(db) {
@@ -2666,6 +2778,101 @@ export function getActiveLeaseForTask(db, taskId) {
   return lease ? getLease(db, lease.id) : null;
 }
 
+export function recordUsageEvent(db, payload = {}) {
+  return withImmediateTransaction(db, () => {
+    const normalized = resolveUsageContextTx(db, payload);
+    db.prepare(`
+      INSERT INTO usage_events (
+        id,
+        session_id,
+        task_id,
+        lease_id,
+        worktree,
+        agent,
+        provider,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cost_usd,
+        source,
+        details
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalized.id,
+      normalized.sessionId,
+      normalized.taskId,
+      normalized.leaseId,
+      normalized.worktree,
+      normalized.agent,
+      normalized.provider,
+      normalized.model,
+      normalized.promptTokens,
+      normalized.completionTokens,
+      normalized.totalTokens,
+      normalized.costUsd,
+      normalized.source,
+      normalized.details,
+    );
+
+    return db.prepare(`
+      SELECT *
+      FROM usage_events
+      WHERE id=?
+      LIMIT 1
+    `).get(normalized.id);
+  });
+}
+
+export function listUsageEvents(db, {
+  days = null,
+  sessionId = null,
+  agent = null,
+  taskId = null,
+  limit = 500,
+} = {}) {
+  const clauses = [];
+  const params = [];
+
+  if (days != null) {
+    clauses.push(`created_at >= datetime('now', ?)`);
+    params.push(`-${Math.max(1, Number.parseInt(days, 10) || 1)} days`);
+  }
+  if (sessionId) {
+    clauses.push(`session_id=?`);
+    params.push(sessionId);
+  }
+  if (agent) {
+    clauses.push(`agent=?`);
+    params.push(agent);
+  }
+  if (taskId) {
+    clauses.push(`task_id=?`);
+    params.push(taskId);
+  }
+
+  const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const rows = db.prepare(`
+    SELECT *
+    FROM usage_events
+    ${whereClause}
+    ORDER BY datetime(created_at) DESC, id DESC
+    LIMIT ?
+  `).all(...params, Math.max(1, Number.parseInt(limit, 10) || 500));
+
+  return rows.map((row) => ({
+    ...row,
+    details: row.details ? (() => {
+      try {
+        return JSON.parse(row.details);
+      } catch {
+        return {};
+      }
+    })() : {},
+  }));
+}
+
 export function heartbeatLease(db, leaseId, agent) {
   const result = db.prepare(`
     UPDATE leases
@@ -2794,6 +3001,11 @@ export function pruneDatabaseMaintenance(db, { retentionDays = DB_PRUNE_RETENTIO
         AND finished_at <= datetime('now', ?)
     `).run(retentionWindow).changes;
 
+    const usageEvents = db.prepare(`
+      DELETE FROM usage_events
+      WHERE created_at <= datetime('now', ?)
+    `).run(retentionWindow).changes;
+
     const orphanedSnapshots = db.prepare(`
       DELETE FROM worktree_snapshots
       WHERE worktree NOT IN (
@@ -2805,6 +3017,7 @@ export function pruneDatabaseMaintenance(db, { retentionDays = DB_PRUNE_RETENTIO
       released_claims_pruned: releasedClaims,
       finished_leases_pruned: finishedLeases,
       released_scope_reservations_pruned: releasedReservations,
+      usage_events_pruned: usageEvents,
       orphaned_snapshots_pruned: orphanedSnapshots,
     };
   });

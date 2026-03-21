@@ -31,8 +31,8 @@ const VALIDATE_URL      = `${SUPABASE_URL}/functions/v1/validate-licence`;
 const AUTH_URL          = `${SUPABASE_URL}/auth/v1`;
 const PRO_PAGE_URL      = 'https://switchman.dev/pro';
 
-const FREE_AGENT_LIMIT  = 3;
-const FREE_RETENTION_DAYS = 7;
+const FREE_AGENT_LIMIT  = Number.POSITIVE_INFINITY;
+const FREE_RETENTION_DAYS = 14;
 const PRO_RETENTION_DAYS = 90;
 const FREE_CLOUD_PROJECT_LIMIT = 1;
 const CACHE_TTL_MS      = 24 * 60 * 60 * 1000;   // 24 hours

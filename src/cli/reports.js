@@ -17,6 +17,7 @@ import {
   listMergeQueueEvents,
   listScopeReservations,
   listTasks,
+  listUsageEvents,
   openDb,
   pruneDatabaseMaintenance,
   reapStaleLeases,
@@ -987,10 +988,14 @@ export function buildDoctorReport({ db, repoRoot, tasks, activeLeases, staleLeas
     })),
   ];
 
-  if (aiGate.status === 'warn' || aiGate.status === 'blocked') {
+  if (aiGate.status === 'warn' || aiGate.status === 'blocked' || aiGate.status === 'uncertain') {
     attention.push({
       kind: 'ai_merge_gate',
-      title: aiGate.status === 'blocked' ? 'AI merge gate blocked the repo' : 'AI merge gate wants manual review',
+      title: aiGate.status === 'blocked'
+        ? 'AI merge gate blocked the repo'
+        : aiGate.status === 'uncertain'
+          ? 'AI merge gate could not determine merge confidence'
+          : 'AI merge gate wants manual review',
       detail: aiGate.summary,
       next_step: 'run `switchman gate ai` and review the risky worktree pairs',
       command: 'switchman gate ai',
@@ -1322,40 +1327,624 @@ export async function buildSessionSummary(repoRoot, { hours = 8 } = {}) {
     const queueEvents = queueItems
       .flatMap((item) => listMergeQueueEvents(db, item.id, { limit: 50 }).map((event) => ({ ...event, item })))
       .filter((event) => isRecent(event.created_at));
-
-    const metrics = {
-      tasks_completed: auditEvents.filter((event) => event.event_type === 'task_completed').length,
-      retries_scheduled: auditEvents.filter((event) => event.event_type === 'task_retried' || event.event_type === 'pipeline_task_retry_scheduled').length,
-      rogue_writes_blocked: auditEvents.filter((event) => event.event_type === 'write_observed' && event.status === 'denied').length,
-      queue_merges_completed: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && event.status === 'merged').length,
-      queue_blocks_avoided: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && ['blocked', 'retrying', 'wave_blocked', 'escalated', 'held'].includes(event.status)).length,
-    };
-
-    const isProDepth = retentionDays > FREE_RETENTION_DAYS;
-    const estimatedMinutesSaved = isProDepth
-      ? (
-        metrics.rogue_writes_blocked * 12 +
-        metrics.retries_scheduled * 10 +
-        metrics.queue_blocks_avoided * 8 +
-        metrics.queue_merges_completed * 4
-      )
-      : 0;
+    const summary = summarizeSessionWindow(auditEvents, queueEvents, {
+      hours: Math.max(1, Number(hours) || 8),
+      retentionDays,
+    });
 
     return {
       generated_at: new Date().toISOString(),
       hours: Math.max(1, Number(hours) || 8),
       retention_days: retentionDays,
-      metrics,
-      estimated_minutes_saved: estimatedMinutesSaved,
+      metrics: summary.metrics,
+      merge_confidence: summary.merge_confidence,
+      narrative: summary.narrative,
+      estimated_minutes_saved: summary.estimated_minutes_saved,
       upgrade_cta: null,
-      counterfactual_depth: isProDepth ? 'full' : 'read_only',
-      depth_hint: !isProDepth
+      counterfactual_depth: summary.counterfactual_depth,
+      depth_hint: summary.depth_hint,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function summarizeSessionWindow(auditEvents = [], queueEvents = [], { hours = null, retentionDays = FREE_RETENTION_DAYS } = {}) {
+  const metrics = {
+    tasks_completed: auditEvents.filter((event) => event.event_type === 'task_completed').length,
+    retries_scheduled: auditEvents.filter((event) => event.event_type === 'task_retried' || event.event_type === 'pipeline_task_retry_scheduled').length,
+    rogue_writes_blocked: auditEvents.filter((event) => event.event_type === 'write_observed' && event.status === 'denied').length,
+    queue_merges_completed: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && event.status === 'merged').length,
+    queue_blocks_avoided: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && ['blocked', 'retrying', 'wave_blocked', 'escalated', 'held'].includes(event.status)).length,
+  };
+
+  const aiGateEvents = auditEvents.filter((event) => event.event_type === 'ai_merge_gate');
+  const hasBlocked = aiGateEvents.some((event) => {
+    const details = parseEventDetails(event.details);
+    return details.status === 'blocked' || event.status === 'denied';
+  });
+  const hasUncertain = aiGateEvents.some((event) => {
+    const details = parseEventDetails(event.details);
+    return details.status === 'uncertain';
+  });
+  const hasWarn = aiGateEvents.some((event) => {
+    const details = parseEventDetails(event.details);
+    return details.status === 'warn' || event.status === 'warn';
+  });
+  const mergeConfidence = hasBlocked
+    ? 'red'
+    : hasUncertain
+      ? 'uncertain'
+      : hasWarn
+        ? 'amber'
+        : metrics.tasks_completed > 0 || metrics.queue_merges_completed > 0
+          ? 'green'
+          : 'uncertain';
+
+  const isProDepth = retentionDays > FREE_RETENTION_DAYS;
+  const estimatedMinutesSaved = isProDepth
+    ? (
+      metrics.rogue_writes_blocked * 12 +
+      metrics.retries_scheduled * 10 +
+      metrics.queue_blocks_avoided * 8 +
+      metrics.queue_merges_completed * 4
+    )
+    : 0;
+  const windowText = hours == null
+    ? 'in that session.'
+    : `in the last ${hours} hour${hours === 1 ? '' : 's'}.`;
+  const narrativeParts = [
+    metrics.tasks_completed > 0
+      ? `Completed ${metrics.tasks_completed} task${metrics.tasks_completed === 1 ? '' : 's'} ${windowText}`
+      : `No task completions were recorded ${windowText}`,
+    metrics.rogue_writes_blocked > 0
+      ? `Switchman blocked ${metrics.rogue_writes_blocked} rogue write${metrics.rogue_writes_blocked === 1 ? '' : 's'} before they spread.`
+      : null,
+    metrics.retries_scheduled > 0
+      ? `It scheduled ${metrics.retries_scheduled} retry or recovery handoff${metrics.retries_scheduled === 1 ? '' : 's'}.`
+      : null,
+    metrics.queue_blocks_avoided > 0
+      ? `It caught ${metrics.queue_blocks_avoided} risky landing issue${metrics.queue_blocks_avoided === 1 ? '' : 's'} before merge.`
+      : null,
+    metrics.queue_merges_completed > 0
+      ? `It landed ${metrics.queue_merges_completed} merge${metrics.queue_merges_completed === 1 ? '' : 's'} cleanly.`
+      : null,
+    mergeConfidence === 'green'
+      ? 'Current merge confidence is green.'
+      : mergeConfidence === 'amber'
+        ? 'Current merge confidence is amber and deserves a careful review.'
+        : mergeConfidence === 'red'
+          ? 'Current merge confidence is red and should not be treated as merge-safe.'
+          : 'Current merge confidence is uncertain, so manual review is recommended.',
+  ].filter(Boolean);
+
+  return {
+    metrics,
+    merge_confidence: mergeConfidence,
+    narrative: narrativeParts.join(' '),
+    estimated_minutes_saved: estimatedMinutesSaved,
+    counterfactual_depth: isProDepth ? 'full' : 'read_only',
+    depth_hint: !isProDepth
         ? {
           title: 'Want deeper counterfactual analysis?',
           command: 'switchman upgrade',
           detail: 'Pro adds richer counterfactual session analysis, longer history, and shared cloud coordination.',
         }
         : null,
+  };
+}
+
+function buildSessionHighlights(auditEvents = [], queueEvents = []) {
+  const highlights = new Set();
+  for (const event of auditEvents) {
+    if (event.task_id) highlights.add(String(event.task_id));
+    const details = parseEventDetails(event.details);
+    if (details.summary) highlights.add(String(details.summary));
+    if (Array.isArray(details.shared_areas)) {
+      for (const area of details.shared_areas.slice(0, 3)) {
+        if (typeof area === 'string') highlights.add(area);
+        else if (area?.name) highlights.add(area.name);
+      }
+    }
+  }
+  for (const event of queueEvents) {
+    if (event.item?.source_ref) highlights.add(String(event.item.source_ref));
+    if (event.item?.target_branch) highlights.add(String(event.item.target_branch));
+    if (event.details) highlights.add(String(event.details));
+  }
+  return [...highlights].filter(Boolean).slice(0, 4);
+}
+
+export async function buildSessionHistoryReport(repoRoot, { days = 90, search = null } = {}) {
+  const db = openDb(repoRoot);
+  try {
+    const retentionDays = await getRetentionDaysForCurrentPlan();
+    const effectiveDays = Math.max(1, Math.min(Number.parseInt(days, 10) || 90, retentionDays));
+    const sinceTimestamp = Date.now() - effectiveDays * 24 * 60 * 60 * 1000;
+    const isRecent = (isoString) => {
+      const timestamp = new Date(isoString || '').getTime();
+      return !Number.isNaN(timestamp) && timestamp >= sinceTimestamp;
+    };
+
+    const auditEvents = listAuditEvents(db, { limit: 10000 }).filter((event) => isRecent(event.created_at));
+    const queueItems = listMergeQueue(db);
+    const queueEvents = queueItems
+      .flatMap((item) => listMergeQueueEvents(db, item.id, { limit: 100 }).map((event) => ({ ...event, item })))
+      .filter((event) => isRecent(event.created_at));
+
+    const timeline = [
+      ...auditEvents.map((event) => ({ kind: 'audit', created_at: event.created_at, payload: event })),
+      ...queueEvents.map((event) => ({ kind: 'queue', created_at: event.created_at, payload: event })),
+    ].sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')));
+
+    const sessions = [];
+    const gapMs = 6 * 60 * 60 * 1000;
+    let current = null;
+
+    for (const entry of timeline) {
+      const timestamp = new Date(entry.created_at || '').getTime();
+      if (!current || Number.isNaN(timestamp) || (current.last_timestamp != null && timestamp - current.last_timestamp > gapMs)) {
+        current = {
+          first_timestamp: timestamp,
+          last_timestamp: timestamp,
+          audit_events: [],
+          queue_events: [],
+        };
+        sessions.push(current);
+      }
+      current.last_timestamp = Number.isNaN(timestamp) ? current.last_timestamp : timestamp;
+      if (entry.kind === 'audit') current.audit_events.push(entry.payload);
+      else current.queue_events.push(entry.payload);
+    }
+
+    const normalizedSearch = String(search || '').trim().toLowerCase();
+    const history = sessions.map((session, index) => {
+      const startedAt = session.audit_events[0]?.created_at || session.queue_events[0]?.created_at || null;
+      const endedAt = [...session.audit_events, ...session.queue_events]
+        .map((event) => event.created_at || null)
+        .filter(Boolean)
+        .sort()
+        .slice(-1)[0] || startedAt;
+      const summary = summarizeSessionWindow(session.audit_events, session.queue_events, {
+        hours: null,
+        retentionDays,
+      });
+      const highlights = buildSessionHighlights(session.audit_events, session.queue_events);
+      const narrative = highlights.length > 0
+        ? `${summary.narrative} Highlights: ${highlights.join('; ')}.`
+        : summary.narrative;
+      const searchBlob = [
+        narrative,
+        summary.merge_confidence,
+        ...session.audit_events.map((event) => [event.event_type, event.task_id, event.reason_code, event.details].filter(Boolean).join(' ')),
+        ...session.queue_events.map((event) => [event.event_type, event.status, event.details, event.item?.source_ref].filter(Boolean).join(' ')),
+      ].join(' ').toLowerCase();
+      return {
+        id: `session-${String(index + 1).padStart(3, '0')}`,
+        started_at: startedAt,
+        ended_at: endedAt,
+        audit_event_count: session.audit_events.length,
+        queue_event_count: session.queue_events.length,
+        metrics: summary.metrics,
+        merge_confidence: summary.merge_confidence,
+        narrative,
+        highlights,
+        estimated_minutes_saved: summary.estimated_minutes_saved,
+        matched_search: normalizedSearch ? searchBlob.includes(normalizedSearch) : true,
+      };
+    }).filter((session) => session.matched_search)
+      .sort((a, b) => String(b.started_at || '').localeCompare(String(a.started_at || '')));
+
+    return {
+      generated_at: new Date().toISOString(),
+      repo_root: repoRoot,
+      retention_days: retentionDays,
+      days_analyzed: effectiveDays,
+      search: normalizedSearch || null,
+      sessions: history,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+export function buildTeamReviewShareReport(events = []) {
+  return events
+    .map((event) => {
+      const shared = event.payload?.review || {};
+      return {
+        user_id: event.user_id || null,
+        email: event.payload?.email || 'unknown teammate',
+        worktree: event.worktree || null,
+        shared_at: event.created_at || event.payload?.synced_at || null,
+        merge_confidence: shared.merge_confidence || 'uncertain',
+        hours: shared.hours || null,
+        metrics: shared.metrics || {},
+        narrative: shared.narrative || 'No shared review narrative available.',
+      };
+    })
+    .sort((a, b) =>
+      String(b.shared_at || '').localeCompare(String(a.shared_at || ''))
+      || String(a.email).localeCompare(String(b.email)));
+}
+
+function normalizeInsightKey(value) {
+  return String(value || '').trim();
+}
+
+function pushInsight(map, {
+  key,
+  kind,
+  label = null,
+  severity = 'warn',
+  createdAt = null,
+  source = null,
+}) {
+  const normalizedKey = normalizeInsightKey(key);
+  if (!normalizedKey) return;
+  const compositeKey = `${kind}:${normalizedKey}`;
+  const existing = map.get(compositeKey) || {
+    key: normalizedKey,
+    kind,
+    label: label || normalizedKey,
+    observations: 0,
+    warn_count: 0,
+    blocked_count: 0,
+    uncertain_count: 0,
+    sources: new Set(),
+    last_seen: null,
+    score: 0,
+  };
+  existing.observations += 1;
+  if (severity === 'blocked') existing.blocked_count += 1;
+  else if (severity === 'uncertain') existing.uncertain_count += 1;
+  else existing.warn_count += 1;
+  if (createdAt && (!existing.last_seen || String(createdAt) > String(existing.last_seen))) {
+    existing.last_seen = createdAt;
+  }
+  if (source) existing.sources.add(source);
+  existing.score = (existing.blocked_count * 4) + (existing.uncertain_count * 3) + (existing.warn_count * 2);
+  map.set(compositeKey, existing);
+}
+
+function finalizeInsights(map) {
+  return [...map.values()]
+    .map((entry) => ({
+      key: entry.key,
+      kind: entry.kind,
+      label: entry.label,
+      observations: entry.observations,
+      warn_count: entry.warn_count,
+      blocked_count: entry.blocked_count,
+      uncertain_count: entry.uncertain_count,
+      score: entry.score,
+      last_seen: entry.last_seen,
+      sources: [...entry.sources].sort(),
+    }))
+    .sort((a, b) =>
+      b.score - a.score
+      || b.observations - a.observations
+      || String(b.last_seen || '').localeCompare(String(a.last_seen || ''))
+      || String(a.label).localeCompare(String(b.label)));
+}
+
+export async function buildInsightsReport(repoRoot, { days = 90 } = {}) {
+  const db = openDb(repoRoot);
+  try {
+    const retentionDays = await getRetentionDaysForCurrentPlan();
+    const effectiveDays = Math.max(1, Math.min(Number.parseInt(days, 10) || 90, retentionDays));
+    const since = Date.now() - effectiveDays * 24 * 60 * 60 * 1000;
+    const isRecent = (isoString) => {
+      const timestamp = new Date(isoString || '').getTime();
+      return !Number.isNaN(timestamp) && timestamp >= since;
+    };
+
+    const auditEvents = listAuditEvents(db, { limit: 5000 }).filter((event) => isRecent(event.created_at));
+    const aiGateEvents = auditEvents.filter((event) => event.event_type === 'ai_merge_gate');
+    const invalidationEvents = auditEvents.filter((event) => event.event_type === 'dependency_invalidations_updated');
+    const boundaryEvents = auditEvents.filter((event) => event.event_type === 'boundary_validation_state' && event.status !== 'allowed');
+
+    const hotspots = new Map();
+    const signalCounts = {
+      ai_gate_warn: 0,
+      ai_gate_blocked: 0,
+      ai_gate_uncertain: 0,
+      dependency_invalidations: invalidationEvents.length,
+      boundary_validation_pending: boundaryEvents.length,
+    };
+
+    for (const event of aiGateEvents) {
+      const details = parseEventDetails(event.details);
+      const status = details.status || (event.status === 'denied' ? 'blocked' : event.status === 'warn' ? 'warn' : 'pass');
+      if (status === 'warn') signalCounts.ai_gate_warn += 1;
+      if (status === 'blocked') signalCounts.ai_gate_blocked += 1;
+      if (status === 'uncertain') signalCounts.ai_gate_uncertain += 1;
+      if (!['warn', 'blocked', 'uncertain'].includes(status)) continue;
+
+      for (const area of details.shared_areas || []) {
+        const label = typeof area === 'string' ? area : area?.name;
+        pushInsight(hotspots, {
+          key: label,
+          kind: 'area',
+          label,
+          severity: status,
+          createdAt: event.created_at,
+          source: 'ai_merge_gate',
+        });
+      }
+
+      for (const tag of details.shared_risk_tags || []) {
+        const label = typeof tag === 'string' ? tag : tag?.name;
+        pushInsight(hotspots, {
+          key: label,
+          kind: 'risk_tag',
+          label,
+          severity: status,
+          createdAt: event.created_at,
+          source: 'ai_merge_gate',
+        });
+      }
+    }
+
+    for (const event of invalidationEvents) {
+      const details = parseEventDetails(event.details);
+      for (const reasonType of details.reason_types || []) {
+        pushInsight(hotspots, {
+          key: reasonType,
+          kind: 'reason_type',
+          label: reasonType.replace(/_/g, ' '),
+          severity: 'warn',
+          createdAt: event.created_at,
+          source: 'dependency_invalidations_updated',
+        });
+      }
+      for (const revalidationSet of details.revalidation_sets || []) {
+        pushInsight(hotspots, {
+          key: revalidationSet,
+          kind: 'revalidation_set',
+          label: revalidationSet.replace(/_/g, ' '),
+          severity: 'warn',
+          createdAt: event.created_at,
+          source: 'dependency_invalidations_updated',
+        });
+      }
+    }
+
+    for (const event of boundaryEvents) {
+      const details = parseEventDetails(event.details);
+      const severity = event.status === 'denied' ? 'blocked' : 'warn';
+      for (const missingTaskType of details.missing_task_types || []) {
+        pushInsight(hotspots, {
+          key: missingTaskType,
+          kind: 'validation_gap',
+          label: missingTaskType,
+          severity,
+          createdAt: event.created_at,
+          source: 'boundary_validation_state',
+        });
+      }
+    }
+
+    const recurringHotspots = finalizeInsights(hotspots).slice(0, 8);
+    const recommendation = recurringHotspots[0]
+      ? recurringHotspots[0].kind === 'area'
+        ? `Tasks touching ${recurringHotspots[0].label} keep surfacing amber-or-worse review signals. Split that area more narrowly or serialize work there.`
+        : recurringHotspots[0].kind === 'risk_tag'
+          ? `${recurringHotspots[0].label} work keeps surfacing amber-or-worse review signals. Add stronger validation or smaller task boundaries there.`
+          : `${recurringHotspots[0].label} keeps recurring in review signals. Tighten the task structure or follow-up validation around it.`
+      : 'No recurring amber patterns detected yet.';
+
+    return {
+      generated_at: new Date().toISOString(),
+      repo_root: repoRoot,
+      retention_days: retentionDays,
+      days_analyzed: effectiveDays,
+      event_counts: {
+        audit_events: auditEvents.length,
+        ai_merge_gate_events: aiGateEvents.length,
+        dependency_invalidation_events: invalidationEvents.length,
+        boundary_validation_events: boundaryEvents.length,
+      },
+      signal_counts: signalCounts,
+      recurring_hotspots: recurringHotspots,
+      recommendation,
+      depth_hint: retentionDays <= FREE_RETENTION_DAYS
+        ? {
+          title: 'Want deeper pattern detection?',
+          command: 'switchman upgrade',
+          detail: 'Pro extends the history window so recurring repo patterns have more time to become obvious.',
+        }
+        : null,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+export async function buildUsageReport(repoRoot, {
+  days = 90,
+  sessionId = null,
+  agent = null,
+  taskId = null,
+} = {}) {
+  const db = openDb(repoRoot);
+  try {
+    const retentionDays = await getRetentionDaysForCurrentPlan();
+    const effectiveDays = Math.max(1, Math.min(Number.parseInt(days, 10) || 90, retentionDays));
+    pruneDatabaseMaintenance(db, { retentionDays });
+    const events = listUsageEvents(db, {
+      days: effectiveDays,
+      sessionId,
+      agent,
+      taskId,
+      limit: 5000,
+    });
+
+    const sessionMap = new Map();
+    const agentMap = new Map();
+    const modelMap = new Map();
+    const providerMap = new Map();
+    const totals = {
+      events: events.length,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+      cost_usd: 0,
+    };
+
+    for (const event of events) {
+      totals.prompt_tokens += Number(event.prompt_tokens || 0);
+      totals.completion_tokens += Number(event.completion_tokens || 0);
+      totals.total_tokens += Number(event.total_tokens || 0);
+      totals.cost_usd += Number(event.cost_usd || 0);
+
+      const sessionKey = event.session_id || 'standalone';
+      if (!sessionMap.has(sessionKey)) {
+        sessionMap.set(sessionKey, {
+          session_id: sessionKey,
+          event_count: 0,
+          task_ids: new Set(),
+          agents: new Set(),
+          worktrees: new Set(),
+          models: new Set(),
+          providers: new Set(),
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0,
+          cost_usd: 0,
+          first_seen_at: event.created_at,
+          last_seen_at: event.created_at,
+        });
+      }
+      const sessionEntry = sessionMap.get(sessionKey);
+      sessionEntry.event_count += 1;
+      if (event.task_id) sessionEntry.task_ids.add(event.task_id);
+      if (event.agent) sessionEntry.agents.add(event.agent);
+      if (event.worktree) sessionEntry.worktrees.add(event.worktree);
+      if (event.model) sessionEntry.models.add(event.model);
+      if (event.provider) sessionEntry.providers.add(event.provider);
+      sessionEntry.prompt_tokens += Number(event.prompt_tokens || 0);
+      sessionEntry.completion_tokens += Number(event.completion_tokens || 0);
+      sessionEntry.total_tokens += Number(event.total_tokens || 0);
+      sessionEntry.cost_usd += Number(event.cost_usd || 0);
+      if (String(event.created_at || '') < String(sessionEntry.first_seen_at || '')) sessionEntry.first_seen_at = event.created_at;
+      if (String(event.created_at || '') > String(sessionEntry.last_seen_at || '')) sessionEntry.last_seen_at = event.created_at;
+
+      const agentKey = event.agent || 'unknown';
+      if (!agentMap.has(agentKey)) {
+        agentMap.set(agentKey, {
+          agent: agentKey,
+          event_count: 0,
+          sessions: new Set(),
+          task_ids: new Set(),
+          models: new Set(),
+          total_tokens: 0,
+          cost_usd: 0,
+          last_seen_at: event.created_at,
+        });
+      }
+      const agentEntry = agentMap.get(agentKey);
+      agentEntry.event_count += 1;
+      agentEntry.sessions.add(sessionKey);
+      if (event.task_id) agentEntry.task_ids.add(event.task_id);
+      if (event.model) agentEntry.models.add(event.model);
+      agentEntry.total_tokens += Number(event.total_tokens || 0);
+      agentEntry.cost_usd += Number(event.cost_usd || 0);
+      if (String(event.created_at || '') > String(agentEntry.last_seen_at || '')) agentEntry.last_seen_at = event.created_at;
+
+      const modelKey = event.model || 'unknown';
+      if (!modelMap.has(modelKey)) {
+        modelMap.set(modelKey, {
+          model: modelKey,
+          event_count: 0,
+          total_tokens: 0,
+          cost_usd: 0,
+        });
+      }
+      const modelEntry = modelMap.get(modelKey);
+      modelEntry.event_count += 1;
+      modelEntry.total_tokens += Number(event.total_tokens || 0);
+      modelEntry.cost_usd += Number(event.cost_usd || 0);
+
+      const providerKey = event.provider || 'unknown';
+      if (!providerMap.has(providerKey)) {
+        providerMap.set(providerKey, {
+          provider: providerKey,
+          event_count: 0,
+          total_tokens: 0,
+          cost_usd: 0,
+        });
+      }
+      const providerEntry = providerMap.get(providerKey);
+      providerEntry.event_count += 1;
+      providerEntry.total_tokens += Number(event.total_tokens || 0);
+      providerEntry.cost_usd += Number(event.cost_usd || 0);
+    }
+
+    return {
+      generated_at: new Date().toISOString(),
+      repo_root: repoRoot,
+      retention_days: retentionDays,
+      days_analyzed: effectiveDays,
+      filters: {
+        session_id: sessionId || null,
+        agent: agent || null,
+        task_id: taskId || null,
+      },
+      totals: {
+        ...totals,
+        tracked_sessions: sessionMap.size,
+        tracked_agents: agentMap.size,
+        tracked_models: modelMap.size,
+      },
+      sessions: [...sessionMap.values()]
+        .map((entry) => ({
+          ...entry,
+          task_ids: [...entry.task_ids].sort(),
+          agents: [...entry.agents].sort(),
+          worktrees: [...entry.worktrees].sort(),
+          models: [...entry.models].sort(),
+          providers: [...entry.providers].sort(),
+          cost_usd: Number(entry.cost_usd.toFixed(6)),
+        }))
+        .sort((a, b) =>
+          b.total_tokens - a.total_tokens
+          || b.cost_usd - a.cost_usd
+          || String(b.last_seen_at || '').localeCompare(String(a.last_seen_at || ''))),
+      agents: [...agentMap.values()]
+        .map((entry) => ({
+          ...entry,
+          sessions: [...entry.sessions].sort(),
+          task_ids: [...entry.task_ids].sort(),
+          models: [...entry.models].sort(),
+          cost_usd: Number(entry.cost_usd.toFixed(6)),
+        }))
+        .sort((a, b) =>
+          b.total_tokens - a.total_tokens
+          || b.cost_usd - a.cost_usd
+          || String(a.agent).localeCompare(String(b.agent))),
+      models: [...modelMap.values()]
+        .map((entry) => ({
+          ...entry,
+          cost_usd: Number(entry.cost_usd.toFixed(6)),
+        }))
+        .sort((a, b) =>
+          b.total_tokens - a.total_tokens
+          || b.cost_usd - a.cost_usd
+          || String(a.model).localeCompare(String(b.model))),
+      providers: [...providerMap.values()]
+        .map((entry) => ({
+          ...entry,
+          cost_usd: Number(entry.cost_usd.toFixed(6)),
+        }))
+        .sort((a, b) =>
+          b.total_tokens - a.total_tokens
+          || b.cost_usd - a.cost_usd
+          || String(a.provider).localeCompare(String(b.provider))),
+      recent_events: events.slice(0, 12).map((event) => ({
+        ...event,
+        cost_usd: Number(Number(event.cost_usd || 0).toFixed(6)),
+      })),
     };
   } finally {
     db.close();

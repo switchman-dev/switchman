@@ -1,3 +1,68 @@
+function parseUsageNumber(value, parser) {
+  if (value == null || value === '') return null;
+  const parsed = parser(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function readTaskUsageFromEnv(source) {
+  const promptTokens = parseUsageNumber(process.env.SWITCHMAN_USAGE_PROMPT_TOKENS, (value) => Number.parseInt(value, 10));
+  const completionTokens = parseUsageNumber(process.env.SWITCHMAN_USAGE_COMPLETION_TOKENS, (value) => Number.parseInt(value, 10));
+  const totalTokens = parseUsageNumber(process.env.SWITCHMAN_USAGE_TOTAL_TOKENS, (value) => Number.parseInt(value, 10));
+  const costUsd = parseUsageNumber(process.env.SWITCHMAN_USAGE_COST_USD, (value) => Number.parseFloat(value));
+  const sessionId = String(process.env.SWITCHMAN_USAGE_SESSION_ID || '').trim() || null;
+  const provider = String(process.env.SWITCHMAN_USAGE_PROVIDER || '').trim() || null;
+  const model = String(process.env.SWITCHMAN_USAGE_MODEL || '').trim() || null;
+  const agent = String(process.env.SWITCHMAN_USAGE_AGENT || '').trim() || null;
+  const worktree = String(process.env.SWITCHMAN_USAGE_WORKTREE || '').trim() || null;
+
+  if ([promptTokens, completionTokens, totalTokens, costUsd].every((value) => value == null) && !provider && !model && !sessionId) {
+    return null;
+  }
+
+  return {
+    sessionId,
+    provider,
+    model,
+    agent,
+    worktree,
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    costUsd,
+    source,
+  };
+}
+
+async function maybeRecordTaskUsage({
+  checkLicence,
+  chalk,
+  getDb,
+  recordUsageEvent,
+  repoRoot,
+  taskId,
+  usageInput,
+}) {
+  if (!usageInput) return;
+
+  try {
+    const licence = await checkLicence();
+    if (!licence.valid) return;
+
+    const db = getDb(repoRoot);
+    try {
+      const event = recordUsageEvent(db, {
+        ...usageInput,
+        taskId,
+      });
+      console.log(chalk.dim(`  usage recorded: ${event.session_id} • ${Number(event.total_tokens || 0).toLocaleString()} tokens • $${Number(event.cost_usd || 0).toFixed(2)}`));
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.log(chalk.yellow(`  usage not recorded: ${err.message}`));
+  }
+}
+
 export function registerTaskCommands(program, {
   acquireNextTaskLeaseViaCoordination,
   analyzeTaskScope,
@@ -18,6 +83,7 @@ export function registerTaskCommands(program, {
   statusBadge,
   taskJsonWithLease,
   checkLicence,
+  recordUsageEvent,
 }) {
   const taskCmd = program.command('task').description('Manage the task list');
   taskCmd.addHelpText('after', `
@@ -179,6 +245,7 @@ Examples:
     .description('Mark a task as complete and release all file claims')
     .action(async (taskId) => {
       const repoRoot = getRepo();
+      const usageInput = readTaskUsageFromEnv('task_done');
       try {
         const { result } = await completeTaskViaCoordination(repoRoot, taskId);
         if (result?.status === 'already_done') {
@@ -198,6 +265,15 @@ Examples:
           return;
         }
         console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
+        await maybeRecordTaskUsage({
+          checkLicence,
+          chalk,
+          getDb,
+          recordUsageEvent,
+          repoRoot,
+          taskId,
+          usageInput,
+        });
         pushSyncEvent('task_done', { task_id: taskId }).catch(() => {});
         sendSwitchmanNotification({
           title: 'Agent finished a task',
@@ -215,8 +291,18 @@ Examples:
     .description('Mark a task as failed')
     .action(async (taskId, reason) => {
       const repoRoot = getRepo();
+      const usageInput = readTaskUsageFromEnv('task_fail');
       await failTaskViaCoordination(repoRoot, { taskId, reason });
       console.log(`${chalk.red('✗')} Task ${chalk.cyan(taskId)} marked failed`);
+      await maybeRecordTaskUsage({
+        checkLicence,
+        chalk,
+        getDb,
+        recordUsageEvent,
+        repoRoot,
+        taskId,
+        usageInput,
+      });
       pushSyncEvent('task_failed', { task_id: taskId, reason: reason || null }).catch(() => {});
       sendSwitchmanNotification({
         title: 'Agent hit a failed task',

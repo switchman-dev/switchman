@@ -40,7 +40,7 @@ import {
   finishOperationJournalEntry, listOperationJournal, listTempResources, updateTempResource,
   claimFiles, releaseFileClaims, getActiveFileClaims, checkFileConflicts, retryTask,
   upsertTaskSpec,
-  listAuditEvents, pruneDatabaseMaintenance, verifyAuditTrail,
+  listAuditEvents, pruneDatabaseMaintenance, recordUsageEvent, verifyAuditTrail,
   getLeaseExecutionContext, getActiveLeaseForTask,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
@@ -84,7 +84,7 @@ import {
 } from '../core/telemetry.js';
 import { checkLicence, clearCredentials, getRetentionDaysForCurrentPlan, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
 import { homedir } from 'os';
-import { cleanupOldSyncEvents, getPendingQueueStatus, pullActiveTeamMembers, pullTeamState, pushSyncEvent } from '../core/sync.js';
+import { cleanupOldSyncEvents, getPendingQueueStatus, pullActiveTeamMembers, pullTeamReviewShares, pullTeamState, pushSyncEvent } from '../core/sync.js';
 import { registerClaudeCommands } from './commands/claude.js';
 import { registerMcpCommands } from './commands/mcp.js';
 import { registerAuditCommands } from './commands/audit.js';
@@ -127,7 +127,11 @@ import {
   repairRepoState,
 } from './repair.js';
 import {
+  buildTeamReviewShareReport,
+  buildSessionHistoryReport,
+  buildInsightsReport,
   buildSessionSummary,
+  buildUsageReport,
   analyzeTaskScope,
   buildClaimExplainReport,
   buildDoctorReport,
@@ -733,7 +737,8 @@ async function runDemoScenario({ repoPath = null, cleanup = false } = {}) {
           && gateReport.fileConflicts.length === 0
           && gateReport.unclaimedChanges.length === 0
           && gateReport.complianceSummary.non_compliant === 0
-          && aiGate.status !== 'blocked',
+          && aiGate.status !== 'blocked'
+          && aiGate.status !== 'uncertain',
         ai_gate_status: aiGate.status,
       },
       next_steps: [
@@ -1134,7 +1139,9 @@ const ROOT_HELP_COMMANDS = new Set([
   'plan',
   'task',
   'status',
-  'session-summary',
+  'insights',
+  'usage',
+  'review',
   'recover',
   'merge',
   'scheduler',
@@ -1156,7 +1163,9 @@ Start here:
   switchman setup --agents 3
   switchman task add "Your task" --priority 8
   switchman status --watch
-  switchman session-summary
+  switchman insights
+  switchman usage                 (Pro)
+  switchman review
   switchman recover
   switchman scheduler status
   switchman gate ci && switchman queue run
@@ -1169,7 +1178,9 @@ For you (the operator):
   switchman claude refresh
   switchman task add
   switchman status
-  switchman session-summary
+  switchman insights
+  switchman usage                 (Pro)
+  switchman review
   switchman recover
   switchman scheduler status
   switchman merge
@@ -1931,6 +1942,7 @@ registerTaskCommands(program, {
   listTasksViaCoordination,
   printErrorWithNext,
   pushSyncEvent,
+  recordUsageEvent,
   sendSwitchmanNotification,
   retryStaleTasks,
   retryTaskViaCoordination,
@@ -2682,11 +2694,16 @@ program
   });
 
 registerOperatorCommands(program, {
+  buildInsightsReport,
+  buildSessionHistoryReport,
   buildSessionSummary,
+  buildTeamReviewShareReport,
+  buildUsageReport,
   buildDoctorReport,
   buildRecoverReport,
   buildWatchSignature,
   chalk,
+  checkLicence,
   collectStatusSnapshot,
   colorForHealth,
   formatClockTime,
@@ -2702,9 +2719,13 @@ registerOperatorCommands(program, {
   printErrorWithNext,
   printRecoverSummary,
   printRepairSummary,
+  pushSyncEvent,
+  PRO_PAGE_URL,
   pullActiveTeamMembers,
+  pullTeamReviewShares,
   pullTeamState,
   readCredentials,
+  recordUsageEvent,
   recoverWorkViaCoordination,
   renderChip,
   renderLiveWatchDashboard,

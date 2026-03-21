@@ -101,6 +101,7 @@ Examples:
         && report.complianceSummary.non_compliant === 0
         && report.complianceSummary.stale === 0
         && aiGate.status !== 'blocked'
+        && aiGate.status !== 'uncertain'
         && (aiGate.dependency_invalidations?.filter((item) => item.severity === 'blocked').length || 0) === 0;
 
       const result = {
@@ -221,6 +222,8 @@ Examples:
           ? chalk.green('PASS')
           : result.status === 'warn'
             ? chalk.yellow('WARN')
+            : result.status === 'uncertain'
+              ? chalk.yellow('UNCERTAIN')
             : chalk.red('BLOCK');
         console.log(`${badge} ${result.summary}`);
 
@@ -271,7 +274,7 @@ Examples:
         }
       }
 
-      if (result.status === 'blocked') process.exitCode = 1;
+      if (result.status !== 'pass') process.exitCode = 1;
     });
 
   return gateCmd;

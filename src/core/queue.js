@@ -107,6 +107,7 @@ export async function evaluateQueueRepoGate(db, repoRoot) {
     && report.complianceSummary.non_compliant === 0
     && report.complianceSummary.stale === 0
     && aiGate.status !== 'blocked'
+    && aiGate.status !== 'uncertain'
     && (aiGate.dependency_invalidations?.filter((item) => item.severity === 'blocked').length || 0) === 0;
 
   return {

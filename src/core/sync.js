@@ -347,24 +347,7 @@ export async function pushSyncEvent(eventType, payload, { worktree = null, repoR
  */
 export async function pullTeamState() {
   try {
-    const scope = await resolveSyncScope(process.cwd());
-    if (!scope.ok) return [];
-
-    await flushQueue(scope.accessToken).catch(() => {});
-
-    const since = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-
-    const res = await fetchWithTimeout(
-      `${SUPABASE_URL}/rest/v1/sync_state` +
-      `?team_id=eq.${scope.teamId}` +
-      `&created_at=gte.${since}` +
-      `&order=created_at.desc` +
-      `&limit=50`,
-      { headers: getHeaders(scope.accessToken) }
-    );
-
-    if (!res.ok) return [];
-    return await res.json();
+    return await fetchTeamSyncEvents({ minutes: 5, limit: 50 });
   } catch {
     return [];
   }
@@ -379,22 +362,7 @@ export async function pullActiveTeamMembers() {
   try {
     const scope = await resolveSyncScope(process.cwd());
     if (!scope.ok) return [];
-
-    await flushQueue(scope.accessToken).catch(() => {});
-
-    const since = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-
-    const res = await fetchWithTimeout(
-      `${SUPABASE_URL}/rest/v1/sync_state` +
-      `?team_id=eq.${scope.teamId}` +
-      `&created_at=gte.${since}` +
-      `&order=created_at.desc` +
-      `&limit=100`,
-      { headers: getHeaders(scope.accessToken) }
-    );
-
-    if (!res.ok) return [];
-    const events = await res.json();
+    const events = await fetchTeamSyncEvents({ minutes: 15, limit: 100 });
 
     // Deduplicate — keep most recent event per user+worktree, exclude self
     const seen = new Map();
@@ -405,6 +373,53 @@ export async function pullActiveTeamMembers() {
     }
 
     return [...seen.values()];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchTeamSyncEvents({ minutes = 5, limit = 50, repoRoot = process.cwd() } = {}) {
+  const scope = await resolveSyncScope(repoRoot);
+  if (!scope.ok) return [];
+
+  await flushQueue(scope.accessToken).catch(() => {});
+
+  const since = new Date(Date.now() - Math.max(1, Number(minutes) || 5) * 60 * 1000).toISOString();
+  const res = await fetchWithTimeout(
+    `${SUPABASE_URL}/rest/v1/sync_state` +
+    `?team_id=eq.${scope.teamId}` +
+    `&created_at=gte.${since}` +
+    `&order=created_at.desc` +
+    `&limit=${Math.max(1, Number(limit) || 50)}`,
+    { headers: getHeaders(scope.accessToken) }
+  );
+
+  if (!res.ok) return [];
+  return await res.json();
+}
+
+export async function pullTeamReviewShares({
+  hours = 24,
+  limit = 20,
+  repoRoot = process.cwd(),
+  includeSelf = false,
+} = {}) {
+  try {
+    const scope = await resolveSyncScope(repoRoot);
+    if (!scope.ok) return [];
+
+    const minutes = Math.max(1, Number(hours) || 24) * 60;
+    const events = await fetchTeamSyncEvents({
+      minutes,
+      limit: Math.max(20, Number(limit) || 20),
+      repoRoot,
+    });
+
+    return events.filter((event) => {
+      if (event.event_type !== 'session_review_shared') return false;
+      if (!includeSelf && event.user_id === scope.userId) return false;
+      return event.payload?.repo_key === scope.repoKey;
+    });
   } catch {
     return [];
   }

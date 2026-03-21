@@ -4,8 +4,10 @@ Use this page when you already know what kind of action you need.
 
 If you are brand new to Switchman, start with:
 - `switchman demo` for the shortest proof
-- `switchman setup --agents 5` for a real repo
+- `switchman start "Add authentication"` for a real repo
 - `switchman status` when you are not sure what to do next
+- `switchman review` when you want the full session summary
+- `switchman usage` when you need Pro cost and token rollups
 
 ## Setup
 
@@ -59,6 +61,7 @@ Most-used first-run commands:
 
 When work feels unclear, these are the front doors:
 - `switchman status`
+- `switchman usage`
 - `switchman explain claim <path>`
 - `switchman explain queue <itemId>`
 - `switchman explain stale --pipeline <pipelineId>`
@@ -70,6 +73,14 @@ When work feels unclear, these are the front doors:
 ### `switchman release <taskId>`
 ### `switchman scan`
 ### `switchman status`
+### `switchman review`
+- `--share` publishes the current review to your Pro team
+- `--team` pulls recent teammate reviews shared for this repo
+### `switchman usage`
+- Pro reporting for token and cost usage by session, agent, and time window
+- useful filters: `--days 30`, `--session <id>`, `--agent <name>`, `--task <id>`
+### `switchman usage record`
+- Pro manual write path for agent/token/cost events when you want to backfill or integrate a custom runner
 ### `switchman worktree list`
 ### `switchman worktree sync`
 

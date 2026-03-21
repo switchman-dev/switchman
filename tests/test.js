@@ -32,9 +32,10 @@ import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipel
 import { buildTaskSpec, planPipelineTasks } from '../src/core/planner.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../src/core/policy.js';
 import { describeQueueError, resolveQueueSource, runMergeQueue } from '../src/core/queue.js';
-import { getPendingQueueStatus, pullTeamState, pushSyncEvent } from '../src/core/sync.js';
+import { getPendingQueueStatus, pullTeamReviewShares, pullTeamState, pushSyncEvent } from '../src/core/sync.js';
 import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
 import { loginWithGitHub } from '../src/core/licence.js';
+import { buildSessionHistoryReport, buildSessionSummary, buildTeamReviewShareReport } from '../src/cli/reports.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 const TEST_ZDOTDIR = join(tmpdir(), `switchman-zdotdir-${Date.now()}`);
@@ -85,8 +86,10 @@ import {
   checkFileConflicts,
   getActiveFileClaims,
   listAuditEvents,
+  listUsageEvents,
   logAuditEvent,
   pruneDatabaseMaintenance,
+  recordUsageEvent,
   revokePolicyOverride,
   verifyAuditTrail,
   retryMergeQueueItem,
@@ -330,6 +333,86 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
   assert(plannedTasks.length >= 2, 'Plan apply creates multiple planned tasks');
   assert(getTaskSpec(appliedDb, plannedTasks[0].id)?.pipeline_id?.startsWith('plan-add-authentication-'), 'Plan apply stores a structured task spec for created tasks');
   appliedDb.close();
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
+});
+
+test('Usage report is Pro-gated and summarizes sessions, agents, and spend', () => {
+  const repoDir = join(tmpdir(), `sw-usage-cli-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-usage-cli-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), '# Usage repo\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const usageDb = initDb(repoDir);
+  registerWorktree(usageDb, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
+  registerWorktree(usageDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
+  const taskA = createTask(usageDb, { title: 'Auth work' });
+  const taskB = createTask(usageDb, { title: 'Docs work' });
+  startTaskLease(usageDb, taskA, 'agent1', 'claude-code');
+  startTaskLease(usageDb, taskB, 'agent2', 'cursor');
+  recordUsageEvent(usageDb, {
+    sessionId: 'session-alpha',
+    taskId: taskA,
+    provider: 'openai',
+    model: 'gpt-5',
+    promptTokens: 1000,
+    completionTokens: 500,
+    costUsd: 0.03,
+    source: 'manual',
+  });
+  recordUsageEvent(usageDb, {
+    sessionId: 'session-alpha',
+    taskId: taskB,
+    provider: 'anthropic',
+    model: 'claude-sonnet',
+    promptTokens: 600,
+    completionTokens: 400,
+    costUsd: 0.02,
+    source: 'manual',
+  });
+  usageDb.close();
+
+  let unpaidOutput = '';
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'usage',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir },
+    });
+  } catch (err) {
+    unpaidOutput = err.stdout || '';
+  }
+
+  assert(unpaidOutput.includes('switchman usage is a Pro feature'), 'Usage blocks unpaid users behind the Pro gate');
+
+  writeProTestCredentials(homeDir);
+  const jsonOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'usage',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: { ...process.env, HOME: homeDir },
+  });
+  const report = JSON.parse(jsonOutput);
+
+  assert(report.totals.total_tokens === 2500, 'Usage report aggregates total tokens across events');
+  assert(report.totals.tracked_sessions === 1, 'Usage report groups usage by session');
+  assert(report.totals.tracked_agents === 2, 'Usage report groups usage by agent');
+  assert(report.sessions[0].session_id === 'session-alpha', 'Usage report includes the recorded session id');
+  assert(report.agents.some((entry) => entry.agent === 'claude-code'), 'Usage report includes per-agent rollups');
+  assert(report.models.some((entry) => entry.model === 'gpt-5'), 'Usage report includes per-model rollups');
+
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
 });
@@ -3927,7 +4010,38 @@ test('Fix 55a: initDb records the current schema version explicitly', () => {
   const version = Object.values(row || {})[0];
   db.close();
 
-  assert(version === 6, 'New Switchman databases record schema version 6 explicitly');
+  assert(version === 7, 'New Switchman databases record schema version 7 explicitly');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Usage events record task context and aggregate token totals', () => {
+  const repoDir = join(tmpdir(), `sw-usage-db-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
+  const taskId = createTask(db, { title: 'Implement auth' });
+  startTaskLease(db, taskId, 'agent1', 'claude-code');
+
+  const event = recordUsageEvent(db, {
+    sessionId: 'session-auth',
+    taskId,
+    provider: 'openai',
+    model: 'gpt-5',
+    promptTokens: 120,
+    completionTokens: 80,
+    costUsd: 0.02,
+    source: 'manual',
+  });
+  const events = listUsageEvents(db, { days: 30 });
+  db.close();
+
+  assert(event.session_id === 'session-auth', 'Usage event stores the provided session id');
+  assert(event.worktree === 'agent1', 'Usage event infers the worktree from the active task lease');
+  assert(event.agent === 'claude-code', 'Usage event infers the agent from the active task lease');
+  assert(event.total_tokens === 200, 'Usage event derives total tokens from prompt and completion usage');
+  assert(events.length === 1, 'Usage events can be listed back from the database');
+  assert(events[0].model === 'gpt-5', 'Listed usage events preserve the recorded model');
 
   rmSync(repoDir, { recursive: true, force: true });
 });
@@ -4113,6 +4227,55 @@ test('Fix 1c: CLI task done succeeds while a transient SQLite write lock is pres
   assert(getTask(verifyDb, taskId).status === 'done', 'task done reaches completion even when a transient lock is present');
   verifyDb.close();
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('CLI task done records Pro usage metadata from the environment when provided', () => {
+  const repoDir = join(tmpdir(), `sw-task-done-usage-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-task-done-usage-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  writeProTestCredentials(homeDir);
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  const taskId = createTask(db, { title: 'Complete with usage' });
+  startTaskLease(db, taskId, 'main', 'claude-code');
+  db.close();
+
+  const output = execFileSync(process.execPath, [cliPath, 'task', 'done', taskId], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      HOME: homeDir,
+      SWITCHMAN_USAGE_SESSION_ID: 'session-task-done',
+      SWITCHMAN_USAGE_PROVIDER: 'openai',
+      SWITCHMAN_USAGE_MODEL: 'gpt-5',
+      SWITCHMAN_USAGE_PROMPT_TOKENS: '100',
+      SWITCHMAN_USAGE_COMPLETION_TOKENS: '50',
+      SWITCHMAN_USAGE_COST_USD: '0.01',
+    },
+  });
+
+  const verifyDb = openDb(repoDir);
+  const events = listUsageEvents(verifyDb, { days: 30 });
+  verifyDb.close();
+
+  assert(output.includes('usage recorded: session-task-done'), 'task done reports when usage metadata was recorded');
+  assert(events.length === 1, 'task done persists a usage event when usage metadata is present');
+  assert(events[0].session_id === 'session-task-done', 'task done usage event stores the session id');
+  assert(events[0].total_tokens === 150, 'task done usage event stores the combined token total');
+  assert(events[0].source === 'task_done', 'task done usage event records the event source');
+
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
 });
 
 test('Fix 1d: CLI task done warns clearly when the task was already completed', () => {
@@ -6849,6 +7012,66 @@ test('Fix 26a: AI merge gate stays calm when only one worktree has local risk si
   rmSync(repoDir, { recursive: true, force: true });
 });
 
+test('Fix 26b: AI merge gate reports uncertain when broad parallel changes are too large to score confidently', () => {
+  const repoDir = join(tmpdir(), `sw-ai-gate-uncertain-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const featureA = join(tmpdir(), `sw-ai-gate-uncertain-a-${Date.now()}`);
+  const featureB = join(tmpdir(), `sw-ai-gate-uncertain-b-${Date.now()}`);
+  const featureC = join(tmpdir(), `sw-ai-gate-uncertain-c-${Date.now()}`);
+  execSync(`git worktree add -b feature-ui-broad "${featureA}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature-docs-broad "${featureB}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature-jobs-broad "${featureC}"`, { cwd: repoDir });
+
+  execSync('mkdir -p src/ui && for i in 1 2 3 4 5 6; do printf "ui\\n" > "src/ui/file${i}.js"; done', { cwd: featureA, shell: '/bin/sh' });
+  execSync('mkdir -p docs && for i in 1 2 3 4 5 6; do printf "docs\\n" > "docs/file${i}.md"; done', { cwd: featureB, shell: '/bin/sh' });
+  execSync('mkdir -p src/jobs && for i in 1 2 3 4 5 6; do printf "jobs\\n" > "src/jobs/file${i}.js"; done', { cwd: featureC, shell: '/bin/sh' });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: featureA.split('/').pop(), path: featureA, branch: 'feature-ui-broad' });
+  registerWorktree(db, { name: featureB.split('/').pop(), path: featureB, branch: 'feature-docs-broad' });
+  registerWorktree(db, { name: featureC.split('/').pop(), path: featureC, branch: 'feature-jobs-broad' });
+  db.close();
+
+  let aiStdout = '';
+  try {
+    aiStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ai', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    aiStdout = String(err.stdout || '');
+  }
+  const aiGate = JSON.parse(aiStdout);
+
+  let ciStdout = '';
+  try {
+    ciStdout = execFileSync(process.execPath, [join(process.cwd(), 'src/cli/index.js'), 'gate', 'ci', '--json'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    ciStdout = String(err.stdout || '');
+  }
+  const ciGate = JSON.parse(ciStdout);
+
+  assert(aiGate.status === 'uncertain', 'AI merge gate uses uncertain when broad parallel changes outgrow its confidence');
+  assert(aiGate.summary.includes('Manual review recommended'), 'Uncertain AI gate output recommends manual review');
+  assert(aiGate.uncertain_reasons.length > 0, 'AI merge gate returns explicit uncertainty reasons');
+  assert(!ciGate.ok, 'Repo CI gate does not treat uncertain AI gate output as merge-safe');
+  assert(ciGate.ai_gate_status === 'uncertain', 'Repo CI gate preserves the uncertain AI gate status');
+
+  execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
+  execSync(`git worktree remove "${featureC}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
 test('Fix 27: pipeline start creates grouped subtasks with suggested worktrees', () => {
   const repoDir = join(tmpdir(), `sw-pipeline-start-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -7428,7 +7651,7 @@ test('Status JSON unifies queue, lease policy, and operator attention', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Status warns free users before short history expires and nudges multi-author repos toward Pro', () => {
+test('Status warns free users before history expires and nudges multi-author repos toward Pro', () => {
   const repoDir = join(tmpdir(), `sw-status-upgrade-hints-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-status-upgrade-hints-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -7453,7 +7676,7 @@ test('Status warns free users before short history expires and nudges multi-auth
     status: 'allowed',
     details: JSON.stringify({ summary: 'old task event' }),
   });
-  db.prepare(`UPDATE audit_log SET created_at=datetime('now', '-6 days') WHERE task_id='task-old'`).run();
+  db.prepare(`UPDATE audit_log SET created_at=datetime('now', '-13 days') WHERE task_id='task-old'`).run();
   db.close();
 
   const jsonOutput = JSON.parse(execFileSync(process.execPath, [
@@ -7606,7 +7829,7 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('switchman claude refresh'), 'Top-level help includes the Claude guide refresh command');
   assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the explicit first task step');
   assert(helpOutput.includes('switchman plan "Add authentication"   (Pro)'), 'Top-level help marks planning as a Pro operator command');
-  assert(helpOutput.includes('switchman session-summary'), 'Top-level help includes the session summary command');
+  assert(helpOutput.includes('switchman review'), 'Top-level help includes the review command');
   assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
 });
 
@@ -7634,7 +7857,7 @@ test('README install section includes the Homebrew path', () => {
   assert(readme.includes('Requirements: Node.js 22.5+ · Git 2.5+'), 'README install section includes the runtime requirements');
 });
 
-test('Session summary stays readable on free tier and keeps deeper counterfactuals for Pro', () => {
+test('Review stays readable on free tier and keeps deeper counterfactuals for Pro', () => {
   const repoDir = join(tmpdir(), `sw-session-summary-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-session-summary-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -7675,7 +7898,7 @@ test('Session summary stays readable on free tier and keeps deeper counterfactua
 
   const output = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
-    'session-summary',
+    'review',
     '--hours',
     '24',
   ], {
@@ -7684,7 +7907,7 @@ test('Session summary stays readable on free tier and keeps deeper counterfactua
     env: { ...process.env, HOME: homeDir },
   });
 
-  assert(output.includes('Session summary'), 'Session summary prints the heading');
+  assert(output.includes('Switchman review'), 'Review prints the heading');
   assert(output.includes('rogue write'), 'Session summary reports blocked rogue edits');
   assert(output.includes('retry / recovery handoff'), 'Session summary reports recovery activity');
   assert(output.includes('risky landing issue'), 'Session summary reports landing issues caught');
@@ -7693,6 +7916,305 @@ test('Session summary stays readable on free tier and keeps deeper counterfactua
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
+});
+
+await testAsync('Review summary builds a shareable narrative and merge confidence', async () => {
+  const repoDir = join(tmpdir(), `sw-review-shareable-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  logAuditEvent(db, {
+    eventType: 'task_completed',
+    status: 'allowed',
+    taskId: 'task-1',
+  });
+  logAuditEvent(db, {
+    eventType: 'write_observed',
+    status: 'denied',
+    taskId: 'task-2',
+    details: JSON.stringify({ file_path: 'src/auth.js' }),
+  });
+  logAuditEvent(db, {
+    eventType: 'ai_merge_gate',
+    status: 'warn',
+    details: JSON.stringify({ status: 'warn' }),
+  });
+  db.close();
+
+  const report = await buildSessionSummary(repoDir, { hours: 24 });
+
+  assert(report.merge_confidence === 'amber', 'Review summary classifies warn-level AI gate signals as amber confidence');
+  assert(report.narrative.includes('Completed 1 task'), 'Review summary narrative explains what was completed');
+  assert(report.narrative.includes('blocked 1 rogue write'), 'Review summary narrative mentions blocked rogue writes');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+await testAsync('Searchable session history groups retained sessions and filters them by query', async () => {
+  const repoDir = join(tmpdir(), `sw-session-history-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-session-history-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+  writeProTestCredentials(homeDir);
+  const originalHome = process.env.HOME;
+  process.env.HOME = homeDir;
+  try {
+    execSync('git init', { cwd: repoDir });
+    execSync('git config user.email "test@test.com"', { cwd: repoDir });
+    execSync('git config user.name "Test"', { cwd: repoDir });
+    execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+    const db = initDb(repoDir);
+    logAuditEvent(db, {
+      eventType: 'task_completed',
+      status: 'allowed',
+      taskId: 'task-auth',
+      details: JSON.stringify({ summary: 'auth middleware completed' }),
+    });
+    logAuditEvent(db, {
+      eventType: 'ai_merge_gate',
+      status: 'warn',
+      details: JSON.stringify({ status: 'warn', shared_areas: ['src/auth'] }),
+    });
+    logAuditEvent(db, {
+      eventType: 'task_completed',
+      status: 'allowed',
+      taskId: 'task-billing',
+      details: JSON.stringify({ summary: 'billing docs completed' }),
+    });
+    db.prepare(`UPDATE audit_log SET created_at=datetime('now', '-2 days', '-12 hours') WHERE task_id='task-auth' OR event_type='ai_merge_gate'`).run();
+    db.prepare(`UPDATE audit_log SET created_at=datetime('now', '-1 days') WHERE task_id='task-billing'`).run();
+    db.close();
+
+    const report = await buildSessionHistoryReport(repoDir, { days: 90, search: 'auth' });
+
+    assert(report.sessions.length === 1, 'Session history search narrows retained history down to matching sessions');
+    assert(report.sessions[0].narrative.toLowerCase().includes('auth'), 'Session history keeps searchable narrative context');
+    assert(report.sessions[0].merge_confidence === 'amber', 'Session history preserves the session merge confidence');
+
+    const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'review',
+      '--history',
+      '--search',
+      'billing',
+      '--json',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir },
+    }));
+
+    assert(jsonOutput.sessions.length === 1, 'CLI review history search returns the matching retained session');
+    assert(jsonOutput.sessions[0].narrative.toLowerCase().includes('billing'), 'CLI review history search returns the billing session narrative');
+  } finally {
+    process.env.HOME = originalHome;
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+await testAsync('Team review sharing pulls only shared reviews for this repo and formats them for teammates', async () => {
+  const repoDir = join(tmpdir(), `sw-team-review-${Date.now()}`);
+  const fakeHome = join(tmpdir(), `sw-team-review-home-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(fakeHome, { recursive: true });
+  const originalHome = process.env.HOME;
+  const originalFetch = global.fetch;
+  process.env.HOME = fakeHome;
+  writeProTestCredentials(fakeHome, 'owner@test.com', { userId: 'user-self' });
+
+  try {
+    global.fetch = async (url) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes('/rest/v1/team_members')) {
+        return new Response(JSON.stringify([{ team_id: 'team-review-1' }]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (requestUrl.includes('/rest/v1/sync_state')) {
+        return new Response(JSON.stringify([
+          {
+            team_id: 'team-review-1',
+            user_id: 'user-other',
+            worktree: 'agent-auth',
+            event_type: 'session_review_shared',
+            created_at: '2026-03-21T10:00:00.000Z',
+            payload: {
+              email: 'lead@test.com',
+              repo_key: repoDir.split('/').pop(),
+              review: {
+                merge_confidence: 'amber',
+                hours: 24,
+                metrics: {
+                  tasks_completed: 2,
+                  retries_scheduled: 1,
+                  rogue_writes_blocked: 1,
+                },
+                narrative: 'Completed 2 tasks and caught one risky overlap before review.',
+              },
+            },
+          },
+          {
+            team_id: 'team-review-1',
+            user_id: 'user-self',
+            worktree: 'agent-self',
+            event_type: 'session_review_shared',
+            created_at: '2026-03-21T11:00:00.000Z',
+            payload: {
+              email: 'owner@test.com',
+              repo_key: repoDir.split('/').pop(),
+              review: {
+                merge_confidence: 'green',
+                hours: 24,
+                metrics: { tasks_completed: 1 },
+                narrative: 'My own review should be filtered by default.',
+              },
+            },
+          },
+          {
+            team_id: 'team-review-1',
+            user_id: 'user-third',
+            worktree: 'agent-other-repo',
+            event_type: 'session_review_shared',
+            created_at: '2026-03-21T09:00:00.000Z',
+            payload: {
+              email: 'other@test.com',
+              repo_key: 'different-repo',
+              review: {
+                merge_confidence: 'red',
+                hours: 24,
+                metrics: { tasks_completed: 3 },
+                narrative: 'Different repo review should be filtered out.',
+              },
+            },
+          },
+          {
+            team_id: 'team-review-1',
+            user_id: 'user-four',
+            worktree: 'agent-noise',
+            event_type: 'task_done',
+            created_at: '2026-03-21T08:00:00.000Z',
+            payload: {
+              email: 'noise@test.com',
+              repo_key: repoDir.split('/').pop(),
+            },
+          },
+        ]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response(JSON.stringify({ reason: 'unexpected_request' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const reviews = await pullTeamReviewShares({ hours: 24, repoRoot: repoDir });
+    const report = buildTeamReviewShareReport(reviews);
+
+    assert(reviews.length === 1, 'Team review sharing filters to teammate reviews for the current repo');
+    assert(report.length === 1, 'Team review share report formats the filtered teammate reviews');
+    assert(report[0].email === 'lead@test.com', 'Team review share report keeps the teammate identity');
+    assert(report[0].merge_confidence === 'amber', 'Team review share report keeps the shared merge confidence');
+    assert(report[0].narrative.includes('Completed 2 tasks'), 'Team review share report keeps the shared narrative');
+  } finally {
+    global.fetch = originalFetch;
+    process.env.HOME = originalHome;
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test('Insights aggregates recurring amber hotspots across audit history', () => {
+  const repoDir = join(tmpdir(), `sw-insights-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  logAuditEvent(db, {
+    eventType: 'ai_merge_gate',
+    status: 'warn',
+    details: JSON.stringify({
+      status: 'warn',
+      shared_areas: [{ name: 'src/auth', count: 2 }, { name: 'src/api', count: 1 }],
+      shared_risk_tags: [{ name: 'auth', count: 2 }],
+    }),
+  });
+  logAuditEvent(db, {
+    eventType: 'ai_merge_gate',
+    status: 'denied',
+    details: JSON.stringify({
+      status: 'blocked',
+      shared_areas: [{ name: 'src/auth', count: 3 }],
+      shared_risk_tags: [{ name: 'auth', count: 3 }],
+    }),
+  });
+  logAuditEvent(db, {
+    eventType: 'ai_merge_gate',
+    status: 'warn',
+    details: JSON.stringify({
+      status: 'uncertain',
+      shared_areas: [{ name: 'src/auth', count: 1 }, { name: 'src/jobs', count: 1 }],
+      shared_risk_tags: [{ name: 'api', count: 1 }],
+    }),
+  });
+  logAuditEvent(db, {
+    eventType: 'dependency_invalidations_updated',
+    status: 'warn',
+    details: JSON.stringify({
+      reason_types: ['shared_module_drift'],
+      revalidation_sets: ['shared_module'],
+      stale_count: 2,
+    }),
+  });
+  logAuditEvent(db, {
+    eventType: 'boundary_validation_state',
+    status: 'denied',
+    details: JSON.stringify({
+      status: 'blocked',
+      missing_task_types: ['tests'],
+    }),
+  });
+  db.close();
+
+  const jsonOutput = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'insights',
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  }));
+
+  const textOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'insights',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(jsonOutput.recurring_hotspots[0].label === 'src/auth', 'Insights ranks src/auth as the strongest recurring hotspot');
+  assert(jsonOutput.recurring_hotspots[0].blocked_count >= 1, 'Insights keeps blocked observations in the hotspot summary');
+  assert(jsonOutput.recurring_hotspots.some((item) => item.kind === 'reason_type' && item.key === 'shared_module_drift'), 'Insights includes recurring invalidation reasons');
+  assert(jsonOutput.recurring_hotspots.some((item) => item.kind === 'validation_gap' && item.key === 'tests'), 'Insights includes recurring validation gaps');
+  assert(textOutput.includes('Switchman insights'), 'Insights prints the heading');
+  assert(textOutput.includes('src/auth'), 'Insights text output includes the top hotspot');
+  assert(textOutput.includes('Recommendation'), 'Insights text output includes a recommendation');
+
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Desktop notifications on free tier fire for finished tasks and blocked claims', () => {
