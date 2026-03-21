@@ -1,13 +1,13 @@
 # Switchman
 
-**Run more AI agents. Know what happened. Merge with confidence.**
+**You ran the agents. Did they build the right thing?**
 
 [![CI](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml/badge.svg)](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/switchman-dev.svg)](https://www.npmjs.com/package/switchman-dev)
 
 <img src="docs/demo.png" width="600" alt="Switchman demo — agent2 blocked from src/auth.js, rerouted safely, both branches landed cleanly">
 
-Switchman coordinates multi-agent coding sessions and gives you one clear answer at the end: what each agent changed, where the risks are, and whether this looks safe to merge.
+Switchman coordinates multi-agent coding sessions and gives you one clear answer at the end: what each agent changed, what does not fit together, and whether this looks safe to ship.
 
 Run 10+ AI coding agents on one codebase safely. Switchman acts like mission control for parallel agents: it hands out tasks, stops overlapping edits early, keeps work visible, and double-checks the session before anything lands on `main`.
 
@@ -19,7 +19,9 @@ switchman start "your goal"
 switchman review
 ```
 
-`switchman review` is the payoff. It turns a parallel agent session into a plain-English summary with semantic overlap detection, interface mismatch detection, and an honest merge confidence outcome: `green`, `amber`, `red`, or `uncertain`.
+`switchman review` is the payoff. It reads every worktree, turns a parallel session into a plain-English summary, flags semantic overlap and interface mismatches, and gives an honest merge confidence outcome: `green`, `amber`, `red`, or `uncertain`.
+
+The problem it solves is simple: launching more agents is easy. Knowing what they actually built is not.
 
 Built for teams using Claude Code, Cursor, Windsurf, Aider, and other CLI-first coding agents on real repos.
 
@@ -78,6 +80,13 @@ switchman quickcheck
 switchman start "Implement auth helper"
 switchman status --watch
 switchman review
+```
+
+Then, when the session looks good:
+
+```bash
+switchman gate ci
+switchman queue run
 ```
 
 What `switchman start` gives you:
@@ -166,7 +175,41 @@ switchman login --status # check your plan
 
 ---
 
-## Why Switchman?
+## What Developers Hit At The End Of Every Session
+
+Three agents finish. You have three worktrees full of diffs and no coherent picture of what was built.
+
+- A 20-minute review tax at the end of every parallel run
+- Agentic drift where two agents solve the same problem in incompatible ways
+- No merge conflict, no CI failure, but still no trustworthy answer to “is this safe to merge?”
+
+Git tells you what changed. It does not tell you whether parallel agent work is coherent. That question has been yours to answer until `switchman review`.
+
+---
+
+## How It Works
+
+Start a session. Review the output. Ship with confidence.
+
+### 1. Start with one goal
+
+Run `switchman start "Add user authentication"`. Switchman reads the repo, creates agent workspaces, and keeps work aligned as agents run.
+
+### 2. Agents coordinate automatically
+
+File claims, task ownership, stale recovery, and MCP coordination happen automatically. You do not need to prompt agents to coordinate manually.
+
+### 3. Review what was built
+
+Run `switchman review`. Get a plain-English summary of what each agent produced, semantic mismatch flags, interface mismatch detection, and a merge confidence outcome.
+
+### 4. Ship through gates
+
+When the review looks good, run the CI gate and merge queue. Finished work lands cleanly instead of turning into last-minute merge cleanup.
+
+---
+
+## Why Developers Use It
 
 Git gives you branches. Switchman gives you coordination.
 
@@ -201,6 +244,25 @@ Most tools stop at "the agents finished." Switchman keeps going.
 - whether the session looks `green`, `amber`, `red`, or `uncertain`
 
 When Switchman cannot make a trustworthy call, it says `uncertain` instead of pretending everything is fine. That honesty is what makes the confident reviews useful.
+
+## Why This Matters
+
+The real risk is not just merge conflicts. It is agentic drift.
+
+Parallel agents can independently solve the same problem in incompatible ways. No conflict. No CI failure. Just divergence that compiles, passes, and breaks later. Switchman is built to detect that kind of mismatch before it reaches `main`.
+
+## Cross-Tool By Default
+
+Mix Claude Code, Cursor, and Codex in the same session. Native MCP support lets agents pick up tasks and coordinate automatically, and `switchman review` gives you one place to review the combined output.
+
+Also supported today:
+
+- Claude Code
+- Cursor
+- OpenAI Codex
+- Windsurf
+- Aider
+- Cline
 
 ---
 
