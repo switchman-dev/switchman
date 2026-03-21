@@ -1,15 +1,25 @@
 # Switchman
 
-**More AI agents. Less repo chaos. One command to start.**
+**Run more AI agents. Know what happened. Merge with confidence.**
 
 [![CI](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml/badge.svg)](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/switchman-dev.svg)](https://www.npmjs.com/package/switchman-dev)
 
 <img src="docs/demo.png" width="600" alt="Switchman demo — agent2 blocked from src/auth.js, rerouted safely, both branches landed cleanly">
 
-Switchman coordinates multi-agent coding sessions. It plans the work, creates workspaces, prevents file collisions, and gives you one safe path to `main`.
+Switchman coordinates multi-agent coding sessions and gives you one clear answer at the end: what each agent changed, where the risks are, and whether this looks safe to merge.
 
-Run 10+ AI coding agents on one codebase safely. Switchman acts like mission control for parallel agents: it hands out tasks, stops overlapping edits early, keeps work visible, and lands finished branches through checks instead of merge chaos.
+Run 10+ AI coding agents on one codebase safely. Switchman acts like mission control for parallel agents: it hands out tasks, stops overlapping edits early, keeps work visible, and double-checks the session before anything lands on `main`.
+
+The core flow is simple:
+
+```bash
+switchman start "your goal"
+# agents run
+switchman review
+```
+
+`switchman review` is the payoff. It turns a parallel agent session into a plain-English summary with semantic overlap detection, interface mismatch detection, and an honest merge confidence outcome: `green`, `amber`, `red`, or `uncertain`.
 
 Built for teams using Claude Code, Cursor, Windsurf, Aider, and other CLI-first coding agents on real repos.
 
@@ -47,12 +57,14 @@ Creates a throwaway repo and shows:
 - agent2 getting blocked from the same file
 - agent2 rerouting safely to `docs/auth-flow.md`
 - both branches landing cleanly through the queue
+- a final `switchman review` session summary
 
 Then inspect it:
 
 ```bash
 cd /tmp/switchman-demo-...
 switchman status
+switchman review
 switchman queue status
 ```
 
@@ -65,8 +77,7 @@ cd my-project
 switchman quickcheck
 switchman start "Implement auth helper"
 switchman status --watch
-switchman gate ci
-switchman queue run
+switchman review
 ```
 
 What `switchman start` gives you:
@@ -75,6 +86,7 @@ What `switchman start` gives you:
 - linked agent workspaces
 - a shared Switchman database in `.switchman/`
 - a repo-aware `CLAUDE.md` when one does not exist
+- automatic MCP coordination wiring where supported
 
 If your shell is running non-interactively, `switchman start` will ask you to rerun with `--yes` instead of hanging for confirmation. In a normal terminal, Switchman now falls back to the controlling TTY when stdin/stdout were piped.
 
@@ -85,14 +97,14 @@ switchman setup --agents 3
 switchman task add "Implement auth helper" --priority 9
 ```
 
-Fastest path to success:
+Fastest path to value:
 
 1. Run `switchman quickcheck` if you want one clear readiness check and one exact next command
 2. Use `switchman start` for the shortest path
 3. Open one agent/editor window per generated workspace
 4. Keep `switchman status --watch` open in a separate terminal
-5. Run `switchman review` after the first session to see what Switchman coordinated
-6. Run `switchman gate ci && switchman queue run` when tasks finish
+5. Run `switchman review` to see what each agent built, where work overlapped, and whether Switchman is confident in the merge
+6. Run `switchman gate ci && switchman queue run` when the review looks good and tasks are finished
 
 If editor wiring feels off later, run `switchman verify-setup`. If you want to regenerate the repo-aware guide, run `switchman claude refresh`.
 
@@ -139,7 +151,10 @@ switchman login --status # check your plan
 **What's in Pro:**
 
 - 90-day searchable session history
+  - `switchman review --history`
+  - `switchman review --history --search auth`
 - Cross-session pattern detection and repo insights
+  - `switchman insights`
 - Team session sharing — `switchman review --share` to publish a review, `switchman review --team` to read teammate reviews before the PR
 - AI task planning — `switchman plan "Add authentication" --apply`, `switchman plan --issue 47`, and optionally `--comment` back to the issue or PR
 - Cost and token tracking over time — `switchman usage`, `switchman usage --days 30`, and `switchman usage record --session <id> ...`
@@ -167,11 +182,25 @@ Switchman adds:
 - **Task planning** — break goals into governed parallel work
 - **File locking** — parallel edits don't quietly collide
 - **Live status** — see what's running, blocked, or stale
+- **Session review** — get a plain-English explanation of what happened before you merge
 - **Stale recovery** — abandoned work gets detected and requeued
 - **Governed landing** — finished work reaches `main` one item at a time with retries and policy checks
 - **Honest merge confidence** — green, amber, red, or uncertain when Switchman cannot make a trustworthy call
 
-Switchman is for the point where "we can manage this by hand" stops being true.
+Switchman is for the point where "we can manage this by hand" stops being true, and where a false green would be worse than no signal at all.
+
+## The Review Moment
+
+Most tools stop at "the agents finished." Switchman keeps going.
+
+`switchman review` is the moment where the session becomes understandable:
+
+- what each agent built, in plain English
+- where the work overlapped semantically
+- where interfaces or boundaries may not line up
+- whether the session looks `green`, `amber`, `red`, or `uncertain`
+
+When Switchman cannot make a trustworthy call, it says `uncertain` instead of pretending everything is fine. That honesty is what makes the confident reviews useful.
 
 ---
 
