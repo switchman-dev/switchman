@@ -7927,10 +7927,14 @@ await testAsync('Review summary builds a shareable narrative and merge confidenc
   execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
 
   const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
+  const taskId = createTask(db, { title: 'Implement JWT middleware' });
+  startTaskLease(db, taskId, 'agent1', 'claude-code');
   logAuditEvent(db, {
     eventType: 'task_completed',
     status: 'allowed',
-    taskId: 'task-1',
+    taskId,
   });
   logAuditEvent(db, {
     eventType: 'write_observed',
@@ -7950,6 +7954,86 @@ await testAsync('Review summary builds a shareable narrative and merge confidenc
   assert(report.merge_confidence === 'amber', 'Review summary classifies warn-level AI gate signals as amber confidence');
   assert(report.narrative.includes('Completed 1 task'), 'Review summary narrative explains what was completed');
   assert(report.narrative.includes('blocked 1 rogue write'), 'Review summary narrative mentions blocked rogue writes');
+  assert(report.agent_summaries.some((entry) => entry.agent === 'claude-code'), 'Review summary keeps the agent identity for completed work');
+  assert(report.narrative.includes('Implement JWT middleware'), 'Review summary narrative includes a per-agent task description');
+  assert(report.narrative.indexOf('Implement JWT middleware') === report.narrative.lastIndexOf('Implement JWT middleware'), 'Review narrative does not duplicate the same agent task description');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+await testAsync('Review runs a live semantic scan and surfaces current mismatches', async () => {
+  const repoDir = join(tmpdir(), `sw-review-live-semantic-${Date.now()}`);
+  const featureA = join(tmpdir(), `sw-review-live-semantic-a-${Date.now()}`);
+  const featureB = join(tmpdir(), `sw-review-live-semantic-b-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('mkdir -p src/auth && printf "export function ensureAuth() { return true; }\\n" > src/auth/guard.js', { cwd: repoDir, shell: '/bin/sh' });
+  execSync('git add src/auth/guard.js', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+  execSync(`git worktree add -b feature-review-semantic-a "${featureA}"`, { cwd: repoDir });
+  execSync(`git worktree add -b feature-review-semantic-b "${featureB}"`, { cwd: repoDir });
+  execSync('printf "export function ensureAuth() { return false; }\\n" > src/auth/guard.js', { cwd: featureA, shell: '/bin/sh' });
+  execSync('printf "export function ensureAuth() { return \"maybe\"; }\\n" > src/auth/guard.js', { cwd: featureB, shell: '/bin/sh' });
+
+  const db = initDb(repoDir);
+  registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
+  registerWorktree(db, { name: featureA.split('/').pop(), path: featureA, branch: 'feature-review-semantic-a' });
+  registerWorktree(db, { name: featureB.split('/').pop(), path: featureB, branch: 'feature-review-semantic-b' });
+  const taskId = createTask(db, { title: 'Review auth drift' });
+  startTaskLease(db, taskId, featureA.split('/').pop(), 'claude-code');
+  logAuditEvent(db, {
+    eventType: 'task_completed',
+    status: 'allowed',
+    taskId,
+  });
+  db.close();
+
+  try {
+    const report = await buildSessionSummary(repoDir, { hours: 24 });
+    assert(report.merge_confidence === 'red', 'Live semantic overlap forces review confidence to red');
+    assert(report.semantic_conflicts.some((conflict) => conflict.object_name === 'ensureAuth'), 'Review includes current semantic conflicts from the live scan');
+    assert(report.narrative.includes('flagged: ensureAuth defined in both feature-review-semantic-a/src/auth/guard.js and feature-review-semantic-b/src/auth/guard.js'), 'Review narrative names the semantic symptom in a developer-facing way');
+    assert(report.narrative.includes('resolve before merging'), 'Review narrative gives an immediate semantic next action');
+
+    const output = execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'review',
+      '--hours',
+      '24',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+
+    assert(output.includes('Live semantic scan'), 'CLI review prints the live semantic scan section');
+    assert(output.includes('flagged: ensureAuth defined in both feature-review-semantic-a/src/auth/guard.js and feature-review-semantic-b/src/auth/guard.js'), 'CLI review names the semantic conflict as a flagged symptom');
+    assert(output.includes('resolve before merging'), 'CLI review gives the semantic finding an immediate action');
+  } finally {
+    execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
+    execSync(`git worktree remove "${featureB}" --force`, { cwd: repoDir });
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(featureA, { recursive: true, force: true });
+    rmSync(featureB, { recursive: true, force: true });
+  }
+});
+
+await testAsync('Review stays calm when no completed work exists yet', async () => {
+  const repoDir = join(tmpdir(), `sw-review-empty-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  initDb(repoDir).close();
+
+  const report = await buildSessionSummary(repoDir, { hours: 24 });
+
+  assert(report.merge_confidence === 'uncertain', 'Empty review windows still keep the honest uncertain state');
+  assert(report.narrative.includes('No completed tasks yet'), 'Empty review windows explain that no work has finished yet');
+  assert(!report.narrative.includes('manual review is recommended'), 'Empty review windows avoid sounding like a warning state');
 
   rmSync(repoDir, { recursive: true, force: true });
 });

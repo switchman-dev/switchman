@@ -396,6 +396,21 @@ Examples:
             : chalk.yellow;
       console.log(`  ${chalk.bold('Narrative')} ${report.narrative}`);
       console.log(`  ${chalk.bold('Merge confidence')} ${confidenceColor(report.merge_confidence)}`);
+      if ((report.semantic_conflicts?.length || 0) > 0) {
+        const semanticSummary = report.semantic_conflicts
+          .slice(0, 3)
+          .map((conflict) => {
+            const objectName = conflict.object_name || conflict.type;
+            const left = `${conflict.worktreeA}/${conflict.fileA || 'unknown'}`;
+            const right = `${conflict.worktreeB}/${conflict.fileB || 'unknown'}`;
+            const action = conflict.type === 'semantic_object_overlap'
+              ? 'resolve before merging'
+              : 'review before merging';
+            return `flagged: ${objectName} defined in both ${left} and ${right} — ${action}`;
+          })
+          .join(', ');
+        console.log(`  ${chalk.bold('Live semantic scan')} ${report.semantic_conflicts.length} conflict${report.semantic_conflicts.length === 1 ? '' : 's'} (${semanticSummary})`);
+      }
       console.log(`  ${chalk.green('✓')} ${report.metrics.rogue_writes_blocked} rogue write${report.metrics.rogue_writes_blocked === 1 ? '' : 's'} blocked`);
       console.log(`  ${chalk.green('✓')} ${report.metrics.retries_scheduled} retry / recovery handoff${report.metrics.retries_scheduled === 1 ? '' : 's'} recorded`);
       console.log(`  ${chalk.green('✓')} ${report.metrics.queue_blocks_avoided} risky landing issue${report.metrics.queue_blocks_avoided === 1 ? '' : 's'} caught`);

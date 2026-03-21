@@ -1327,9 +1327,14 @@ export async function buildSessionSummary(repoRoot, { hours = 8 } = {}) {
     const queueEvents = queueItems
       .flatMap((item) => listMergeQueueEvents(db, item.id, { limit: 50 }).map((event) => ({ ...event, item })))
       .filter((event) => isRecent(event.created_at));
+    const scanReport = await scanAllWorktrees(db, repoRoot);
+    const liveSemanticConflicts = scanReport.semanticConflicts || [];
+    const agentSummaries = buildAgentSessionSummaries(db, auditEvents);
     const summary = summarizeSessionWindow(auditEvents, queueEvents, {
       hours: Math.max(1, Number(hours) || 8),
       retentionDays,
+      liveSemanticConflicts,
+      agentSummaries,
     });
 
     return {
@@ -1339,6 +1344,8 @@ export async function buildSessionSummary(repoRoot, { hours = 8 } = {}) {
       metrics: summary.metrics,
       merge_confidence: summary.merge_confidence,
       narrative: summary.narrative,
+      semantic_conflicts: summary.semantic_conflicts,
+      agent_summaries: summary.agent_summaries,
       estimated_minutes_saved: summary.estimated_minutes_saved,
       upgrade_cta: null,
       counterfactual_depth: summary.counterfactual_depth,
@@ -1349,13 +1356,23 @@ export async function buildSessionSummary(repoRoot, { hours = 8 } = {}) {
   }
 }
 
-function summarizeSessionWindow(auditEvents = [], queueEvents = [], { hours = null, retentionDays = FREE_RETENTION_DAYS } = {}) {
+function summarizeSessionWindow(
+  auditEvents = [],
+  queueEvents = [],
+  {
+    hours = null,
+    retentionDays = FREE_RETENTION_DAYS,
+    liveSemanticConflicts = [],
+    agentSummaries = [],
+  } = {},
+) {
   const metrics = {
     tasks_completed: auditEvents.filter((event) => event.event_type === 'task_completed').length,
     retries_scheduled: auditEvents.filter((event) => event.event_type === 'task_retried' || event.event_type === 'pipeline_task_retry_scheduled').length,
     rogue_writes_blocked: auditEvents.filter((event) => event.event_type === 'write_observed' && event.status === 'denied').length,
     queue_merges_completed: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && event.status === 'merged').length,
     queue_blocks_avoided: queueEvents.filter((event) => event.event_type === 'merge_queue_state_changed' && ['blocked', 'retrying', 'wave_blocked', 'escalated', 'held'].includes(event.status)).length,
+    live_semantic_conflicts: liveSemanticConflicts.length,
   };
 
   const aiGateEvents = auditEvents.filter((event) => event.event_type === 'ai_merge_gate');
@@ -1371,11 +1388,15 @@ function summarizeSessionWindow(auditEvents = [], queueEvents = [], { hours = nu
     const details = parseEventDetails(event.details);
     return details.status === 'warn' || event.status === 'warn';
   });
-  const mergeConfidence = hasBlocked
+  const hasLiveBlockedSemantic = liveSemanticConflicts.some((conflict) =>
+    conflict.severity === 'blocked' || conflict.type === 'semantic_object_overlap');
+  const hasLiveWarnSemantic = liveSemanticConflicts.some((conflict) =>
+    !hasLiveBlockedSemantic && (conflict.severity === 'warn' || conflict.type === 'semantic_name_overlap'));
+  const mergeConfidence = hasBlocked || hasLiveBlockedSemantic
     ? 'red'
     : hasUncertain
       ? 'uncertain'
-      : hasWarn
+      : hasWarn || hasLiveWarnSemantic
         ? 'amber'
         : metrics.tasks_completed > 0 || metrics.queue_merges_completed > 0
           ? 'green'
@@ -1393,10 +1414,21 @@ function summarizeSessionWindow(auditEvents = [], queueEvents = [], { hours = nu
   const windowText = hours == null
     ? 'in that session.'
     : `in the last ${hours} hour${hours === 1 ? '' : 's'}.`;
+  const semanticConflictSummaries = buildSemanticConflictSummaries(liveSemanticConflicts);
+  const hasNoSessionWork = metrics.tasks_completed === 0
+    && metrics.queue_merges_completed === 0
+    && metrics.rogue_writes_blocked === 0
+    && metrics.retries_scheduled === 0
+    && metrics.queue_blocks_avoided === 0
+    && semanticConflictSummaries.length === 0;
   const narrativeParts = [
+    ...agentSummaries.slice(0, 3).map((entry) => entry.narrative),
     metrics.tasks_completed > 0
       ? `Completed ${metrics.tasks_completed} task${metrics.tasks_completed === 1 ? '' : 's'} ${windowText}`
       : `No task completions were recorded ${windowText}`,
+    semanticConflictSummaries.length > 0
+      ? `Live review scan flagged ${semanticConflictSummaries.length} semantic mismatch${semanticConflictSummaries.length === 1 ? '' : 'es'}: ${semanticConflictSummaries.join('; ')}.`
+      : null,
     metrics.rogue_writes_blocked > 0
       ? `Switchman blocked ${metrics.rogue_writes_blocked} rogue write${metrics.rogue_writes_blocked === 1 ? '' : 's'} before they spread.`
       : null,
@@ -1415,13 +1447,17 @@ function summarizeSessionWindow(auditEvents = [], queueEvents = [], { hours = nu
         ? 'Current merge confidence is amber and deserves a careful review.'
         : mergeConfidence === 'red'
           ? 'Current merge confidence is red and should not be treated as merge-safe.'
-          : 'Current merge confidence is uncertain, so manual review is recommended.',
+          : hasNoSessionWork
+            ? 'No completed tasks yet — run `switchman review` again when agents finish.'
+            : 'Current merge confidence is uncertain, so manual review is recommended.',
   ].filter(Boolean);
 
   return {
     metrics,
     merge_confidence: mergeConfidence,
     narrative: narrativeParts.join(' '),
+    semantic_conflicts: liveSemanticConflicts,
+    agent_summaries: agentSummaries,
     estimated_minutes_saved: estimatedMinutesSaved,
     counterfactual_depth: isProDepth ? 'full' : 'read_only',
     depth_hint: !isProDepth
@@ -1432,6 +1468,68 @@ function summarizeSessionWindow(auditEvents = [], queueEvents = [], { hours = nu
         }
         : null,
   };
+}
+
+function formatTaskList(taskTitles = []) {
+  const titles = taskTitles.filter(Boolean);
+  if (titles.length === 0) return 'recent work';
+  if (titles.length === 1) return titles[0];
+  if (titles.length === 2) return `${titles[0]} and ${titles[1]}`;
+  return `${titles.slice(0, 2).join(', ')}, and ${titles.length - 2} more`;
+}
+
+function buildAgentSessionSummaries(db, auditEvents = []) {
+  const allLeases = listLeases(db);
+  const leaseByTaskId = new Map();
+  for (const lease of allLeases) {
+    if (!lease?.task_id || leaseByTaskId.has(lease.task_id)) continue;
+    leaseByTaskId.set(lease.task_id, lease);
+  }
+
+  const completedTaskIds = [...new Set(
+    auditEvents
+      .filter((event) => event.event_type === 'task_completed' && event.task_id)
+      .map((event) => String(event.task_id)),
+  )];
+
+  const agents = new Map();
+  for (const taskId of completedTaskIds) {
+    const task = getTask(db, taskId);
+    const lease = leaseByTaskId.get(taskId);
+    const agent = task?.agent || lease?.agent || task?.worktree || lease?.worktree || 'unknown agent';
+    if (!agents.has(agent)) {
+      agents.set(agent, {
+        agent,
+        worktrees: new Set(),
+        task_ids: [],
+        task_titles: [],
+      });
+    }
+    const entry = agents.get(agent);
+    if (task?.worktree || lease?.worktree) entry.worktrees.add(task?.worktree || lease?.worktree);
+    entry.task_ids.push(taskId);
+    entry.task_titles.push(task?.title || taskId);
+  }
+
+  return [...agents.values()]
+    .map((entry) => ({
+      agent: entry.agent,
+      worktrees: [...entry.worktrees],
+      task_count: entry.task_ids.length,
+      task_ids: entry.task_ids,
+      task_titles: entry.task_titles,
+      narrative: `${entry.agent}${entry.worktrees.length > 0 ? ` in ${entry.worktrees.join(', ')}` : ''} completed ${entry.task_ids.length} task${entry.task_ids.length === 1 ? '' : 's'}: ${formatTaskList(entry.task_titles)}.`,
+    }))
+    .sort((a, b) => b.task_count - a.task_count || String(a.agent).localeCompare(String(b.agent)));
+}
+
+function buildSemanticConflictSummaries(conflicts = []) {
+  return conflicts.slice(0, 3).map((conflict) => {
+    if (conflict.type === 'semantic_object_overlap') {
+      return `flagged: ${conflict.object_name || 'shared export'} defined in both ${conflict.worktreeA}/${conflict.fileA || 'unknown'} and ${conflict.worktreeB}/${conflict.fileB || 'unknown'} — resolve before merging`;
+    }
+    return `flagged: ${conflict.object_name || 'shared symbol'} appears in both ${conflict.worktreeA}/${conflict.fileA || 'unknown'} and ${conflict.worktreeB}/${conflict.fileB || 'unknown'} — review before merging`;
+  });
 }
 
 function buildSessionHighlights(auditEvents = [], queueEvents = []) {
