@@ -7992,9 +7992,11 @@ await testAsync('Review runs a live semantic scan and surfaces current mismatche
 
   try {
     const report = await buildSessionSummary(repoDir, { hours: 24 });
+    const leftPath = `${featureA.split('/').pop()}/src/auth/guard.js`;
+    const rightPath = `${featureB.split('/').pop()}/src/auth/guard.js`;
     assert(report.merge_confidence === 'red', 'Live semantic overlap forces review confidence to red');
     assert(report.semantic_conflicts.some((conflict) => conflict.object_name === 'ensureAuth'), 'Review includes current semantic conflicts from the live scan');
-    assert(report.narrative.includes('flagged: ensureAuth defined in both feature-review-semantic-a/src/auth/guard.js and feature-review-semantic-b/src/auth/guard.js'), 'Review narrative names the semantic symptom in a developer-facing way');
+    assert(report.narrative.includes(`flagged: ensureAuth defined in both ${leftPath} and ${rightPath}`), 'Review narrative names the semantic symptom in a developer-facing way');
     assert(report.narrative.includes('resolve before merging'), 'Review narrative gives an immediate semantic next action');
 
     const output = execFileSync(process.execPath, [
@@ -8008,7 +8010,7 @@ await testAsync('Review runs a live semantic scan and surfaces current mismatche
     });
 
     assert(output.includes('Live semantic scan'), 'CLI review prints the live semantic scan section');
-    assert(output.includes('flagged: ensureAuth defined in both feature-review-semantic-a/src/auth/guard.js and feature-review-semantic-b/src/auth/guard.js'), 'CLI review names the semantic conflict as a flagged symptom');
+    assert(output.includes(`flagged: ensureAuth defined in both ${leftPath} and ${rightPath}`), 'CLI review names the semantic conflict as a flagged symptom');
     assert(output.includes('resolve before merging'), 'CLI review gives the semantic finding an immediate action');
   } finally {
     execSync(`git worktree remove "${featureA}" --force`, { cwd: repoDir });
