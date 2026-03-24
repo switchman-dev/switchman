@@ -1,0 +1,1880 @@
+
+DB initialization
+  ✓ Database created successfully
+  ✓ Database file exists on disk
+
+Task creation
+  ✓ Task ID auto-generated
+  ✓ Three tasks created
+  ✓ Highest priority task is first
+
+Plan command requires Pro and an explicit goal before creating planned tasks
+Switched to a new branch 'feature/47-add-auth'
+  ✓ Plan blocks unpaid usage behind the Pro gate
+  ✓ Plan explains the Pro planning value proposition
+  ✓ Plan points unpaid users at the upgrade command
+  ✓ Plan requires an explicit goal even for Pro users
+  ✓ Plan shows the supported explicit-goal command
+  ✓ Plan shows the supported GitHub issue command too
+  ✓ Plan preview reads repo context first
+  ✓ Plan preview reports the branch and CLAUDE.md in the found context summary
+  ✓ Plan preview explains which context sources it used
+  ✓ Plan preview lists the explicit goal as a planning source
+  ✓ Plan preview lists the branch name as a planning source
+  ✓ Plan preview lists CLAUDE.md as a planning source
+  ✓ Plan preview lists recent git history as a planning source
+  ✓ Plan preview suggests implementation work from the explicit goal
+  ✓ Plan apply creates multiple planned tasks
+  ✓ Plan apply stores a structured task spec for created tasks
+
+Usage report is Pro-gated and summarizes sessions, agents, and spend
+  ✓ Usage blocks unpaid users behind the Pro gate
+  ✓ Usage report aggregates total tokens across events
+  ✓ Usage report groups usage by session
+  ✓ Usage report groups usage by agent
+  ✓ Usage report includes the recorded session id
+  ✓ Usage report includes per-agent rollups
+  ✓ Usage report includes per-model rollups
+
+Start boots a free repo into a real 3-agent local Switchman session
+Switched to a new branch 'feature/47-add-auth'
+- Starting Switchman session...
+✔ Switchman start is ready — 3 agent workspaces and 3 tasks prepared
+  ✓ Start reads repo context before booting the session
+  ✓ Start explains the context it used for the proposed work
+  ✓ Start explains the free-tier coordination mode
+  ✓ Start prints the handoff section once the session is ready
+  ✓ Start creates a repo-aware CLAUDE.md when one does not exist
+  ✓ Free start creates three agent workspaces
+  ✓ Start creates planned tasks automatically
+
+Start allows more than three local agents on free tier
+- Starting Switchman session...
+✔ Switchman start is ready — 4 agent workspaces and 2 tasks prepared
+  ✓ Free start keeps larger local runs on local coordination
+  ✓ Free start can create more than three local agent workspaces
+
+Start self-heals missing local MCP wiring and reports it
+- Setting up Switchman...
+✔ Switchman ready — 1 agent workspace created
+- Starting Switchman session...
+✔ Switchman start is ready — 1 agent workspace and 2 tasks prepared
+  ✓ Start recreates the repo-local MCP config when it is missing
+  ✓ Start recreates the Cursor MCP config when it is missing
+  ✓ Start reports that it repaired local MCP wiring
+
+Start unlocks more than three agents for Pro users
+- Starting Switchman session...
+✔ Switchman start is ready — 4 agent workspaces and 2 tasks prepared
+  ✓ Start reports the Pro tier when a valid licence is present
+  ✓ Pro start can create more than three agent workspaces
+
+Free logged-in users can use shared coordination for one real project
+  ✓ Free shared coordination lets a second repo lease work created elsewhere on the same project
+  ✓ Shared claims can be recorded against the leased task
+  ✓ Shared claims reject cross-repo conflicts on the same free shared project
+  ✓ Shared claim conflicts name the owning remote worktree
+  ✓ Shared task listing reads the team task state from the shared queue
+  ✓ Shared lease listing reads the team lease state from the shared queue
+  ✓ Shared status snapshot reports the shared queue mode
+  ✓ Shared status snapshot includes active team file claims
+  ✓ Shared retry resets a shared task back to pending
+  ✓ Shared retry clears active team leases
+  ✓ Shared retry clears active shared claims
+
+Free shared coordination stays limited to one project key per logged-in user
+(node:45003) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓ Free shared coordination allows one logged-in project
+  ✓ Free shared coordination blocks a second distinct project
+  ✓ Second free shared project reports the project limit reason
+
+Scheduler once dispatches only dependency-ready tasks onto idle workspaces
+file:///Users/ned/Documents/GitHub/switchman/src/cli/index.js:472
+    throw new Error(sharedResult.message || `Shared coordination scheduler dispatch failed (${sharedResult.reason}).`);
+          ^
+
+Error: Requested function was not found
+    at dispatchReadyTasksViaCoordination (file:///Users/ned/Documents/GitHub/switchman/src/cli/index.js:472:11)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Command.<anonymous> (file:///Users/ned/Documents/GitHub/switchman/src/cli/commands/scheduler.js:22:22)
+
+Node.js v22.22.1
+  ✗ THREW: Command failed: /Users/ned/.nvm/versions/node/v22.22.1/bin/node /Users/ned/Documents/GitHub/switchman/src/cli/index.js scheduler once --json
+file:///Users/ned/Documents/GitHub/switchman/src/cli/index.js:472
+    throw new Error(sharedResult.message || `Shared coordination scheduler dispatch failed (${sharedResult.reason}).`);
+          ^
+
+Error: Requested function was not found
+    at dispatchReadyTasksViaCoordination (file:///Users/ned/Documents/GitHub/switchman/src/cli/index.js:472:11)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async Command.<anonymous> (file:///Users/ned/Documents/GitHub/switchman/src/cli/commands/scheduler.js:22:22)
+
+Node.js v22.22.1
+
+
+Start launches the background scheduler by default
+- Starting Switchman session...
+✔ Switchman start is ready — 2 agent workspaces and 2 tasks prepared
+  ✓ Start points operators at the scheduler status command
+  ✓ Start writes scheduler background state by default
+  ✓ Start leaves the background scheduler process running
+
+Plan command can read a GitHub issue through gh and create planned tasks from it
+  ✓ Plan issue mode invokes gh issue view
+  ✓ Plan issue mode requests the selected GitHub issue number
+  ✓ Plan issue mode reports the GitHub issue in the context summary
+  ✓ Plan issue mode explains its context sources
+  ✓ Plan issue mode lists the GitHub issue as a planning source
+  ✓ Plan issue mode plans from the issue title
+  ✓ Plan issue apply creates planned tasks from the GitHub issue
+
+Plan issue mode can post a summary comment back to the GitHub issue after apply
+  ✓ Plan issue comment invokes gh issue comment
+  ✓ Plan issue comment targets the source issue
+  ✓ Plan issue comment writes the summary through a body file
+  ✓ Plan issue comment reports the posted issue summary
+
+Plan apply can post a summary comment to a GitHub pull request
+  ✓ Plan PR comment invokes gh pr comment
+  ✓ Plan PR comment targets the requested pull request
+  ✓ Plan PR comment writes the summary through a body file
+  ✓ Plan PR comment reports the posted PR summary
+
+Planner keeps API documentation updates docs-only and treats payments work as high risk
+  ✓ Docs-only planning stays as a single docs task
+  ✓ Docs-only planning creates a docs task
+  ✓ Docs-only API documentation work stays low risk
+  ✓ Payments planning creates an implementation task
+  ✓ Payments planning is treated as high risk
+  ✓ Payments planning tags the payments subsystem
+
+Setup allows more than three local agents on free tier
+- Setting up Switchman...
+✔ Switchman ready — 4 agent workspaces created
+  ✓ Setup still completes the first-run flow for larger local free runs
+  ✓ Setup creates four local workspaces on free tier
+
+Root help keeps the front door small and points advanced users deeper
+  ✓ Root help includes the task-first start path
+  ✓ Root help includes the one-command merge front door
+  ✓ Root help hides lower-level queue commands from the day-one command list
+  ✓ Root help points power users at advanced help
+
+Task assignment and status flow
+  ✓ Next task is highest priority
+  ✓ Lease acquired successfully
+  ✓ Lease stores the assigned worktree
+  ✓ One task in progress
+  ✓ Worktree correctly set
+  ✓ Cannot re-assign in-progress task
+  ✓ Task exposes its active lease
+  ✓ Task marked as done
+  ✓ Completing a task closes its active lease
+
+Lease execution context exposes task, worktree, spec, and claims as one execution object
+  ✓ Lease execution context returns the active lease
+  ✓ Lease execution context returns the assigned task
+  ✓ Lease execution context returns the assigned worktree
+  ✓ Lease execution context returns the structured task spec
+  ✓ Lease execution context returns active claims for the lease
+
+Lease-scoped completion and failure finalize execution by lease identity
+  ✓ Lease-scoped completion marks the task done
+  ✓ Lease-scoped completion closes the active lease
+  ✓ Lease-scoped failure marks the task failed
+  ✓ Lease-scoped failure records the reason on the task
+
+Worktree registration
+  ✓ Three worktrees registered
+  ✓ Agent correctly stored
+  ✓ Still 3 worktrees after upsert
+
+Worktree registration deduplicates repeated paths under one canonical name
+  ✓ Registering the same worktree path twice does not create duplicate worktrees
+  ✓ The first registered worktree name remains canonical for that path
+
+Worktree registration normalizes aliased paths to one canonical worktree
+  ✓ Aliased real paths do not create duplicate worktrees
+  ✓ Canonical name is preserved when the same worktree is registered through an alias path
+  ✓ Stored worktree path is normalized to its real path
+
+File claims - happy path
+  ✓ Three files claimed
+  ✓ Claims associated with correct worktree
+  ✓ Claims are attached to the active lease
+
+File claims - conflict detection
+  ✓ One conflict detected
+  ✓ Correct conflicting file identified
+  ✓ Conflict correctly attributed to feature-auth
+
+File claims - release
+  ✓ Claims released successfully
+
+File claims auto-release when a task completes
+  ✓ Completing a task releases its active claims automatically
+
+Task queue ordering
+  ✓ Queue returns highest priority first
+
+Merge queue add stores a queued worktree merge item
+  ✓ Queue item starts queued
+  ✓ Queue item is persisted
+  ✓ Queue item stores the queued worktree name
+
+Merge queue error classifier explains untracked local files during landing
+  ✓ Queue error classifier detects untracked-file merge failures
+  ✓ Untracked-file merge failures are retryable after cleanup
+  ✓ Queue error classifier points users at the retry command
+  ✓ Queue error classifier explains the MCP exclude path
+
+Merge front door queues finished worktrees and lands them cleanly
+Preparing worktree (new branch 'feature/merge-a')
+Preparing worktree (new branch 'feature/merge-b')
+  ✓ Merge front door previews the merge order
+  ✓ Merge front door reports a clean landing summary
+  ✓ Merge front door lands the first worktree change onto main
+  ✓ Merge front door lands the second worktree change onto main
+
+Merge queue add materializes a synthetic landing branch for multi-branch pipelines
+Preparing worktree (new branch 'feature/pipeline-a')
+Preparing worktree (new branch 'feature/pipeline-b')
+  ✓ queue add succeeds for a completed multi-branch pipeline
+  ✓ queue add enqueues the synthesized landing branch
+  ✓ queue add targets the synthetic landing branch
+  ✓ queue add creates the synthetic landing branch in git
+
+Fix 29a: queue add blocks pipeline landing when policy requirements are still missing
+Switched to a new branch 'feature/policy-queue-add'
+Switched to branch 'main'
+  ✓ queue add exits non-zero when policy blocks landing
+  ✓ queue add explains that the landing block comes from policy
+  ✓ queue add points at pipeline review as the remediation command
+  ✓ queue add does not enqueue a policy-blocked pipeline
+
+Fix 29a1: policy overrides can unblock governed landing gates and stay visible in the policy record
+Switched to a new branch 'feature/policy-override-queue-add'
+  ✓ Policy state clears missing requirements once they are explicitly overridden
+  ✓ Pipeline status records the overridden task type
+  ✓ Pipeline status carries the active override record
+  ✓ Pipeline status policy record includes the active override history
+  ✓ Policy overrides can be revoked after being recorded
+
+Explain queue reports the blocker, resolved source, and next action
+  ✓ Explain queue prints the queue item header
+  ✓ Explain queue prints the source ref
+  ✓ Explain queue prints a concrete next action
+  ✓ Explain queue JSON returns the queue item
+  ✓ Explain queue JSON carries the next action
+
+Merge queue pipeline resolution requires a completed pipeline and prefers the implementation branch
+Preparing worktree (new branch 'feature/pipeline-impl')
+Preparing worktree (new branch 'feature/pipeline-docs')
+  ✓ Pipeline queueing rejects incomplete pipelines
+  ✓ Completed multi-branch pipelines resolve to a synthetic landing branch
+  ✓ Pipeline queueing materializes the completed landing branch in git
+
+Merge queue pipeline resolution materializes a synthetic landing branch when needed
+Preparing worktree (new branch 'feature/pipeline-docs-a')
+Preparing worktree (new branch 'feature/pipeline-docs-b')
+  ✓ Pipeline queueing resolves to a synthetic landing branch when branches diverge
+  ✓ Synthetic landing branch is created in git
+
+Merge queue run fast-forwards a clean worktree branch into main
+Preparing worktree (new branch 'feature/queue-run')
+  ✓ Queue runner reports a merged queue item
+  ✓ Queue item is marked merged
+  ✓ Merged queue item records the resulting commit
+  ✓ Merged queue work lands on the main branch
+
+Merge queue run prioritizes fresher queued branches before older behind branches
+Preparing worktree (new branch 'feature/queue-stale')
+Preparing worktree (new branch 'feature/queue-fresh')
+  ✓ Queue runner chooses the fresher branch first
+  ✓ Fresh queue item lands before the behind branch
+  ✓ Behind queue item remains queued for a later landing attempt
+
+Merge queue run blocks missing source branches with a clear reason
+  ✓ Queue runner blocks missing source branches
+  ✓ Blocked queue item records the missing-source error code
+  ✓ Blocked queue item provides an exact retry command
+
+Fix 29b: merge queue run blocks queued pipelines on explicit policy failures
+Switched to a new branch 'feature/policy-queue-run'
+Switched to branch 'main'
+  ✓ Queue runner blocks the item when pipeline policy is incomplete
+  ✓ Blocked queue item records a policy-specific error code
+  ✓ Blocked queue item stores a policy-specific summary
+  ✓ Blocked queue item gives the exact policy remediation command
+
+Merge queue retry resets a blocked item back to retrying
+  ✓ Retrying a blocked queue item resets it to retrying
+  ✓ Retrying clears the last error code
+
+Fix 54c: repo repair resets interrupted queue items back to retrying
+  ✓ Repo repair reports that it repaired interrupted state
+  ✓ Repo repair reports the reset queue item
+  ✓ Repo repair resets interrupted queue items to retrying
+  ✓ Repo repair points the operator at queue run next
+
+Fix 56e: repo repair auto-registers git worktrees that exist but are missing from the database
+Preparing worktree (new branch 'feature/repair-register')
+  ✓ Repo repair reports the newly registered git worktree
+  ✓ Repo repair registers the missing git worktree in the database
+
+Fix 54g: repo repair removes stale temporary landing worktrees left by interrupted materialization
+Preparing worktree (detached HEAD 7c5649a)
+  ✓ Repo repair reports that it removed stale temp landing worktree state
+  ✓ Repo repair reports the removed stale temp landing worktree
+  ✓ Repo repair removes the stale temp landing worktree from disk
+  ✓ Repo repair removes the stale temp landing worktree from git metadata
+
+Fix 56f: repo repair marks db worktrees missing when git no longer has them
+  ✓ Repo repair reports the missing db worktree
+  ✓ Repo repair marks the missing db worktree as missing
+
+Fix 56c: repo repair closes interrupted queue journal operations after resetting the queue item
+  ✓ Repo repair reports the closed interrupted queue operation
+  ✓ Repo repair still resets the queue item to retrying
+  ✓ Repo repair marks the interrupted queue journal entry as repaired
+
+Fix 54h: repo repair prunes missing temporary landing worktree metadata left by crashes
+Preparing worktree (detached HEAD e76c7c9)
+  ✓ Repo repair reports that it pruned stale temp landing metadata
+  ✓ Repo repair reports the pruned temp landing metadata
+  ✓ Repo repair prunes missing temp landing worktree metadata from git
+
+Fix 54i: database maintenance pruning removes old released coordination rows
+  ✓ Pruning removes old released file claims
+  ✓ Pruning removes old finished leases
+  ✓ Pruning removes old released scope reservations
+  ✓ Pruning removes snapshots for missing worktrees
+
+Fix 56g: repo repair blocks queued worktree items whose source worktree is missing
+  ✓ Repo repair reports the blocked queue item for a missing worktree
+  ✓ Repo repair blocks the queue item when its source worktree is missing
+  ✓ Blocked queue item records a missing-worktree error code
+
+Fix 56a: queue run records rebase and merge operations in the operation journal
+Preparing worktree (new branch 'feature/queue-journal')
+
+Merge queue run blocks when the repo gate fails before merge
+Preparing worktree (new branch 'feature/queue-gate')
+  ✓ Queue runner blocks when the repo gate fails
+  ✓ Blocked queue item records the gate failure code
+  ✓ Blocked queue item points the operator at the repo gate
+
+Merge queue status JSON includes retry counts and recent queue events
+  ✓ Queue status JSON includes the retry budget
+  ✓ Queue status JSON includes recent queue events
+  ✓ Queue status JSON includes queue counts
+
+Merge queue status explains freshness-based landing priority
+Preparing worktree (new branch 'feature/status-stale')
+Preparing worktree (new branch 'feature/status-fresh')
+  ✓ Queue status picks the fresher branch as the next landing candidate
+  ✓ Queue status JSON includes the freshness assessment for the next item
+  ✓ Queue status JSON explains why the fresh branch lands next
+  ✓ Queue status recommends landing the freshest clear branch now
+  ✓ Queue status surfaces the landing recommendation for the focus item
+
+Merge queue run deprioritizes stale pipeline-backed items behind clear fresh branches
+Preparing worktree (new branch 'feature/stale-pipeline')
+Preparing worktree (new branch 'feature/clear-branch')
+  ✓ Queue runner lands the clear branch before the stale pipeline-backed branch
+  ✓ Clear branch is merged first when the competing pipeline item is stale
+  ✓ Stale pipeline-backed branch stays queued for revalidation
+
+Merge queue status shows stale pipeline items as held back behind clearer landing work
+Preparing worktree (new branch 'feature/held-back-stale')
+Preparing worktree (new branch 'feature/held-back-fresh')
+  ✓ Queue status keeps the clearer branch at the front of the landing queue
+  ✓ Queue status reports the stale pipeline-backed branch as held back
+  ✓ Queue status explains that stale revalidation is why the item is held back
+  ✓ Queue status points at the exact bulk revalidation command for the held-back pipeline
+  ✓ Queue status marks the stale pipeline-backed branch as a hold decision
+  ✓ Queue status recommendations include the branch that should land now
+  ✓ Queue status recommendations include the held-back stale branch
+
+Merge queue status groups stale queue items by shared stale wave for coordinated revalidation
+Preparing worktree (new branch 'feature/wave-clear')
+Preparing worktree (new branch 'feature/wave-a')
+Preparing worktree (new branch 'feature/wave-b')
+  ✓ Queue keeps the clear branch at the front when the stale wave affects other queued goals
+  ✓ Queue recommendations hold both stale-wave items back
+  ✓ Queue recommendations record that the item belongs to one stale causal wave
+  ✓ Queue recommendations record the size of the shared stale wave
+  ✓ Queue recommendations surface the stale wave summary
+  ✓ Queue recommendations steer the operator toward coordinated revalidation for shared stale waves
+
+Merge queue run persists shared stale waves as wave-blocked queue items
+Preparing worktree (new branch 'feature/wave-blocked-a')
+Preparing worktree (new branch 'feature/wave-blocked-b')
+  ✓ Queue run does not process shared stale-wave items
+  ✓ Queue run reports one of the shared stale-wave items as the deferred focus
+  ✓ Queue run still recommends a hold decision for the shared stale wave
+  ✓ Deferred shared stale-wave items are persisted as wave_blocked
+  ✓ Wave-blocked queue items record a dedicated queue code
+  ✓ Wave-blocked queue items keep the exact coordinated revalidation command
+  ✓ Queue retry can reopen wave-blocked items
+
+Merge queue status marks retrying items as retry decisions
+  ✓ Queue status recommends retry for retrying items
+  ✓ Queue status exposes the retry decision for the focus item
+  ✓ Queue recommendations list the retrying queue item as a retry decision
+
+Merge queue status prioritizes fresher high-priority pipeline goals over lower-priority goals
+Preparing worktree (new branch 'feature/high-goal')
+Preparing worktree (new branch 'feature/low-goal')
+  ✓ Queue status prioritizes the higher-priority pipeline goal when freshness is equal
+  ✓ Queue status includes the high goal priority in the assessment
+  ✓ Queue status explains the high-priority landing preference
+  ✓ Queue recommendations still mark the high-priority clear goal as land_now
+
+Merge queue status builds a longer-horizon queue plan across active goals
+Preparing worktree (new branch 'feature/plan-now')
+Preparing worktree (new branch 'feature/plan-later')
+Preparing worktree (new branch 'feature/plan-stale')
+Already on 'main'
+Rebasing (1/1)Successfully rebased and updated refs/heads/feature/plan-now.
+  ✓ Queue plan marks the clearest candidate as land_now
+  ✓ Queue plan marks stale work as unblock_first
+  ✓ Queue plan marks behind work as defer
+  ✓ Queue sequence starts with the clearest landing candidate
+  ✓ Queue sequence includes stale work as a later unblock step
+  ✓ Queue sequence includes behind work as a defer step
+
+Merge queue run can follow the queue plan with a merge budget
+Preparing worktree (new branch 'feature/follow-plan-first')
+Preparing worktree (new branch 'feature/follow-plan-second')
+  ✓ Queue run JSON records that the plan-aware execution policy was enabled
+  ✓ Queue run JSON records the merge budget
+  ✓ Queue run JSON records the number of merges consumed from the budget
+  ✓ Queue run stops after consuming the requested merge budget
+  ✓ Queue run merges the first ranked land_now candidate first
+  ✓ Exactly one queue item is merged when the budget is one
+  ✓ The next land_now candidate stays queued for a later run once the budget is spent
+
+Merge queue run follow-plan defers behind work instead of auto-landing it
+Preparing worktree (new branch 'feature/follow-plan-behind')
+  ✓ Queue run JSON records follow-plan mode for deferred runs too
+  ✓ Queue run does not auto-land non-land_now work in follow-plan mode
+  ✓ Queue run reports the deferred behind item as the current focus
+  ✓ Queue run keeps behind work as a hold decision in follow-plan mode
+  ✓ Behind work is persisted as held rather than being auto-landed
+
+Merge queue status escalates high-risk stale pipeline work instead of quietly holding it
+Preparing worktree (new branch 'feature/risky-escalate')
+Preparing worktree (new branch 'feature/risky-clear')
+  ✓ Queue status keeps the clear branch ahead of stale high-risk work
+  ✓ Queue status escalates high-risk stale work
+  ✓ Queue status records the high integration risk in the assessment
+  ✓ Queue status explains why the stale high-risk branch is escalated
+
+Merge queue run defers held stale work instead of trying to land it
+Preparing worktree (new branch 'feature/defer-hold')
+  ✓ Queue run does not process held stale items
+  ✓ Queue run reports the deferred held item in JSON output
+  ✓ Queue run reports hold as the deferred decision
+  ✓ Deferred held item is persisted as held
+  ✓ Deferred held item records a hold-specific queue code
+
+Merge queue run defers escalated high-risk work instead of landing it blindly
+Preparing worktree (new branch 'feature/defer-escalate')
+  ✓ Queue run does not process escalated items automatically
+  ✓ Queue run reports the deferred escalated item in JSON output
+  ✓ Queue run reports escalate as the deferred decision
+  ✓ Deferred escalated item is persisted as escalated for operator review
+  ✓ Deferred escalated item records an escalation-specific queue code
+
+Merge queue retry can reopen held and escalated items back to retrying
+  ✓ Queue retry reopens held items
+  ✓ Queue retry reopens escalated items
+  ✓ Queue retry can also restart retrying items immediately
+  ✓ Reopening a held item clears the deferred queue code
+  ✓ Reopening an escalated item clears the deferred queue code
+  ✓ Retrying a backoff item clears the deferred retry window
+
+Merge queue run waits for retry backoff windows before retrying work
+  ✓ Queue run leaves retrying items alone while their backoff window is still active
+  ✓ Queue run reports the deferred retry item while waiting for backoff
+  ✓ Queue run keeps the retry recommendation visible for deferred backoff work
+  ✓ Queue run points operators at the exact override command for retry backoff
+  ✓ Retry backoff leaves the queue item in retrying state
+  ✓ Retry backoff keeps the deferred retry window recorded
+
+Merge queue escalate records explicit operator review guidance
+  ✓ Queue escalate marks the item as escalated
+  ✓ Queue escalate records a manual escalation code
+  ✓ Queue escalate gives an exact resume command
+  ✓ Explain queue carries the escalation recovery command
+
+Merge queue run watch mode polls for work and exits after max cycles
+  ✓ Queue watch mode reports that watch mode was enabled
+  ✓ Queue watch mode respects the requested max cycle count
+  ✓ Queue watch mode can poll without processing items
+
+Merge queue run schedules an automatic retry for retryable rebase conflicts
+Preparing worktree (new branch 'feature/queue-auto-retry')
+  ✓ Queue runner schedules a retry for retryable rebase conflicts
+  ✓ Retryable merge failure leaves the queue item in retrying
+  ✓ Retryable merge failure increments the retry count
+
+Merge queue run blocks once retry budget is exhausted for rebase conflicts
+Preparing worktree (new branch 'feature/queue-retry-exhausted')
+  ✓ Queue runner blocks once the retry budget is exhausted
+  ✓ Exhausted retry budget leaves the queue item blocked
+  ✓ Blocking after retry exhaustion does not increment retries again
+
+Fix 1: busy_timeout is set on new connections
+  ✓ busy_timeout is set to 10000ms (expected ≥ 5000)
+
+Fix 55a: initDb records the current schema version explicitly
+  ✓ New Switchman databases record schema version 7 explicitly
+
+Usage events record task context and aggregate token totals
+  ✓ Usage event stores the provided session id
+  ✓ Usage event infers the worktree from the active task lease
+  ✓ Usage event infers the agent from the active task lease
+  ✓ Usage event derives total tokens from prompt and completion usage
+  ✓ Usage events can be listed back from the database
+  ✓ Listed usage events preserve the recorded model
+
+Fix 55b: openDb fails closed for newer schema versions
+  ✓ openDb rejects schema versions newer than the current CLI supports
+
+Fix 55c: openDb refuses to proceed when a migration was left running
+  ✓ openDb fails closed when migration state says a migration was interrupted
+  ✓ Migration failure points operators at the recorded migration state file
+
+Fix 1b: parallel CLI task acquisition avoids transient database lock failures
+- Setting up Switchman...
+✔ Switchman ready — 3 agent workspaces created
+  ✓ All parallel agents acquire a task without database lock failure
+  ✓ Parallel task acquisition still assigns distinct tasks
+
+Setup prints a first-run verification summary
+- Setting up Switchman...
+✔ Switchman ready — 2 agent workspaces created
+  ✓ Setup prints a first-run verification section
+  ✓ Setup verification checks the project database
+  ✓ Setup verification checks local editor config
+  ✓ Setup reports the background monitor status
+  ✓ Setup verification suggests exact next commands
+  ✓ Setup points the operator at the live status dashboard
+  ✓ Setup points the operator at monitor follow-up commands
+  ✓ Setup hides the SQLite experimental warning from first-run output
+  ✓ Setup starts the background monitor by default
+
+Quickcheck gives one clear first-run path in a fresh repo
+  ✓ Quickcheck prints the onboarding summary heading
+  ✓ Quickcheck reports whether login is needed
+  ✓ Quickcheck keeps local-first login messaging calm
+  ✓ Quickcheck ends with one exact next command
+  ✓ Quickcheck points first-time users at switchman start
+  ✓ Quickcheck includes the live dashboard follow-up
+
+Fix 1c: CLI task done succeeds while a transient SQLite write lock is present
+  ✓ task done reaches completion even when a transient lock is present
+
+CLI task done records Pro usage metadata from the environment when provided
+  ✓ task done reports when usage metadata was recorded
+  ✓ task done persists a usage event when usage metadata is present
+  ✓ task done usage event stores the session id
+  ✓ task done usage event stores the combined token total
+  ✓ task done usage event records the event source
+
+Fix 1d: CLI task done warns clearly when the task was already completed
+  ✓ Second task done call warns that the task was already completed
+
+Fix 1e: CLI task done warns clearly when the task is failed
+  ✓ task done warns when the task is failed instead of silently reporting success
+
+Fix 1ea: CLI task done blocks completion when no active lease exists for the in-progress task
+  ✓ task done warns when the task has no active lease
+  ✓ task done does not complete the task without an active lease
+
+Fix 1eb: completeTask refuses to complete a task that is not in progress
+  ✓ completeTask returns not_in_progress for a pending task
+  ✓ Pending tasks remain pending when completeTask is called too early
+
+Fix 2: SWITCHMAN_DIR constant (no stale AGENTQ_DIR)
+  ✓ .switchman/switchman.db created at correct path
+
+Fix 2b: task add warns when a task looks too broad for a first parallel run
+  ✓ task add warns when a task looks broad
+  ✓ task add points users toward pipeline planning for broad work
+
+Fix 2c: blocked claim returns a non-zero exit code for shell automation
+  ✓ Blocked claim exits with status 1
+  ✓ Blocked claim still prints the conflict explanation
+
+Fix 3: claimFiles transaction is atomic (partial failure rolls back)
+  ✓ Transaction rolled back cleanly — no partial claims
+
+Fix 3b: active file claims are unique across tasks
+  ✓ Second active claim for the same file throws
+  ✓ Only one active claim exists for the file
+
+Fix 3ba: database enforces one active claim per file even when callers bypass the pre-check
+  ✓ The database rejects a second active claim for the same file path
+
+Fix 3c: claiming a nonexistent task is rejected
+  ✓ Nonexistent task cannot claim files
+
+Fix 3d: claim paths are normalized before conflict checks and storage
+  ✓ Equivalent paths conflict even when claimed with different relative syntax
+  ✓ Conflict checks normalize equivalent file paths
+  ✓ Stored claim paths are canonicalized
+
+Explain claim reports the current owner and the next safe move
+  ✓ Explain claim normalizes the displayed path
+  ✓ Explain claim prints the owning worktree
+  ✓ Explain claim prints the next safe action
+  ✓ Explain claim JSON returns the explicit owner
+  ✓ Explain claim JSON identifies the owning task
+
+Lease heartbeat refreshes the active session timestamp
+  ✓ Lease is stale before heartbeat refresh
+  ✓ Heartbeat refresh returns the active lease
+  ✓ Heartbeat refresh removes the lease from the stale set
+
+Lease policy defaults load when no repo policy file exists
+  ✓ Missing lease policy falls back to the default stale timeout
+  ✓ Missing lease policy falls back to the default auto-reap behavior
+  ✓ Status auto-reaping is enabled by default
+
+Lease policy writes and reloads persisted settings
+  ✓ Lease policy persists the heartbeat interval
+  ✓ Lease policy persists the stale timeout
+  ✓ Lease policy persists auto-reap-on-status
+  ✓ Lease policy persists requeue-on-reap
+
+Telemetry config defaults to disabled until the user chooses
+  ✓ Telemetry starts unset before opt-in
+  ✓ Telemetry has no install ID before opt-in
+
+Telemetry enable/disable persists an anonymous install ID
+  ✓ Telemetry enable persists an enabled flag
+  ✓ Telemetry enable creates an anonymous install ID
+  ✓ Telemetry disable persists a disabled flag
+  ✓ Telemetry disable keeps the same anonymous install ID
+  ✓ Telemetry config is written to the expected path
+
+Telemetry CLI reports config status and can be enabled explicitly
+  ✓ Telemetry status reports when telemetry is enabled
+  ✓ Telemetry status reports the configured destination
+
+Telemetry send reports not-configured and disabled states clearly
+
+Shared sync buffers retryable cloud failures locally and flushes them on the next successful contact
+  ✓ Telemetry send reports failure when no destination is configured
+  ✓ Telemetry send reports a not_configured reason
+  ✓ Telemetry send reports failure when telemetry is disabled
+  ✓ Telemetry send reports a not_enabled reason
+  ✓ Queue run records a completed rebase operation
+  ✓ Queue run records a completed merge operation
+  ✓ Queue merge journal entry stores merge-result details
+  ✓ Shared sync reports a failed cloud push when the upstream is unavailable
+  ✓ Shared sync queues retryable failures locally
+  ✓ Retryable shared sync failures are buffered on disk
+  ✓ Buffered shared sync events flush after the next successful cloud contact
+  ✓ Shared sync retries the buffered event on the next contact
+
+Stale lease reaping releases claims and re-queues the task
+  ✓ One stale lease was reaped
+  ✓ Stale lease returns the task to pending
+  ✓ Re-queued task clears its assigned worktree
+  ✓ Reaping a stale lease releases active claims
+  ✓ Stale lease is marked expired
+
+Stale lease reaping can fail tasks instead of re-queueing them when policy disables requeue
+  ✓ One stale lease was reaped when requeue is disabled
+  ✓ Stale lease can mark the task failed instead of pending
+  ✓ Failing on stale reap records the stale-lease reason
+
+Lease reap CLI uses the configured stale policy by default
+  ✓ Lease reap CLI uses the configured stale timeout by default
+  ✓ Lease reap CLI expires leases using the configured stale timeout
+
+Fix 54m: stale lease reap at 0 minutes reaps every equally stale active lease in one call
+  ✓ One reap call expires every stale lease at the 0-minute boundary
+  ✓ First stale task returns to pending
+  ✓ Second stale task returns to pending
+
+Status auto-reaps stale leases when policy enables it
+  ✓ Status auto-reaps stale leases when policy enables it
+  ✓ Status auto-reap requeues the task when policy enables requeue
+
+openDb migrates legacy in-progress tasks into leases and backfills claims
+  ✓ Legacy in-progress task receives an active lease on openDb
+  ✓ Legacy active claims are backfilled onto the migrated lease
+
+Fix 4: findRepoRoot resolves main repo root from worktree dir
+Preparing worktree (new branch 'fix-test')
+  ✓ Root from main worktree is correct
+  ✓ Root from linked worktree resolves to main repo
+
+Fix 5: getWorktreeChangedFiles includes untracked files
+  ✓ Untracked file appears in changed-files scan
+
+Fix 6: default ignore list drops node_modules and build output noise
+  ✓ Ignored paths are removed from conflict scans
+  ✓ Non-generated source files are preserved
+  ✓ Nested node_modules paths are ignored
+  ✓ Project MCP config is ignored by default scans
+  ✓ Cursor project MCP config is ignored by default scans
+
+Fix 7: setup MCP config can be written locally without clobbering other servers
+  ✓ Initial MCP config write reports creation
+  ✓ Switchman MCP server is registered
+  ✓ Existing MCP servers are preserved
+  ✓ Switchman MCP server is merged into existing config
+
+Fix 7a: setup can keep project-local MCP files out of merge paths via git excludes
+  ✓ First MCP exclude write updates the repo-local git exclude file
+  ✓ Repo-local git exclude ignores the Claude MCP config
+  ✓ Repo-local git exclude ignores the Cursor MCP config
+  ✓ Second MCP exclude write is idempotent
+
+Cursor MCP config can be written locally without clobbering other servers
+  ✓ Initial Cursor MCP config write reports creation
+  ✓ Cursor MCP config registers the Switchman server
+  ✓ Cursor MCP config preserves existing MCP servers
+  ✓ Cursor MCP config merges in the Switchman server
+
+Windsurf MCP config can be written without clobbering other servers
+  ✓ Windsurf MCP config writes to the expected user config path
+  ✓ Initial Windsurf MCP config write reports creation
+  ✓ Windsurf MCP config registers the Switchman server
+  ✓ Windsurf MCP config preserves existing MCP servers
+  ✓ Windsurf MCP config merges in the Switchman server
+  ✓ Windsurf MCP install CLI prints the written config path
+
+Fix 8: worktree compliance marks unmanaged changes as non-compliant
+  ✓ Unmanaged changed files mark the worktree non-compliant
+  ✓ Unclaimed changed file is reported
+
+Fix 8d: repo compliance carries exact unclaimed files into status consumers
+  ✓ Repo compliance carries the first unclaimed file
+  ✓ Repo compliance carries the second unclaimed file
+
+Fix 8e: worktree list shows exact non-compliant files for dirty worktrees
+  ✓ Worktree list includes a files line for non-compliant worktrees
+  ✓ Worktree list names the exact unclaimed file
+
+Fix 8b: completed claimed work remains governed for compliance checks
+  ✓ Completed governed changes remain observed instead of non-compliant
+  ✓ Completed governed changes are not reported as unclaimed
+
+Fix 8c: active task-scoped changes remain governed for compliance checks
+  ✓ In-scope task-owned changes remain managed without an explicit file claim
+  ✓ In-scope task-owned changes are not reported as unclaimed
+
+Fix 8ca: completed task-scoped changes remain observed after clean completion
+  ✓ Completed in-scope task-owned changes remain observed instead of non-compliant
+  ✓ Completed in-scope task-owned changes are not reported as unclaimed
+
+Fix 9: commit gate passes for claimed files under an active lease
+  ✓ Commit gate allows claimed changes under the active lease
+  ✓ Commit gate inspects the changed claimed file
+
+Fix 10: commit gate rejects unclaimed files
+  ✓ Commit gate rejects unclaimed changes
+  ✓ Missing lease is reported as the rejection reason
+
+Fix 10a: commit gate resolves the registered worktree name in linked worktrees
+Preparing worktree (new branch 'feature/gate-linked')
+  ✓ Commit gate passes for a claimed change in a linked registered worktree
+  ✓ Commit gate reports the registered Switchman worktree name
+
+Fix 11: commit hook installer writes a pre-commit hook
+  ✓ Pre-commit hook file is written
+  ✓ Pre-commit hook runs the Switchman commit gate
+  ✓ Pre-commit hook is executable
+
+Fix 11b: gate hook installer writes both commit and merge hooks
+  ✓ Pre-commit hook is installed by the gate hook installer
+  ✓ Pre-merge-commit hook is installed by the gate hook installer
+  ✓ Pre-merge-commit hook runs the merge gate
+
+Fix 12: managed write gateway allows claimed writes
+  ✓ Write gateway allows a claimed file write
+  ✓ Write gateway updates the file contents
+
+Fix 12a: managed write gateway allows task-scoped writes without an explicit file claim
+  ✓ Validation allows an unclaimed path inside the lease task scope
+  ✓ Scoped validation reports scope ownership
+  ✓ Write gateway allows an in-scope task-scoped write
+  ✓ Write gateway writes scoped content to disk
+
+Fix 13: managed write gateway rejects unclaimed paths
+  ✓ Validation rejects an unclaimed path
+  ✓ Unclaimed write is classified correctly
+  ✓ Write gateway denies an unclaimed path
+  ✓ Denied write returns path_not_claimed
+
+Fix 13z: managed gateways reject path traversal outside the assigned worktree
+  ✓ Traversal validation rejects paths that escape the repo
+  ✓ Traversal validation reports a policy exception requirement
+  ✓ Write gateway denies traversal attempts
+  ✓ Write gateway reports policy_exception_required for traversal
+  ✓ Mkdir gateway denies traversal attempts
+  ✓ Mkdir gateway reports policy_exception_required for traversal
+  ✓ Traversal denial does not create files outside the repo
+  ✓ Traversal denial does not create directories outside the repo
+
+Fix 13a: attaching a conflicting task scope to an active lease is rejected immediately
+  ✓ Conflicting task scope is rejected as soon as it is attached to the active lease
+  ✓ Conflicting task does not keep any active scope reservations after rejection
+
+Fix 13aa: validation still rejects writes into another lease claim inside shared areas
+  ✓ Validation rejects a path already claimed by another active lease
+  ✓ Claim conflicts still use the explicit claim reason code
+
+Fix 13b: overlapping scope reservations are blocked when the second lease starts
+  ✓ First lease acquires its reserved scope normally
+  ✓ Second overlapping lease is blocked at reservation time
+  ✓ Task stays pending when scope reservation fails
+  ✓ Only the first lease keeps active scope reservations after the conflict
+
+Fix 13c: scope reservations are released when a lease completes
+  ✓ Lease creates both path-scope and subsystem reservations
+  ✓ Lease completion releases active scope reservations
+  ✓ Released scope reservations keep a release timestamp for auditability
+
+Fix 14: managed remove gateway enforces the same claim policy
+  ✓ Remove gateway allows a claimed delete
+  ✓ Remove gateway deletes the claimed file
+
+Fix 14b: managed append gateway appends only to claimed files
+  ✓ Append gateway allows appending to a claimed file
+  ✓ Append gateway preserves existing content and appends new content
+
+Fix 14c: managed move gateway requires both source and destination claims
+  ✓ Move gateway allows renaming between two claimed paths
+  ✓ Move gateway removes the source path
+  ✓ Move gateway creates the destination path with the original contents
+
+Fix 14d: managed mkdir gateway allows directories for claimed descendants
+  ✓ Mkdir gateway allows creating a directory that contains a claimed descendant
+  ✓ Mkdir gateway creates the requested directory
+
+Fix 15: runtime monitor logs denied direct writes immediately
+  ✓ Monitor reports the denied direct write
+  ✓ Denied direct write is classified correctly
+  ✓ Denied observed write is written to the audit log
+
+Fix 15b: monitor once explains rogue edits with ownership and exact next commands
+Preparing worktree (new branch 'rogue-watch')
+  ✓ Monitor explains the rogue edit plainly
+  ✓ Monitor shows the current owner of the file
+  ✓ Monitor suggests the status dashboard as a recovery path
+
+Fix 16: runtime monitor treats claimed in-scope writes as allowed
+  ✓ Monitor reports the claimed write as allowed
+  ✓ Monitor reports the claimed file path
+
+Fix 17: managed gateway writes into the assigned linked worktree path
+Preparing worktree (new branch 'linked-test')
+  ✓ Gateway write succeeds for linked worktree lease
+  ✓ Gateway writes into the linked worktree checkout
+  ✓ Gateway does not write into the main repo checkout by mistake
+
+Fix 18: runtime quarantine moves denied added files out of the worktree
+  ✓ Denied runtime write is quarantined
+  ✓ Quarantine action is recorded on the observed event
+  ✓ Quarantined file is removed from the worktree
+  ✓ Quarantined file is moved into the quarantine area
+
+Fix 19: enforcement policy allows generated outputs without explicit claims
+  ✓ Path matcher accepts generated-path policy patterns
+  ✓ Enforcement policy file is written
+  ✓ Generated output covered by policy is allowed
+  ✓ Allowed generated output records the policy exception reason
+
+Fix 20: wrapper mode launches commands with Switchman lease context
+  ✓ Wrapper command succeeds for an active lease
+  ✓ Wrapper injects SWITCHMAN_LEASE_ID
+  ✓ Wrapper injects SWITCHMAN_TASK_ID
+  ✓ Wrapper injects SWITCHMAN_WORKTREE
+  ✓ Wrapper injects SWITCHMAN_REPO_ROOT
+  ✓ Wrapper injects SWITCHMAN_WORKTREE_PATH
+
+Fix 21: wrapper mode rejects expired leases before launch
+  ✓ Wrapper command is denied for an expired lease
+  ✓ Expired lease denial returns lease_expired
+
+Fix 22: repo CI gate rejects unmanaged changes across worktrees
+  ✓ CI gate exits non-zero for unmanaged changes
+  ✓ CI gate reports the repo as rejected
+  ✓ CI gate reports the unmanaged changed file
+
+Fix 22b: gate ci writes GitHub Actions summary and outputs
+  ✓ gate ci writes a GitHub step summary markdown file
+  ✓ gate ci writes GitHub Actions outputs
+
+Fix 22c: gate install-ci writes a GitHub Actions workflow
+  ✓ gate install-ci writes the GitHub Actions workflow file
+  ✓ Installed workflow runs the Switchman CI gate in GitHub Actions
+  ✓ Installed workflow exposes the gate step outputs for follow-up workflow logic
+  ✓ Installed workflow keeps running long enough to publish a readable result
+  ✓ Installed workflow includes an explicit enforcement step for the PR check
+  ✓ Installed workflow only syncs PR state on pull request events
+  ✓ Installed workflow auto-syncs PR state through the hosted sync-pr path
+
+Fix 23: monitor state helpers persist and clear background monitor state
+  ✓ Monitor state file is written
+  ✓ Monitor state can be read back from disk
+  ✓ Monitor state file can be cleared
+
+Fix 24: process liveness helper detects running and exited processes
+  ✓ Liveness helper returns true for a running process
+  ✓ Liveness helper returns false after the process exits
+
+Fix 25: AI merge gate blocks high-risk overlapping subsystem changes
+Preparing worktree (new branch 'feature-auth-a')
+Preparing worktree (new branch 'feature-auth-b')
+  ✓ AI merge gate blocks overlapping high-risk subsystem changes
+  ✓ Blocked pair identifies shared auth subsystem risk
+
+Fix 25a: scan and gates report hierarchical ownership overlaps explicitly
+Preparing worktree (new branch 'feature-owned-a')
+Preparing worktree (new branch 'feature-owned-b')
+- Scanning workspaces for conflicts...
+  ✓ Scan reports shared subsystem ownership explicitly
+  ✓ Scan reports overlapping path scopes explicitly
+  ✓ AI merge gate includes hierarchical ownership overlaps in its output
+  ✓ AI merge gate reasons mention shared subsystem ownership
+  ✓ Repo CI gate rejects ownership boundary overlaps
+  ✓ Repo CI gate returns ownership overlaps in JSON output
+
+Fix 25aa: scan and gates report semantic exported-object overlaps explicitly
+Preparing worktree (new branch 'feature-semantic-a')
+Preparing worktree (new branch 'feature-semantic-b')
+- Scanning workspaces for conflicts...
+  ✓ Scan reports overlapping exported objects explicitly
+  ✓ AI merge gate includes semantic conflicts in JSON output
+  ✓ AI merge gate reasons mention the overlapping exported object
+  ✓ Repo CI gate rejects semantic exported-object overlaps
+  ✓ Repo CI gate returns semantic conflicts in JSON output
+
+Fix 25b: AI merge gate blocks missing boundary validation work for high-risk implementation
+  ✓ AI merge gate blocks when a high-risk ownership boundary is missing validation work
+  ✓ AI merge gate reports the missing completed tests requirement
+  ✓ AI merge gate reports the missing completed governance review requirement
+  ✓ Repo CI gate fails when blocking boundary validations are still missing
+  ✓ Repo CI gate returns the blocking boundary validations in JSON output
+
+Fix 25c: accepted high-risk boundary work creates incremental validation state and follow-up completion satisfies it
+  ✓ Outcome evaluator accepts the implementation work before follow-up validation is complete
+  ✓ Accepted high-risk implementation work records a blocking boundary validation state immediately
+  ✓ Boundary validation state tracks missing tests immediately after the implementation write
+  ✓ Completing the follow-up validation tasks satisfies the incremental boundary validation state
+  ✓ Satisfied boundary validation state clears the missing follow-up task types
+
+Fix 25d: shared-boundary changes mark dependent work stale until it is retried
+  ✓ Outcome evaluator still accepts the new implementation work
+  ✓ Shared subsystem work marks the older completed task stale
+  ✓ Retrying the stale task clears the active dependency invalidation
+
+Fix 25da: explain stale reports why a task is stale and points at task retry
+  ✓ Explain stale prints the task header
+  ✓ Explain stale points at the retry command
+  ✓ Explain stale JSON returns the active invalidations
+  ✓ Explain stale JSON returns the exact retry command
+
+Fix 25db0: explain stale can summarize a whole stale pipeline cluster
+  ✓ Explain stale pipeline prints the pipeline header
+  ✓ Explain stale pipeline prints the affected task list
+  ✓ Explain stale pipeline points at bulk retry
+  ✓ Explain stale pipeline JSON groups invalidations into one cluster
+  ✓ Explain stale pipeline JSON returns the grouped affected tasks
+  ✓ Explain stale pipeline JSON returns the exact retry command
+
+Fix 25db1: explain history and audit change show a pipeline timeline with exact next steps
+  ✓ Explain history prints the pipeline header
+  ✓ Explain history prints a timeline section
+  ✓ Explain history points at the exact recovery command
+  ✓ Explain history JSON includes the pipeline-created event
+  ✓ Explain history JSON includes blocked queue state changes
+  ✓ Explain history JSON includes the current queue state
+  ✓ Explain history JSON surfaces the exact next command
+  ✓ Audit change reuses the same pipeline history report
+  ✓ Audit change JSON includes the same event timeline
+
+Fix 25db: task retry CLI resets stale completed work back to pending
+  ✓ task retry CLI reports that the task was reset
+  ✓ task retry CLI resets the task to pending
+
+Fix 25db1: task retry can recover a stranded in-progress task with no active lease
+  ✓ task retry reports that the stranded in-progress task was reset
+  ✓ task retry resets a stranded in-progress task to pending
+
+Fix 25dc: task retry-stale resets all stale tasks for one pipeline together
+  ✓ task retry-stale reports how many pipeline tasks were reset
+  ✓ task retry-stale resets the first stale task to pending
+  ✓ task retry-stale resets the second stale task to pending
+  ✓ task retry-stale clears active dependency invalidations for the pipeline
+
+Fix 26: AI merge gate passes isolated worktree changes
+Preparing worktree (new branch 'feature-ui')
+Preparing worktree (new branch 'feature-docs')
+  ✓ AI merge gate passes isolated low-overlap changes
+  ✓ All pair analyses pass for isolated changes
+
+Fix 26a: AI merge gate stays calm when only one worktree has local risk signals
+Preparing worktree (new branch 'feature-auth-risk')
+  ✓ AI merge gate does not warn just because one worktree has local risk signals
+  ✓ AI merge gate keeps the single-worktree local-risk summary calm and clearly passing
+
+Fix 26b: AI merge gate reports uncertain when broad parallel changes are too large to score confidently
+Preparing worktree (new branch 'feature-ui-broad')
+Preparing worktree (new branch 'feature-docs-broad')
+Preparing worktree (new branch 'feature-jobs-broad')
+  ✓ AI merge gate uses uncertain when broad parallel changes outgrow its confidence
+  ✓ Uncertain AI gate output recommends manual review
+  ✓ AI merge gate returns explicit uncertainty reasons
+  ✓ Repo CI gate does not treat uncertain AI gate output as merge-safe
+  ✓ Repo CI gate preserves the uncertain AI gate status
+
+Fix 27: pipeline start creates grouped subtasks with suggested worktrees
+  ✓ Pipeline start creates one task per checklist item
+  ✓ Pipeline tasks use stable prefixed IDs
+  ✓ Pipeline tasks capture suggested worktrees
+  ✓ Pipeline start attaches a structured implementation task spec
+  ✓ Pipeline start attaches a structured test task spec
+  ✓ Implementation tasks get a default execution policy
+  ✓ Test tasks get a test-specific execution policy
+  ✓ Implementation task specs include required deliverables
+  ✓ Pipeline task specs are persisted in the database
+
+Fix 27a: planner applies repo change policy to governed domains
+  ✓ Planner keeps required tests for governed auth work
+  ✓ Planner keeps required governance for governed auth work
+  ✓ Planner adds policy-required docs for governed auth work
+  ✓ Planner carries policy rationale into the task spec
+
+Fix 27b: policy-aware followups add missing governed work for sensitive pipelines
+  ✓ Policy-aware followups add missing tests
+  ✓ Policy-aware followups add missing docs
+  ✓ Policy-aware followups add missing governance review
+
+Fix 28: pipeline PR summary combines task status with gate results
+  ✓ Pipeline PR summary returns the requested pipeline ID
+  ✓ Pipeline PR summary includes PR-ready markdown
+  ✓ Pipeline PR summary includes a passing repo gate for a clean repo
+  ✓ Pipeline PR summary generates a reviewer-facing PR title
+  ✓ Pipeline PR summary generates a structured PR body
+  ✓ Pipeline PR summary includes provenance entries for reviewers
+  ✓ Pipeline PR summary includes completed lease provenance
+
+Fix 28p: pipeline PR summary includes active policy requirements
+  ✓ Pipeline PR summary carries the governed domain
+  ✓ Pipeline PR summary carries the missing policy-required task types
+  ✓ Pipeline PR summary carries concrete evidence for satisfied test requirements
+  ✓ Pipeline PR summary carries governance artifact evidence
+  ✓ Pipeline PR summary carries stable policy evidence objects
+  ✓ Pipeline PR summary attributes who or what satisfied each evidence object
+  ✓ Pipeline PR summary carries policy satisfaction history
+  ✓ Pipeline PR markdown includes a policy requirements section
+  ✓ Pipeline PR markdown includes policy satisfaction history lines
+  ✓ Pipeline PR markdown lists the evidence backing satisfied policy requirements
+  ✓ Pipeline PR body includes the active policy domains
+  ✓ Pipeline PR body includes a compact policy evidence summary
+  ✓ Pipeline PR body includes the compact evidence object summary
+
+Fix 28a: pipeline status exposes readable failure context and next action
+  ✓ Pipeline status exposes the structured failure reason code
+  ✓ Pipeline status exposes a readable failure summary
+  ✓ Pipeline status provides a concrete next action for the failure
+  ✓ Pipeline status CLI prints a readable failure summary
+  ✓ Pipeline status CLI prints a concrete next step for failed tasks
+
+Fix 28a1: pipeline status surfaces policy state in JSON and text output
+  ✓ Pipeline status JSON includes the active governed domain
+  ✓ Pipeline status JSON includes missing policy-required work
+  ✓ Pipeline status JSON includes concrete evidence for satisfied requirements
+  ✓ Pipeline status JSON includes stable policy evidence objects
+  ✓ Pipeline status JSON includes policy satisfaction history
+  ✓ Pipeline status text includes the policy panel
+  ✓ Pipeline status text includes the governed domain name
+  ✓ Pipeline status text includes satisfied policy evidence entries
+
+Fix 28aa: doctor surfaces operator-friendly attention and next steps
+  ✓ Doctor reports warning health when failed tasks need attention
+  ✓ Doctor includes the failed task in the attention list
+  ✓ Doctor suggests a concrete next step for the failure
+  ✓ Doctor suggests an exact follow-through command
+  ✓ Doctor attention items include exact commands when available
+  ✓ Doctor JSON surfaces scope ownership for active leases
+  ✓ Doctor CLI prints an attention section
+  ✓ Doctor CLI prints actionable next guidance
+  ✓ Doctor CLI prints exact follow-through commands
+  ✓ Doctor CLI prints scope ownership for active leases
+
+Fix 54d: doctor --repair repairs safe state before reporting health
+  ✓ Doctor JSON includes the repair report when --repair is used
+  ✓ Doctor repair JSON reports the reset queue item
+  ✓ Doctor repair JSON includes structured auto-fixed counts
+  ✓ Doctor text reports the repair preflight state
+  ✓ Doctor --repair leaves interrupted queue items in retrying state
+
+Fix 56l: repair and doctor report structured auto-fixed and manual-review sections
+Preparing worktree (new branch 'feature/repair-reporting-a')
+Preparing worktree (new branch 'feature/repair-reporting-b')
+  ✓ Repair JSON reports auto-fixed item counts
+  ✓ Repair JSON reports manual-review item counts
+  ✓ Repair JSON keeps auto-fixed repair actions in the structured summary
+  ✓ Repair JSON keeps manual-review items in the structured summary
+  ✓ Repair text includes an auto-fixed section
+  ✓ Doctor repair text includes a manual-review section
+
+Status JSON unifies queue, lease policy, and operator attention
+  ✓ Status JSON includes merge queue counts
+  ✓ Status JSON includes the active lease policy
+  ✓ Status JSON includes blocked queue items in attention
+  ✓ Status JSON preserves active lease scope summaries
+  ✓ Status JSON suggests queue follow-up commands
+
+Status warns free users before history expires and nudges multi-author repos toward Pro
+  ✓ Status JSON includes a history retention upgrade hint
+  ✓ Status JSON includes a multi-author team visibility hint
+  ✗ Status text warns before free history expires
+  ✓ Status text surfaces the team visibility upgrade nudge
+  ✓ Status text points the operator at the upgrade command
+
+Status text surfaces one front-door operator view
+  ✓ Status text includes the dashboard banner
+  ✓ Status text hides the SQLite experimental warning
+  ✓ Status text starts with a plain-language summary
+  ✓ Status text highlights the top thing to look at
+  ✓ Status text gives one exact next command near the top
+  ✓ Status text includes the blocked panel
+  ✓ Status text includes merge queue visibility
+  ✓ Status text includes the next action panel
+
+Status watch renders the compact live terminal dashboard
+  ✓ Watch mode uses the dedicated live dashboard banner
+  ✓ Watch mode includes the live agent panel
+  ✓ Watch mode includes the live focus panel
+  ✓ Watch mode includes the live queue panel
+  ✓ Watch mode includes the team and sync panel
+  ✓ Watch mode includes a repo-level summary line
+  ✓ Watch mode includes an at-a-glance focus line
+  ✓ Watch mode includes one exact next command
+  ✓ Watch mode includes the ticker line
+  ✓ Watch mode shows the live refresh cadence
+  ✓ Watch mode shows claimed files under the active agent
+
+CLI help includes examples for the main entrypoint
+  ✓ Top-level help includes a guided start section
+  ✓ Top-level help includes an operator section
+  ✓ Top-level help includes an agent section
+  ✓ Top-level help includes the quick onboarding check
+  ✓ Top-level help includes the one-command start entrypoint
+  ✓ Top-level help includes the Claude guide refresh command
+  ✓ Top-level help includes the explicit first task step
+  ✓ Top-level help marks planning as a Pro operator command
+  ✓ Top-level help includes the review command
+  ✓ Top-level help points power users at the advanced surface
+
+Advanced Homebrew formula command renders a release-ready formula
+  ✓ Homebrew command emits a formula class
+  ✓ Homebrew formula depends on Node 22
+  ✓ Homebrew formula installs through npm into libexec
+  ✓ Homebrew formula links the main Switchman binary
+
+README install section includes the Homebrew path
+  ✓ README includes the Homebrew install command
+  ✓ README install section includes the runtime requirements
+
+Review stays readable on free tier and keeps deeper counterfactuals for Pro
+  ✓ Review prints the heading
+  ✓ Session summary reports blocked rogue edits
+  ✓ Session summary reports recovery activity
+  ✓ Session summary reports landing issues caught
+  ✓ Free session summary stays read-only and hides counterfactual time-saved analysis
+  ✗ Free session summary points at Pro for deeper analysis
+
+Review summary builds a shareable narrative and merge confidence
+  ✓ Review summary classifies warn-level AI gate signals as amber confidence
+  ✓ Review summary narrative explains what was completed
+  ✓ Review summary narrative mentions blocked rogue writes
+  ✓ Review summary keeps the agent identity for completed work
+  ✓ Review summary narrative includes a per-agent task description
+  ✓ Review narrative does not duplicate the same agent task description
+
+Review runs a live semantic scan and surfaces current mismatches
+Preparing worktree (new branch 'feature-review-semantic-a')
+Preparing worktree (new branch 'feature-review-semantic-b')
+  ✓ Live semantic overlap forces review confidence to red
+  ✓ Review includes current semantic conflicts from the live scan
+  ✓ Review narrative names the semantic symptom in a developer-facing way
+  ✓ Review narrative gives an immediate semantic next action
+  ✓ CLI review prints the live semantic scan section
+  ✓ CLI review names the semantic conflict as a flagged symptom
+  ✓ CLI review gives the semantic finding an immediate action
+
+Review stays calm when no completed work exists yet
+  ✓ Empty review windows still keep the honest uncertain state
+  ✓ Empty review windows explain that no work has finished yet
+  ✓ Empty review windows avoid sounding like a warning state
+
+Searchable session history groups retained sessions and filters them by query
+  ✓ Session history search narrows retained history down to matching sessions
+  ✓ Session history keeps searchable narrative context
+  ✓ Session history preserves the session merge confidence
+  ✓ CLI review history search returns the matching retained session
+  ✓ CLI review history search returns the billing session narrative
+
+Team review sharing pulls only shared reviews for this repo and formats them for teammates
+  ✓ Team review sharing filters to teammate reviews for the current repo
+  ✓ Team review share report formats the filtered teammate reviews
+  ✓ Team review share report keeps the teammate identity
+  ✓ Team review share report keeps the shared merge confidence
+  ✓ Team review share report keeps the shared narrative
+
+Insights aggregates recurring amber hotspots across audit history
+  ✓ Insights ranks src/auth as the strongest recurring hotspot
+  ✓ Insights keeps blocked observations in the hotspot summary
+  ✓ Insights includes recurring invalidation reasons
+  ✓ Insights includes recurring validation gaps
+  ✓ Insights prints the heading
+  ✓ Insights text output includes the top hotspot
+  ✓ Insights text output includes a recommendation
+
+Desktop notifications on free tier fire for finished tasks and blocked claims
+  ✓ Free desktop notifications fire when an agent finishes work
+  ✓ Free desktop notifications fire when a claim is blocked
+
+Slack notifications are available on free tier and can be delivered for failed tasks
+  ✓ Free Slack notifications fire when an agent fails a task
+
+Login reports a clear manual fallback when the browser cannot be opened
+
+  Visit this URL to sign in:
+  https://switchman.dev/activate?code=CALM-9131
+
+  Your code: CALM-9131
+
+  Waiting for authorization...
+  ✓ Login fails cleanly when the browser cannot be opened
+  ✓ Login classifies browser launch failures explicitly
+  ✓ Login explains the browser-open problem plainly
+  ✓ Login returns the manual activate URL
+  ✓ Login returns the short manual authorization code
+  ✓ Login still creates the auth session before reporting the browser problem
+
+Login times out with the exact manual recovery information still visible
+
+  Visit this URL to sign in:
+  https://switchman.dev/activate?code=CLEAR-9280
+
+  Your code: CLEAR-9280
+
+  Waiting for authorization...
+  ✓ Login fails cleanly after the authorization timeout
+  ✓ Login classifies authorization timeouts explicitly
+  ✓ Login explains the timeout plainly
+  ✓ Login keeps the activate URL on timeout
+  ✓ Login keeps the sign-in code on timeout
+  ✓ Login polls the pending auth session before timing out
+
+Claude refresh writes a repo-aware CLAUDE.md from local repo signals
+  ✓ Claude refresh reports the generated guide
+  ✓ Claude refresh detects the repo stack
+  ✓ Claude refresh lists key repo paths
+  ✓ Claude refresh captures the repo test command
+  ✓ Claude refresh captures the repo lint command
+  ✓ Claude refresh includes recovery guidance
+
+Claude refresh can preview the generated guide without writing the file
+  ✓ Claude refresh --print renders the generated guide
+  ✓ Claude refresh --print does not write CLAUDE.md
+
+Fix 28k: demo command creates a self-contained proof repo with blocked overlap and safe landing
+  ✓ Demo returns the requested repo path
+  ✓ Demo leaves the proof repo on disk by default
+  ✓ Demo identifies the overlapping file it blocked
+  ✓ Demo records the blocked overlap explanation
+  ✓ Demo lands the queued work safely through the queue
+  ✓ Demo finishes with a clean final gate summary
+  ✓ Demo repo includes the merged implementation change on main
+  ✓ Demo repo includes the merged docs change on main
+
+Status on a fresh setup gives first-run guidance instead of generic healthy output
+  ✓ Fresh status collapses to a quiet empty state
+  ✓ Fresh status makes the first command obvious
+  ✓ Fresh status suggests adding a first task
+  ✓ Fresh status points at the demo as the shortest proof path
+  ✓ Fresh status JSON uses the first-run summary
+  ✓ Fresh status JSON includes the demo in suggested commands
+
+Status JSON surfaces buffered shared sync state when cloud events are pending
+  ✓ Status JSON includes the buffered shared sync count
+  ✓ Status JSON carries the buffered shared sync state in the team panel
+  ✓ Status JSON includes the last buffered shared sync error
+
+Shared coordination can recover abandoned team work through the shared queue
+  ✓ Shared recover can request abandoned-work recovery from the shared queue
+  ✓ Shared recover reports recovered stale leases from team state
+  ✓ Shared recover carries claimed files from the abandoned shared work
+
+Recover command resets stale leases and stranded tasks while summarizing abandoned changes
+  ✓ Recover reports one stale lease recovered
+  ✓ Recover reports one stranded task recovered
+  ✓ Recover summarizes changed files left by the stale lease
+  ✓ Recover summarizes the files claimed by the stale lease
+  ✓ Recover reports the stale task was returned to pending
+  ✓ Recover summarizes changed files left by the stranded task
+  ✓ Recover reports the stranded task was returned to pending
+  ✓ Recover points operators back to the main status view
+  ✓ Recover resets the stale task to pending
+  ✓ Recover resets the stranded task to pending
+  ✓ Recover leaves no active lease behind for the abandoned work
+
+Queue status help explains when to use it
+  ✓ Queue status help explains its operator use case
+  ✓ Queue status help explains the questions it answers
+
+Queue status collapses to one clear empty-state next step when nothing is queued
+  ✓ Queue status explains the empty state plainly
+  ✓ Queue status gives one exact next step when empty
+
+Fix 55f: status points dirty worktrees at the exact worktree path and git fix flow
+  ✓ Dirty-worktree status points at the exact worktree path to inspect
+  ✓ Dirty-worktree status explains the fix instead of only saying to rescan
+
+Pipeline status help explains when to use it
+  ✓ Pipeline status help explains its operator use case
+  ✓ Pipeline status help includes a JSON example
+
+Doctor help explains when to use it
+  ✓ Doctor help explains its operator use case
+  ✓ Doctor help includes a JSON example
+
+Lease help explains the term and shows examples
+  ✓ Lease help includes plain-English vocabulary guidance
+  ✓ Lease help includes a practical example
+
+Worktree help includes the workspace alias and plain-English explanation
+  ✓ Worktree help includes the plain-English alias example
+  ✓ Worktree help explains the term in plain English
+
+Claim without files suggests the next command clearly
+  ✓ Claim without files includes a next-step hint
+  ✓ Claim without files suggests the exact next command shape
+
+Verify-setup reports missing local editor config clearly
+- Setting up Switchman...
+✔ Switchman ready — 1 agent workspace created
+  ✓ verify-setup exits non-zero when required setup pieces are missing
+  ✓ verify-setup reports missing Cursor config
+  ✓ verify-setup points users at start as the self-healing path
+  ✓ verify-setup suggests how to restore local editor config
+  ✓ verify-setup suggests generating a repo-aware CLAUDE guide
+
+Fix 28ab: doctor and repo gate surface stale dependency invalidations
+  ✓ Doctor includes stale dependency invalidations in the attention list
+  ✓ Doctor surfaces stale dependency invalidations in merge readiness
+  ✓ Doctor groups stale invalidations into pipeline clusters
+  ✓ Doctor points stale work at the exact retry command
+  ✓ Doctor text includes a dedicated stale clusters panel
+  ✓ Doctor text names the affected stale pipeline
+  ✓ Status JSON includes grouped stale clusters
+  ✓ Status text includes a dedicated stale clusters panel
+  ✓ Repo gate fails while stale dependency invalidations are unresolved
+  ✓ Repo gate returns stale dependency invalidations in JSON output
+
+Fix 28ab1: dependency invalidations record semantic exported-object drift
+  ✓ Dependency invalidations include a semantic exported-object overlap reason
+  ✓ Semantic invalidations record the exported object name that drifted
+  ✓ Doctor JSON surfaces semantic exported-object invalidations
+
+Fix 28ab2: dependency invalidations escalate exported contract drift into contract revalidation sets
+  ✓ Dependency invalidations include a semantic contract drift reason
+  ✓ Contract invalidations record the exported contract name that drifted
+  ✓ Contract invalidations classify the revalidation set as contract
+  ✓ Doctor JSON groups contract drift into a stale cluster
+  ✓ Contract drift stale clusters are labeled as contract revalidation sets
+
+Fix 28ab3: stale clusters prioritize urgent contract revalidation ahead of lower-priority stale work
+  ✓ High-priority contract drift sorts to the front of stale clusters
+  ✓ High-priority contract drift is marked urgent for rerun
+  ✓ Urgent contract drift gets a higher rerun priority score than lower-priority stale work
+
+Fix 28ab4: dependency invalidations detect shared module drift across goals
+  ✓ Dependency invalidations include a shared module drift reason
+  ✓ Shared module drift records the changed module path
+  ✓ Shared module drift records dependent files in the affected goal
+  ✓ Shared module drift classifies the revalidation set as shared_module
+  ✓ Doctor JSON groups shared module drift into a stale cluster
+  ✓ Shared module drift stale clusters are labeled as shared-module revalidation sets
+  ✓ Shared module drift contributes rerun priority for stale cluster ordering
+
+Fix 28ab5: stale clusters prioritize broader shared-module stale waves ahead of narrower ones
+  ✓ Broader shared-module stale wave sorts ahead of narrower stale work
+  ✓ Broader shared-module stale wave gets a higher breadth score
+  ✓ Broader shared-module stale wave gets a higher rerun priority score
+
+Fix 28ab6: stale clusters group multiple pipelines into one causal stale wave
+  ✓ Doctor JSON includes both stale clusters in the causal wave
+  ✓ Clusters caused by the same upstream module share one causal group id
+  ✓ Clusters record the size of the shared stale wave
+  ✓ Each cluster lists the other affected pipeline in the stale wave
+  ✓ Clusters summarize the upstream stale wave cause
+
+Fix 28ab7: pipeline summaries and GitHub outputs expose stale causal waves
+  ✓ Pipeline bundle JSON includes stale causal waves
+  ✓ PR artifact carries stale causal wave state
+  ✓ PR summary markdown includes a stale waves section
+  ✓ Pipeline bundle trust audit includes active stale-wave entries
+  ✓ Landing summary trust audit includes active stale-wave entries
+  ✓ GitHub step summary includes stale causal waves
+  ✓ GitHub outputs include stale wave count
+  ✓ GitHub outputs include stale wave summary
+
+Fix 28b: planner emits subsystem-aware specs for high-risk work
+  ✓ High-risk work produces implementation, tests, docs, and safety review tasks
+  ✓ Planner marks auth/API/migration work as high risk
+  ✓ Planner tags auth-related implementation tasks with auth subsystem metadata
+  ✓ Planner narrows implementation scope to auth-related paths
+  ✓ Planner keeps source as the required deliverable for implementation work
+  ✓ Planner records tests as a follow-up deliverable for high-risk implementation work
+  ✓ Planner records docs as a follow-up deliverable for API/schema-related implementation work
+  ✓ Planner requires completed tests for high-risk ownership-boundary implementation work
+  ✓ Planner requires completed governance review for sensitive ownership-boundary implementation work
+  ✓ Planner marks auth/schema/payment boundary validation as blocking
+  ✓ Planner gives high-risk implementation tasks a stricter execution timeout
+  ✓ Planner keeps high-risk implementation retries constrained
+  ✓ Planner keeps generated test work dependent on implementation
+  ✓ Planner gives safety-review tasks governance-oriented allowed paths
+  ✓ Planner gives governance tasks a unique review artifact path
+  ✓ Planner allows governance tasks to write their unique review artifact
+
+Fix 28bb: planner uses repo structure to narrow task scope
+  ✓ Planner narrows implementation scope to the relevant auth area in the repo
+  ✓ Planner avoids unrelated repo areas when narrowing task scope
+  ✓ Planner narrows generated test work to the relevant test subtree
+  ✓ Planner narrows docs work using the repo docs layout
+
+Fix 28c: pipeline PR summary includes reviewer risk notes for high-risk work
+  ✓ Pipeline PR summary includes reviewer risk notes for high-risk tasks
+  ✓ Pipeline PR summary carries subsystem tags into the reviewer artifact
+
+Fix 28d: pipeline bundle exports reviewer-ready files to disk
+  ✓ Pipeline bundle exports to the requested output directory
+  ✓ Pipeline bundle writes the JSON summary file
+  ✓ Pipeline bundle writes the markdown summary file
+  ✓ Pipeline bundle writes the PR body markdown file
+  ✓ Pipeline bundle writes the landing summary JSON artifact
+  ✓ Pipeline bundle writes the landing summary markdown artifact
+  ✓ Pipeline bundle writes reviewer checklist content into the PR body file
+  ✓ Pipeline bundle summary markdown includes lease provenance for completed work
+  ✓ Pipeline landing summary markdown includes assembled component branches
+  ✓ Pipeline landing summary JSON reports when the pipeline is not queued yet
+  ✓ Pipeline landing summary JSON reports that no recovery worktree is active by default
+
+Fix 28d0: pipeline bundle carries stale cluster state into PR and landing artifacts
+  ✓ PR summary JSON includes grouped stale cluster state
+  ✓ PR artifact carries stale cluster state for reviewers
+  ✓ PR summary JSON includes stale-wave trust audit entries
+  ✓ PR summary markdown includes a stale clusters section
+  ✓ PR summary markdown includes a trust audit section
+  ✓ Landing summary JSON includes grouped stale clusters
+  ✓ Landing summary JSON includes stale-wave trust audit entries
+  ✓ Landing summary markdown includes a stale clusters section
+  ✓ Landing summary markdown includes a trust audit section
+  ✓ Landing summary points stale pipelines at the exact bulk retry command
+
+Fix 28d0a: pipeline bundle carries policy audit entries into PR and landing artifacts
+  ✓ PR summary JSON includes policy trust audit entries
+  ✓ PR artifact carries policy trust audit entries
+  ✓ PR artifact carries a policy satisfaction history array
+  ✓ PR summary markdown includes the trust audit section for policy changes
+  ✓ Landing summary JSON includes policy trust audit entries
+  ✓ Landing summary JSON carries a policy evidence object array too
+
+Fix 28d1: pipeline bundle writes GitHub Actions landing summary and outputs
+  ✓ Pipeline bundle writes a GitHub step summary for landing state
+  ✓ Pipeline bundle step summary includes a dedicated check summary section
+  ✓ Pipeline bundle step summary includes a stable check name
+  ✓ Pipeline bundle step summary includes a check-friendly title
+  ✓ Pipeline bundle step summary includes a one-line check summary
+  ✓ Pipeline bundle step summary includes stale cluster context for PR checks
+  ✓ Pipeline bundle step summary includes the trust audit section
+  ✓ Pipeline bundle step summary includes queue state for PR-facing checks
+  ✓ Pipeline bundle writes the pipeline ID to GitHub outputs
+  ✓ Pipeline bundle writes the landing branch to GitHub outputs
+  ✓ Pipeline bundle writes a reusable check name to GitHub outputs
+  ✓ Pipeline bundle writes a reusable check status to GitHub outputs
+  ✓ Pipeline bundle writes a reusable check title to GitHub outputs
+  ✓ Pipeline bundle writes a reusable check summary to GitHub outputs
+  ✓ Pipeline bundle writes queue status to GitHub outputs
+  ✓ Pipeline bundle writes queue target branch to GitHub outputs
+  ✓ Pipeline bundle writes stale cluster count to GitHub outputs
+  ✓ Pipeline bundle writes trust audit count to GitHub outputs
+  ✓ Pipeline bundle writes trust audit summary to GitHub outputs
+
+Fix 28d2: pipeline bundle reflects queued pipeline state in GitHub check outputs
+  ✓ Queued pipelines render a pending check status for GitHub summaries
+  ✓ Queued pipelines explain that landing is already queued
+  ✓ Queued pipelines include the active queue item in the step summary
+  ✓ Queued pipelines export the queue status for GitHub checks
+  ✓ Queued pipelines export the queue item id for GitHub checks
+
+Fix 28da: semantic materialize writes a deterministic semantic index artifact
+  ✓ Semantic materialize writes the semantic index artifact
+  ✓ Semantic index includes the main worktree
+  ✓ Semantic index materializes exported code objects deterministically
+
+Fix 28db: canonical object store can import, update, and materialize exported code objects
+  ✓ Object import stores exported code objects canonically
+  ✓ Object import captures the exported ensureAuth function
+  ✓ Object materialize rewrites files from the canonical object store
+  ✓ Object materialize keeps other canonical exported objects in the same file
+
+Fix 28e: pipeline publish creates a hosted PR through gh with bundle content
+Switched to a new branch 'feature/docs-refresh'
+  ✓ Pipeline publish infers the head branch from the pipeline worktree when possible
+  ✓ Pipeline publish invokes gh pr create
+  ✓ Pipeline publish passes the generated PR body file to gh
+  ✓ Pipeline publish passes the generated PR title to gh
+
+Fix 28e1: pipeline comment posts the landing summary to a GitHub PR
+Switched to a new branch 'feature/docs-refresh'
+  ✓ Pipeline comment returns the PR number
+  ✓ Pipeline comment invokes gh pr comment
+  ✓ Pipeline comment passes the landing summary markdown file to gh
+  ✓ Pipeline comment targets the requested PR number
+  ✓ Pipeline comment reuses the landing summary artifact
+
+Fix 28e2: pipeline comment can update an existing GitHub PR comment
+Switched to a new branch 'feature/docs-refresh'
+  ✓ Pipeline comment reports when it is updating an existing comment
+  ✓ Pipeline comment can update the last GitHub comment
+  ✓ Pipeline comment can create the comment if none exists yet
+
+Fix 28e3: pipeline comment can resolve the PR number from GitHub Actions env
+Switched to a new branch 'feature/docs-refresh'
+  ✓ pipeline comment resolves the PR number from the GitHub event payload
+  ✓ pipeline comment uses the resolved PR number when calling gh
+
+Fix 28e4: pipeline sync-pr bundles artifacts, writes GitHub outputs, and updates the PR comment
+Switched to a new branch 'feature/docs-refresh'
+  ✓ pipeline sync-pr resolves the PR number from GitHub Actions env
+  ✓ pipeline sync-pr updates the PR comment
+  ✓ pipeline sync-pr writes the GitHub step summary
+  ✓ pipeline sync-pr writes GitHub check outputs
+
+Fix 28e5: pipeline sync-pr can infer the pipeline from GitHub branch context
+Preparing worktree (new branch 'feature/docs-refresh')
+  ✓ pipeline sync-pr infers the pipeline id from the GitHub branch context
+  ✓ pipeline sync-pr still updates the PR comment after branch-based inference
+
+Fix 28e6: pipeline sync-pr can skip cleanly when no pipeline matches the GitHub branch
+Switched to a new branch 'feature/unknown-branch'
+  ✓ pipeline sync-pr can skip successfully when branch inference finds no matching pipeline
+  ✓ pipeline sync-pr reports why the hosted sync was skipped
+
+Fix 28f: pipeline publish prefers the implementation worktree branch in multi-worktree pipelines
+  ✓ Pipeline publish infers the implementation worktree branch when multiple worktree branches exist
+  ✓ Pipeline publish passes the inferred implementation branch to gh
+
+Fix 29c: pipeline publish blocks when policy-backed landing evidence is still missing
+Switched to a new branch 'feature/policy-publish'
+  ✓ pipeline publish exits non-zero when policy blocks landing
+  ✓ pipeline publish reports a policy-backed landing block
+  ✓ pipeline publish points at pipeline review as the exact remediation command
+  ✓ pipeline publish does not call gh when policy blocks landing
+
+Fix 28fa: pipeline land materializes a synthetic integration branch for multi-branch pipelines
+Preparing worktree (new branch 'feature/pipeline-land-a')
+Preparing worktree (new branch 'feature/pipeline-land-b')
+  ✓ Pipeline land reports that it created a synthetic branch
+  ✓ Pipeline land uses the default synthetic branch name
+  ✓ Synthetic landing branch includes the first component branch changes
+  ✓ Synthetic landing branch includes the second component branch changes
+
+Fix 28fc: pipeline land detects stale synthetic branches and refreshes them explicitly
+Preparing worktree (new branch 'feature/pipeline-refresh-a')
+Preparing worktree (new branch 'feature/pipeline-refresh-b')
+  ✓ Initial landing branch is materialized synthetically
+  ✓ Pipeline land reports that the synthetic branch is stale after a component branch moves
+  ✓ Pipeline land points the operator at the refresh command
+  ✓ Pipeline status JSON exposes landing branch status
+  ✓ Pipeline status marks the landing branch stale after branch drift
+  ✓ Pipeline status names the component branch that drifted
+  ✓ Refreshing reports that the landing branch was rebuilt
+  ✓ Refreshing updates the synthetic landing branch head commit
+  ✓ Refreshing rebuilds the synthetic branch with the moved component branch content
+
+Fix 28fd: pipeline land reuses an up-to-date synthetic branch without rewriting it
+Preparing worktree (new branch 'feature/pipeline-reuse-a')
+Preparing worktree (new branch 'feature/pipeline-reuse-b')
+  ✓ First landing branch creation materializes a fresh synthetic branch
+  ✓ Second landing branch call reuses the up-to-date synthetic branch
+  ✓ Reusing the landing branch keeps the same synthetic head commit
+
+Fix 28fe: explain landing reports merge-conflict refresh failures with the blocked branch and next step
+Preparing worktree (new branch 'feature/pipeline-conflict-a')
+Preparing worktree (new branch 'feature/pipeline-conflict-b')
+  ✓ Landing refresh failure points the operator at explain landing
+  ✓ Explain landing reports the landing failure
+  ✓ Explain landing names the component branch that blocked the merge
+  ✓ Explain landing gives the exact recovery command
+  ✓ Explain landing JSON classifies merge conflicts explicitly
+  ✓ Explain landing JSON reports the blocked component branch
+  ✓ Explain landing JSON points merge conflicts at recovery mode
+  ✓ Explain landing JSON includes the conflicting file list
+  ✓ Pipeline status JSON surfaces the landing failure classification
+
+Fix 28fg: pipeline land recover creates a conflict-ready recovery worktree
+Preparing worktree (new branch 'feature/pipeline-recover-a')
+Preparing worktree (new branch 'feature/pipeline-recover-b')
+  ✓ Recovery worktree reports the component branch that blocked landing
+  ✓ Recovery worktree reports the conflicting file
+  ✓ Recovery worktree returns an exact inspect command
+  ✓ Recovery worktree returns the resume command
+  ✓ Recovery worktree leaves the conflict in progress for manual resolution
+  ✓ Recovery worktree checks out the landing branch for the operator
+
+Fix 28fga: pipeline land recover reuses an existing recovery worktree unless replaced
+Preparing worktree (new branch 'feature/pipeline-dup-a')
+Preparing worktree (new branch 'feature/pipeline-dup-b')
+  ✓ Duplicate recovery creation reuses the existing recovery worktree when it is still valid
+  ✓ Reused recovery keeps the same recovery path
+  ✓ Replacing recovery removes the previous recovery worktree
+  ✓ Replacing recovery creates a fresh recovery worktree
+
+Fix 56h: pipeline land recover is idempotent when the existing recovery worktree is still valid
+Preparing worktree (new branch 'feature/pipeline-recover-idempotent-a')
+Preparing worktree (new branch 'feature/pipeline-recover-idempotent-b')
+  ✓ Rerunning recover reuses the existing recovery worktree
+  ✓ Idempotent recover returns the same recovery path
+
+Fix 28fh: pipeline land resume marks a resolved recovery branch ready for queueing
+Preparing worktree (new branch 'feature/pipeline-resume-a')
+Preparing worktree (new branch 'feature/pipeline-resume-b')
+  ✓ Resume keeps the synthetic landing branch as the governed head
+  ✓ Resume returns the exact queue follow-up command
+  ✓ Explain landing clears the previous merge failure once recovery is resumed
+  ✓ Explain landing points resumed recovery at queueing
+  ✓ Pipeline status clears the previous landing failure after resume
+  ✓ Pipeline status tracks the resolved landing commit as the current head
+  ✓ Queue add uses the resumed landing branch
+
+Fix 56i: pipeline land resume is idempotent after the recovery is already resumed
+Preparing worktree (new branch 'feature/pipeline-resume-idempotent-a')
+Preparing worktree (new branch 'feature/pipeline-resume-idempotent-b')
+  ✓ First resume performs the recovery handoff
+  ✓ Second resume reports the recovery as already resumed
+  ✓ Idempotent resume keeps the same landing head commit
+
+Fix 28fi: pipeline land cleanup removes recorded recovery worktrees and clears landing state
+Preparing worktree (new branch 'feature/pipeline-cleanup-a')
+Preparing worktree (new branch 'feature/pipeline-cleanup-b')
+  ✓ Cleanup removes an on-disk recovery worktree
+  ✓ Cleanup targets the recorded recovery path by default
+  ✓ Cleanup removes the recorded recovery path from disk
+  ✓ Cleanup clears the recorded recovery state from explain landing
+
+Fix 28fj: pipeline land cleanup clears missing recorded recovery paths without failing
+Preparing worktree (new branch 'feature/pipeline-cleanup-missing-a')
+Preparing worktree (new branch 'feature/pipeline-cleanup-missing-b')
+  ✓ Cleanup does not fail when the recovery worktree was already removed
+  ✓ Cleanup reports that the recorded recovery path was already gone
+  ✓ Cleanup clears missing recovery paths from landing state too
+
+Fix 54a: pipeline repair clears broken recovery metadata automatically
+Preparing worktree (new branch 'feature/pipeline-repair-a')
+Preparing worktree (new branch 'feature/pipeline-repair-b')
+  ✓ Pipeline repair reports that it repaired broken state
+  ✓ Pipeline repair clears missing recovery metadata
+  ✓ Pipeline repair clears the broken recovery record from landing state
+
+Fix 54b: pipeline repair refreshes stale synthetic landing branches idempotently
+Preparing worktree (new branch 'feature/pipeline-repair-refresh-a')
+Preparing worktree (new branch 'feature/pipeline-repair-refresh-b')
+  ✓ Pipeline repair reports that it refreshed stale landing state
+  ✓ Pipeline repair refreshes stale synthetic landing branches
+  ✓ Pipeline repair leaves the landing branch current
+  ✓ Pipeline repair updates the synthetic landing branch head commit
+  ✓ Pipeline repair is idempotent once the landing branch is current again
+
+Fix 54e: pipeline repair clears recovery metadata when the recovery path still exists but is no longer a git worktree
+Preparing worktree (new branch 'feature/pipeline-repair-untracked-a')
+Preparing worktree (new branch 'feature/pipeline-repair-untracked-b')
+  ✓ Explain landing classifies an on-disk but untracked recovery path explicitly
+  ✓ Pipeline repair reports that it repaired the untracked recovery metadata
+  ✓ Pipeline repair clears untracked recovery metadata
+  ✓ Pipeline repair clears the untracked recovery record from landing state
+
+Fix 56d: repo repair closes interrupted pipeline journal operations after pipeline repair succeeds
+Preparing worktree (new branch 'feature/repair-pipeline-journal-a')
+Preparing worktree (new branch 'feature/repair-pipeline-journal-b')
+  ✓ Repo repair reports the repaired pipeline
+  ✓ Repo repair reports the closed interrupted pipeline operation
+  ✓ Repo repair marks the interrupted pipeline journal entry as repaired
+
+Fix 54f: pipeline repair re-materializes a synthetic landing branch when the ref exists without recorded landing state
+Preparing worktree (new branch 'feature/pipeline-repair-reconcile-a')
+Preparing worktree (new branch 'feature/pipeline-repair-reconcile-b')
+  ✓ Pipeline status starts without recorded landing materialization
+  ✓ Synthetic landing branch ref exists before repair
+  ✓ Pipeline repair reports that it reconciled the landing branch state
+  ✓ Pipeline repair re-materializes landing state when the ref exists without audit history
+  ✓ Pipeline repair records landing materialization state after reconciliation
+
+Fix 56b: pipeline landing records materialization and recovery operations in the operation journal
+Preparing worktree (new branch 'feature/pipeline-journal-a')
+Preparing worktree (new branch 'feature/pipeline-journal-b')
+  ✓ Landing materialization journal records the failed merge-conflict attempt
+  ✓ Landing materialization journal stores the failure reason code
+  ✓ Landing recovery preparation is journaled as completed
+  ✓ Landing recovery journal stores the recovery worktree path
+
+Fix 56j: pipeline landing resources are tracked through landing and recovery lifecycle changes
+Preparing worktree (new branch 'feature/pipeline-resource-a')
+Preparing worktree (new branch 'feature/pipeline-resource-b')
+  ✓ Landing materialization releases its tracked temp worktree resource after cleanup
+  ✓ Recovery preparation records the active recovery worktree resource path
+  ✓ Recovery resume marks the tracked recovery worktree resource as resolved
+  ✓ Recovery cleanup marks the tracked recovery worktree resource as released
+
+Fix 56k: repo repair reconciles missing tracked recovery resources
+Preparing worktree (new branch 'feature/repair-recovery-resource-a')
+Preparing worktree (new branch 'feature/repair-recovery-resource-b')
+  ✓ Repo repair reports when it reconciles a missing tracked recovery resource
+  ✓ Repo repair marks the missing tracked recovery resource as abandoned
+
+Fix 28ff: explain landing reports missing component branches clearly
+Preparing worktree (new branch 'feature/pipeline-missing-a')
+Preparing worktree (new branch 'feature/pipeline-missing-b')
+  ✓ Missing branch failures point at explain landing
+  ✓ Explain landing JSON classifies missing component branches
+  ✓ Explain landing preserves the exact retry command
+  ✓ Explain landing tells the operator to restore the missing branch first
+
+Fix 28fb: pipeline publish materializes a synthetic landing branch when multiple completed branches exist
+Preparing worktree (new branch 'feature/publish-synth-a')
+Preparing worktree (new branch 'feature/publish-synth-b')
+  ✓ Pipeline publish uses the synthetic landing branch when multiple completed branches exist
+  ✓ Pipeline publish reports the synthetic landing strategy
+  ✓ Pipeline publish passes the synthetic branch to gh
+
+Fix 29: pipeline run dispatches pending tasks onto available worktrees
+  ✓ Pipeline run dispatches only dependency-ready tasks
+  ✓ Pipeline run reports no additional ready tasks once dependent work is held back
+  ✓ Only the dependency-free task moves into in_progress
+
+Fix 30: pipeline run launches agent commands with Switchman env
+Preparing worktree (new branch 'pipeline-launch')
+  ✓ Pipeline run launches one command per assigned task
+  ✓ Launched pipeline command receives SWITCHMAN_PIPELINE_ID
+  ✓ Launched pipeline command receives SWITCHMAN_TASK_ID
+  ✓ Launched pipeline command receives SWITCHMAN_WORKTREE
+  ✓ Launched pipeline command receives the structured task type
+  ✓ Launched pipeline command receives the structured task spec payload
+  ✓ Tasks without a primary output path get an empty SWITCHMAN_TASK_OUTPUT_PATH
+  ✓ Launched pipeline command receives the task-specific timeout policy
+  ✓ Launched pipeline command receives the task-specific retry policy
+
+Fix 30b: pipeline run exposes governance artifact output paths to launched agents
+Preparing worktree (new branch 'pipeline-launch-governance')
+  ✓ Pipeline run launches the ready governance task command
+  ✓ Launched governance task receives the governance task type
+  ✓ Launched governance task receives a unique review artifact output path
+  ✓ Structured task spec and env agree on the governance review artifact path
+
+Fix 31: pipeline review avoids duplicate governance tasks when merge risk is already covered
+Preparing worktree (new branch 'review-auth-a')
+Preparing worktree (new branch 'review-auth-b')
+  ✓ Pipeline review still reports blocked AI merge risk
+  ✓ Pipeline review avoids creating duplicate governance follow-ups when governance work already exists
+
+Fix 32: pipeline review stays quiet when gates have no new issues
+  ✓ Pipeline review creates no follow-up tasks for a clean pipeline
+
+Fix 33: pipeline exec drives a simple pipeline to ready
+Preparing worktree (new branch 'pipe-exec-ready-branch')
+  ✓ Pipeline exec reports ready when commands succeed and gates pass
+  ✓ Pipeline exec returns a ready PR summary
+
+Fix 34: pipeline exec blocks when work fails and no new work can progress
+Preparing worktree (new branch 'pipe-exec-blocked-branch')
+  ✓ Pipeline exec blocks when commands fail and no forward progress remains
+  ✓ Pipeline exec records failed command executions
+
+Fix 35: dependency-aware pipeline execution holds test tasks until implementation completes
+  ✓ Planner wires the test task to depend on the implementation task
+  ✓ Runner dispatches only the dependency-free implementation task first
+  ✓ Runner dispatches the dependent test task after implementation completes
+
+Fix 36: task outcome evaluator flags successful no-op executions
+  ✓ Outcome evaluator flags no-op command results
+  ✓ Outcome evaluator reports no_changes_detected for no-op results
+
+Fix 37: task outcome evaluator accepts in-scope claimed source changes
+  ✓ Outcome evaluator accepts claimed source changes for implementation tasks
+
+Fix 37aa: task outcome evaluator can resolve execution from lease identity
+  ✓ Outcome evaluator accepts lease-resolved execution context
+  ✓ Outcome evaluator returns the evaluated lease ID
+  ✓ Outcome evaluator returns the task behind the lease
+
+Fix 37b: task outcome evaluator enforces structured task scope
+  ✓ Outcome evaluator flags changes outside the structured task scope
+  ✓ Outcome evaluator reports changes_outside_task_scope for out-of-scope edits
+
+Fix 37c: task outcome evaluator allows implementation work when follow-up deliverables are split into separate tasks
+  ✓ Outcome evaluator accepts implementation work when only source is required for the current task
+  ✓ Outcome evaluator does not force tests/docs onto the implementation task when they are follow-up deliverables
+
+Fix 37d: task outcome evaluator checks objective evidence beyond scope
+  ✓ Outcome evaluator rejects in-scope changes that do not evidence the task objective strongly enough
+  ✓ Outcome evaluator reports objective_not_evidenced when keywords are not reflected in changed outputs
+
+Fix 38: pipeline exec retries transient failures and reaches ready
+Preparing worktree (new branch 'pipe-retry-ready-branch')
+  ✓ Pipeline exec recovers from a transient task failure within retry budget
+  ✓ Pipeline exec records scheduled retries when a task fails transiently
+
+Fix 39: pipeline exec blocks after exhausting retry budget
+Preparing worktree (new branch 'pipe-retry-blocked-branch')
+  ✓ Pipeline exec blocks once retry budget is exhausted and no forward progress remains
+  ✓ Pipeline exec schedules exactly one retry when max-retries is one
+  ✓ Pipeline leaves the task failed after retries are exhausted
+
+Fix 39b: pipeline exec enforces task-specific timeout policy
+Preparing worktree (new branch 'pipe-timeout-branch')
+  ✓ Pipeline exec blocks when a task exceeds its execution timeout
+  ✓ Timed out execution is recorded as a failed task execution
+  ✓ Timed out execution is logged with a timeout-specific reason code
+
+Fix 40: pipeline exec resumes previously failed tasks when retries remain
+Preparing worktree (new branch 'pipe-retry-resume-branch')
+  ✓ Fixture acquires a lease before simulating a previous failed run
+  ✓ Pipeline exec resumes a previously failed task when retry budget remains
+  ✓ Pipeline exec reports resumed retry work in the iteration summary
+
+Fix 53: audit events are chained and signed with a project audit key
+  ✓ Audit key file is created alongside the project database
+  ✓ Audit log stores the signed test events
+  ✓ Audit events include a chain sequence number
+  ✓ Audit events store an entry hash
+  ✓ Audit events store a signature
+  ✓ Audit verification succeeds for an untampered audit trail
+
+Fix 53b: audit verification detects tampering and CLI exits non-zero
+  ✓ Audit verification fails after a stored event is modified
+  ✓ Audit verification reports an entry hash mismatch after tampering
+  ✓ CLI audit verify surfaces the tamper reason code
+  ✓ CLI audit verify exits non-zero when the audit trail has been tampered with
+
+────────────────────────────────────────
+Results: 1123 passed, 3 failed
+
+⚠ Some tests failed

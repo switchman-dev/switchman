@@ -64,11 +64,11 @@ function buildUpgradeHints({ repoRoot, retentionDays, oldestAuditAt = null, rece
 
   // Unauthenticated (3-day retention) — nudge to log in free, not upgrade
   if (Number(retentionDays) === FREE_RETENTION_DAYS && oldestAuditAt) {
-    const oldest = new Date(oldestAuditAt);
-    if (!Number.isNaN(oldest.getTime())) {
-      const ageDays = Math.floor((Date.now() - oldest.getTime()) / (24 * 60 * 60 * 1000));
-      const daysUntilExpiry = Math.max(0, FREE_RETENTION_DAYS - ageDays);
-      if (daysUntilExpiry <= 1) {
+  const oldest = new Date(oldestAuditAt);
+  if (!Number.isNaN(oldest.getTime())) {
+    const ageDays = Math.floor((Date.now() - oldest.getTime()) / (24 * 60 * 60 * 1000));
+    const daysUntilExpiry = Math.max(0, FREE_LOGGED_IN_RETENTION_DAYS - ageDays);
+    if (daysUntilExpiry <= 2) {
         hints.push({
           kind: 'history_retention',
           severity: 'warn',
@@ -1482,18 +1482,14 @@ function summarizeSessionWindow(
     estimated_minutes_saved: estimatedMinutesSaved,
     counterfactual_depth: isProDepth ? 'full' : 'read_only',
     depth_hint: !isProDepth
-      ? !isLoggedIn
-        ? {
-          title: 'Log in free to see the full issue breakdown',
-          command: 'switchman login',
-          detail: 'Free login unlocks amber / red issue detail and extends session history to 14 days.',
-        }
-        : {
-          title: 'Want deeper counterfactual analysis?',
-          command: 'switchman upgrade',
-          detail: 'Pro adds richer counterfactual session analysis, longer history, and shared cloud coordination.',
-        }
-      : null,
+  ? {
+    title: 'Want deeper counterfactual analysis?',
+    command: isLoggedIn ? 'switchman upgrade' : 'switchman login',
+    detail: isLoggedIn
+      ? 'Pro adds richer counterfactual session analysis, longer history, and shared cloud coordination.'
+      : 'Free login unlocks amber / red issue detail and extends session history to 14 days.',
+  }
+  : null,
   };
 }
 
