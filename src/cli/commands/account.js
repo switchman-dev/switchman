@@ -23,7 +23,7 @@ export function registerAccountCommands(program, {
 }) {
   program
     .command('login')
-    .description('Sign in with GitHub to activate Switchman Pro')
+    .description('Sign in with GitHub — free, or to activate Pro')
     .option('--invite <token>', 'Join a team with an invite token')
     .option('--status', 'Show current login status')
     .addHelpText('after', `
@@ -140,7 +140,9 @@ Examples:
       }
 
       console.log('');
-      console.log(chalk.bold('  Switchman Pro — sign in with GitHub'));
+      console.log(chalk.bold('  Sign in with GitHub'));
+      console.log(chalk.dim('  Free login unlocks amber / red issue detail and 14-day history.'));
+      console.log(chalk.dim('  Pro adds 90-day history, team sharing, and cross-session patterns.'));
       console.log('');
 
       const spinner = ora('Waiting for GitHub sign-in...').start();
@@ -174,12 +176,11 @@ Examples:
         console.log('');
         console.log(`  Run ${chalk.cyan('switchman setup --agents 10')} to start with unlimited agents.`);
       } else {
-        console.log(`  ${chalk.yellow('⚠')} Signed in — no Pro licence found yet`);
+        console.log(`  ${chalk.green('✓')} Signed in on Free — amber / red issue detail and 14-day history are now unlocked`);
         console.log('');
-        console.log(`  ${chalk.dim('If you just subscribed, Polar may take 30–60 seconds to activate.')}`);
-        console.log(`  ${chalk.dim('Check your status with:')} ${chalk.cyan('switchman login --status')}`);
+        console.log(`  ${chalk.dim('Run')} ${chalk.cyan('switchman review')} ${chalk.dim('to see your full session breakdown.')}`);
         console.log('');
-        console.log(`  ${chalk.dim('Not subscribed yet?')} ${chalk.cyan(PRO_PAGE_URL)}`);
+        console.log(`  ${chalk.dim('Want 90-day history and team sharing?')} ${chalk.cyan(PRO_PAGE_URL)}`);
       }
 
       console.log('');

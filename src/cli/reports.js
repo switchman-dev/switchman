@@ -24,7 +24,7 @@ import {
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
-import { FREE_RETENTION_DAYS, getRetentionDaysForCurrentPlan } from '../core/licence.js';
+import { FREE_LOGGED_IN_RETENTION_DAYS, FREE_RETENTION_DAYS, getRetentionDaysForCurrentPlan } from '../core/licence.js';
 import { loadChangePolicy, loadLeasePolicy } from '../core/policy.js';
 import { getPipelineLandingExplainReport, getPipelineStatus, summarizePipelinePolicyState } from '../core/pipeline.js';
 import { buildQueueStatusSummary, resolveQueueSource } from '../core/queue.js';
@@ -62,17 +62,37 @@ function listRecentGitAuthors(repoRoot, limit = 30) {
 function buildUpgradeHints({ repoRoot, retentionDays, oldestAuditAt = null, recentAuthors = [] }) {
   const hints = [];
 
+  // Unauthenticated (3-day retention) — nudge to log in free, not upgrade
   if (Number(retentionDays) === FREE_RETENTION_DAYS && oldestAuditAt) {
     const oldest = new Date(oldestAuditAt);
     if (!Number.isNaN(oldest.getTime())) {
       const ageDays = Math.floor((Date.now() - oldest.getTime()) / (24 * 60 * 60 * 1000));
       const daysUntilExpiry = Math.max(0, FREE_RETENTION_DAYS - ageDays);
+      if (daysUntilExpiry <= 1) {
+        hints.push({
+          kind: 'history_retention',
+          severity: 'warn',
+          title: `Your session history expires in ${daysUntilExpiry} day${daysUntilExpiry === 1 ? '' : 's'}`,
+          detail: `Log in free to extend history to ${FREE_LOGGED_IN_RETENTION_DAYS} days. Pro extends to 90 days.`,
+          next_step: 'log in free to keep recent session history',
+          command: 'switchman login',
+        });
+      }
+    }
+  }
+
+  // Free logged-in (14-day retention) — nudge to upgrade for more history
+  if (Number(retentionDays) === FREE_LOGGED_IN_RETENTION_DAYS && oldestAuditAt) {
+    const oldest = new Date(oldestAuditAt);
+    if (!Number.isNaN(oldest.getTime())) {
+      const ageDays = Math.floor((Date.now() - oldest.getTime()) / (24 * 60 * 60 * 1000));
+      const daysUntilExpiry = Math.max(0, FREE_LOGGED_IN_RETENTION_DAYS - ageDays);
       if (daysUntilExpiry <= 2) {
         hints.push({
           kind: 'history_retention',
           severity: 'warn',
           title: `Your task history expires in ${daysUntilExpiry} day${daysUntilExpiry === 1 ? '' : 's'}`,
-          detail: `Free history keeps ${FREE_RETENTION_DAYS} days of audit trail in ${repoRoot}. Pro keeps 90 days for debugging, handoff, and incident review.`,
+          detail: `Free history keeps ${FREE_LOGGED_IN_RETENTION_DAYS} days of audit trail in ${repoRoot}. Pro keeps 90 days for debugging, handoff, and incident review.`,
           next_step: 'upgrade before the oldest recent work rolls out of local history',
           command: 'switchman upgrade',
         });
@@ -80,7 +100,7 @@ function buildUpgradeHints({ repoRoot, retentionDays, oldestAuditAt = null, rece
     }
   }
 
-  if (Number(retentionDays) === FREE_RETENTION_DAYS && recentAuthors.length > 1) {
+  if (Number(retentionDays) <= FREE_LOGGED_IN_RETENTION_DAYS && recentAuthors.length > 1) {
     hints.push({
       kind: 'team_visibility',
       severity: 'warn',
@@ -1402,7 +1422,8 @@ function summarizeSessionWindow(
           ? 'green'
           : 'uncertain';
 
-  const isProDepth = retentionDays > FREE_RETENTION_DAYS;
+  const isProDepth = retentionDays > FREE_LOGGED_IN_RETENTION_DAYS;
+  const isLoggedIn = retentionDays > FREE_RETENTION_DAYS;
   const estimatedMinutesSaved = isProDepth
     ? (
       metrics.rogue_writes_blocked * 12 +
@@ -1461,12 +1482,18 @@ function summarizeSessionWindow(
     estimated_minutes_saved: estimatedMinutesSaved,
     counterfactual_depth: isProDepth ? 'full' : 'read_only',
     depth_hint: !isProDepth
+      ? !isLoggedIn
         ? {
+          title: 'Log in free to see the full issue breakdown',
+          command: 'switchman login',
+          detail: 'Free login unlocks amber / red issue detail and extends session history to 14 days.',
+        }
+        : {
           title: 'Want deeper counterfactual analysis?',
           command: 'switchman upgrade',
           detail: 'Pro adds richer counterfactual session analysis, longer history, and shared cloud coordination.',
         }
-        : null,
+      : null,
   };
 }
 
@@ -1848,11 +1875,17 @@ export async function buildInsightsReport(repoRoot, { days = 90 } = {}) {
       recommendation,
       depth_hint: retentionDays <= FREE_RETENTION_DAYS
         ? {
-          title: 'Want deeper pattern detection?',
-          command: 'switchman upgrade',
-          detail: 'Pro extends the history window so recurring repo patterns have more time to become obvious.',
+          title: 'Log in free to see the full issue breakdown',
+          command: 'switchman login',
+          detail: 'Free login unlocks amber / red issue detail and extends history to 14 days.',
         }
-        : null,
+        : retentionDays <= FREE_LOGGED_IN_RETENTION_DAYS
+          ? {
+            title: 'Want deeper pattern detection?',
+            command: 'switchman upgrade',
+            detail: 'Pro extends the history window so recurring repo patterns have more time to become obvious.',
+          }
+          : null,
     };
   } finally {
     db.close();

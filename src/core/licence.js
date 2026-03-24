@@ -32,7 +32,8 @@ const AUTH_URL          = `${SUPABASE_URL}/auth/v1`;
 const PRO_PAGE_URL      = 'https://switchman.dev/pro';
 
 const FREE_AGENT_LIMIT  = Number.POSITIVE_INFINITY;
-const FREE_RETENTION_DAYS = 14;
+const FREE_RETENTION_DAYS = 3;          // unauthenticated — triggers login nudge
+const FREE_LOGGED_IN_RETENTION_DAYS = 14; // logged in, free plan
 const PRO_RETENTION_DAYS = 90;
 const FREE_CLOUD_PROJECT_LIMIT = 1;
 const CACHE_TTL_MS      = 24 * 60 * 60 * 1000;   // 24 hours
@@ -263,8 +264,10 @@ export async function checkLicence() {
 }
 
 export async function getRetentionDaysForCurrentPlan() {
+  const creds = readCredentials();
+  if (!creds?.access_token) return FREE_RETENTION_DAYS;       // not logged in → 3 days
   const licence = await checkLicence();
-  return licence.valid ? PRO_RETENTION_DAYS : FREE_RETENTION_DAYS;
+  return licence.valid ? PRO_RETENTION_DAYS : FREE_LOGGED_IN_RETENTION_DAYS; // pro → 90, free logged-in → 14
 }
 
 // ─── Token refresh ────────────────────────────────────────────────────────────
@@ -483,6 +486,7 @@ function saveSession(session) {
 export {
   FREE_AGENT_LIMIT,
   FREE_CLOUD_PROJECT_LIMIT,
+  FREE_LOGGED_IN_RETENTION_DAYS,
   FREE_RETENTION_DAYS,
   PRO_PAGE_URL,
   PRO_RETENTION_DAYS,

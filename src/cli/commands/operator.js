@@ -338,7 +338,15 @@ Examples:
           console.log(chalk.dim(`Search: ${opts.search}`));
         }
         if (report.sessions.length === 0) {
-          console.log(chalk.dim('No retained sessions matched this query.'));
+          const creds = readCredentials();
+          if (!creds?.access_token) {
+            console.log(chalk.dim('No sessions in the last 3 days.'));
+            console.log('');
+            console.log(chalk.dim('  → Log in free to extend history to 14 days:'));
+            console.log(`     ${chalk.cyan('switchman login')}`);
+          } else {
+            console.log(chalk.dim('No retained sessions matched this query.'));
+          }
           console.log('');
           return;
         }
@@ -396,6 +404,14 @@ Examples:
             : chalk.yellow;
       console.log(`  ${chalk.bold('Narrative')} ${report.narrative}`);
       console.log(`  ${chalk.bold('Merge confidence')} ${confidenceColor(report.merge_confidence)}`);
+      if (report.merge_confidence === 'amber' || report.merge_confidence === 'red') {
+        const creds = readCredentials();
+        if (!creds?.access_token) {
+          console.log('');
+          console.log(chalk.dim('  → Log in free to see the full issue breakdown:'));
+          console.log(`     ${chalk.cyan('switchman login')}`);
+        }
+      }
       if ((report.semantic_conflicts?.length || 0) > 0) {
         const semanticSummary = report.semantic_conflicts
           .slice(0, 3)
