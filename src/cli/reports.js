@@ -72,7 +72,7 @@ function buildUpgradeHints({ repoRoot, retentionDays, oldestAuditAt = null, rece
         hints.push({
           kind: 'history_retention',
           severity: 'warn',
-          title: `Your session history expires in ${daysUntilExpiry} day${daysUntilExpiry === 1 ? '' : 's'}`,
+          title: `Your task history expires in ${daysUntilExpiry} day${daysUntilExpiry === 1 ? '' : 's'}`,
           detail: `Log in free to extend history to ${FREE_LOGGED_IN_RETENTION_DAYS} days. Pro extends to 90 days.`,
           next_step: 'log in free to keep recent session history',
           command: 'switchman login',

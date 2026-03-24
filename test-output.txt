@@ -83,35 +83,18 @@ Free logged-in users can use shared coordination for one real project
   ✓ Shared retry clears active shared claims
 
 Free shared coordination stays limited to one project key per logged-in user
-(node:45003) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(node:64405) ExperimentalWarning: SQLite is an experimental feature and might change at any time
 (Use `node --trace-warnings ...` to show where the warning was created)
   ✓ Free shared coordination allows one logged-in project
   ✓ Free shared coordination blocks a second distinct project
   ✓ Second free shared project reports the project limit reason
 
 Scheduler once dispatches only dependency-ready tasks onto idle workspaces
-file:///Users/ned/Documents/GitHub/switchman/src/cli/index.js:472
-    throw new Error(sharedResult.message || `Shared coordination scheduler dispatch failed (${sharedResult.reason}).`);
-          ^
-
-Error: Requested function was not found
-    at dispatchReadyTasksViaCoordination (file:///Users/ned/Documents/GitHub/switchman/src/cli/index.js:472:11)
-    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
-    at async Command.<anonymous> (file:///Users/ned/Documents/GitHub/switchman/src/cli/commands/scheduler.js:22:22)
-
-Node.js v22.22.1
-  ✗ THREW: Command failed: /Users/ned/.nvm/versions/node/v22.22.1/bin/node /Users/ned/Documents/GitHub/switchman/src/cli/index.js scheduler once --json
-file:///Users/ned/Documents/GitHub/switchman/src/cli/index.js:472
-    throw new Error(sharedResult.message || `Shared coordination scheduler dispatch failed (${sharedResult.reason}).`);
-          ^
-
-Error: Requested function was not found
-    at dispatchReadyTasksViaCoordination (file:///Users/ned/Documents/GitHub/switchman/src/cli/index.js:472:11)
-    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
-    at async Command.<anonymous> (file:///Users/ned/Documents/GitHub/switchman/src/cli/commands/scheduler.js:22:22)
-
-Node.js v22.22.1
-
+  ✓ Scheduler dispatches only the dependency-ready task first
+  ✓ Scheduler picks the implementation task before follow-up work
+  ✓ Scheduler reports dependency-blocked follow-up work
+  ✓ Scheduler creates one active lease-backed assignment
+  ✓ Scheduler leaves blocked follow-up tasks pending
 
 Start launches the background scheduler by default
 - Starting Switchman session...
@@ -324,7 +307,7 @@ Preparing worktree (new branch 'feature/repair-register')
   ✓ Repo repair registers the missing git worktree in the database
 
 Fix 54g: repo repair removes stale temporary landing worktrees left by interrupted materialization
-Preparing worktree (detached HEAD 7c5649a)
+Preparing worktree (detached HEAD ffd2072)
   ✓ Repo repair reports that it removed stale temp landing worktree state
   ✓ Repo repair reports the removed stale temp landing worktree
   ✓ Repo repair removes the stale temp landing worktree from disk
@@ -340,7 +323,7 @@ Fix 56c: repo repair closes interrupted queue journal operations after resetting
   ✓ Repo repair marks the interrupted queue journal entry as repaired
 
 Fix 54h: repo repair prunes missing temporary landing worktree metadata left by crashes
-Preparing worktree (detached HEAD e76c7c9)
+Preparing worktree (detached HEAD 99aab13)
   ✓ Repo repair reports that it pruned stale temp landing metadata
   ✓ Repo repair reports the pruned temp landing metadata
   ✓ Repo repair prunes missing temp landing worktree metadata from git
@@ -1196,7 +1179,7 @@ Review stays readable on free tier and keeps deeper counterfactuals for Pro
   ✓ Session summary reports recovery activity
   ✓ Session summary reports landing issues caught
   ✓ Free session summary stays read-only and hides counterfactual time-saved analysis
-  ✗ Free session summary points at Pro for deeper analysis
+  ✓ Free session summary points at Pro for deeper analysis
 
 Review summary builds a shareable narrative and merge confidence
   ✓ Review summary classifies warn-level AI gate signals as amber confidence
@@ -1255,9 +1238,9 @@ Slack notifications are available on free tier and can be delivered for failed t
 Login reports a clear manual fallback when the browser cannot be opened
 
   Visit this URL to sign in:
-  https://switchman.dev/activate?code=CALM-9131
+  https://switchman.dev/activate?code=KEEN-5608
 
-  Your code: CALM-9131
+  Your code: KEEN-5608
 
   Waiting for authorization...
   ✓ Login fails cleanly when the browser cannot be opened
@@ -1270,9 +1253,9 @@ Login reports a clear manual fallback when the browser cannot be opened
 Login times out with the exact manual recovery information still visible
 
   Visit this URL to sign in:
-  https://switchman.dev/activate?code=CLEAR-9280
+  https://switchman.dev/activate?code=CLEAN-3606
 
-  Your code: CLEAR-9280
+  Your code: CLEAN-3606
 
   Waiting for authorization...
   ✓ Login fails cleanly after the authorization timeout
@@ -1875,6 +1858,6 @@ Fix 53b: audit verification detects tampering and CLI exits non-zero
   ✓ CLI audit verify exits non-zero when the audit trail has been tampered with
 
 ────────────────────────────────────────
-Results: 1123 passed, 3 failed
+Results: 1129 passed, 1 failed
 
 ⚠ Some tests failed
