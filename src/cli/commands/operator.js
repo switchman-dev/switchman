@@ -11,6 +11,7 @@ export function registerOperatorCommands(program, deps) {
     checkLicence,
     collectStatusSnapshot,
     colorForHealth,
+    createPublicReview,
     formatClockTime,
     getDb,
     getRepo,
@@ -261,6 +262,7 @@ Examples:
     .option('--days <n>', 'How many recent days of retained history to inspect', '90')
     .option('--search <query>', 'Filter retained sessions by a text query')
     .option('--share', 'Publish this review to your Switchman Pro team')
+    .option('--public', 'Generate a public read-only review URL anyone can view')
     .option('--team', 'Show recent teammate reviews shared for this repo')
     .option('--json', 'Output raw JSON')
     .addHelpText('after', `
@@ -270,6 +272,7 @@ Examples:
   switchman review --history
   switchman review --history --search auth
   switchman review --share
+  switchman review --public
   switchman review --team
   switchman review --json
 `)
@@ -371,6 +374,8 @@ Examples:
         hours: reviewHours,
       });
       let shareResult = null;
+      let publicShareResult = null;
+
       if (opts.share) {
         if (!(await ensureProReviewSharingAccess())) return;
         shareResult = await pushSyncEvent('session_review_shared', {
@@ -382,6 +387,13 @@ Examples:
             narrative: report.narrative,
           },
         }, { repoRoot });
+      }
+
+      if (opts.public) {
+        const { default: ora } = await import('ora');
+        const spinner = ora('Generating public review URL...').start();
+        publicShareResult = await createPublicReview(report);
+        spinner.stop();
       }
 
       if (opts.json) {
@@ -436,6 +448,17 @@ Examples:
         if (shareResult?.ok) console.log(`${chalk.green('✓')} Shared this review with your team`);
         else if (shareResult?.queued) console.log(`${chalk.yellow('!')} Review sharing queued locally until sync comes back`);
         else console.log(`${chalk.yellow('!')} Review sharing did not complete${shareResult?.reason ? ` (${shareResult.reason})` : ''}`);
+      }
+      if (opts.public) {
+        console.log('');
+        if (publicShareResult?.ok) {
+          console.log(`${chalk.green('✓')} Public review URL generated`);
+          console.log(`  ${chalk.cyan(publicShareResult.url)}`);
+          console.log(chalk.dim('  Anyone with this link can view the session summary. No source code is shared.'));
+        } else {
+          console.log(`${chalk.yellow('!')} Could not generate public URL${publicShareResult?.error ? ` (${publicShareResult.error})` : ''}`);
+          console.log(chalk.dim('  Check your connection and try again.'));
+        }
       }
       if (report.estimated_minutes_saved > 0) {
         console.log('');

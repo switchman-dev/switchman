@@ -83,6 +83,7 @@ import {
   sendTelemetryEvent,
 } from '../core/telemetry.js';
 import { checkLicence, clearCredentials, getRetentionDaysForCurrentPlan, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
+import { createPublicReview } from '../core/share.js';
 import { homedir } from 'os';
 import { cleanupOldSyncEvents, getPendingQueueStatus, pullActiveTeamMembers, pullTeamReviewShares, pullTeamState, pushSyncEvent } from '../core/sync.js';
 import { registerClaudeCommands } from './commands/claude.js';
@@ -2706,6 +2707,7 @@ registerOperatorCommands(program, {
   checkLicence,
   collectStatusSnapshot,
   colorForHealth,
+  createPublicReview,
   formatClockTime,
   getDb,
   getRepo,
