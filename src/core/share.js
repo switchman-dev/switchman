@@ -94,7 +94,7 @@ export async function createPublicReview(report) {
     return {
       ok: true,
       id: row.id,
-      url: `${REVIEW_BASE_URL}/${row.id}`,
+      url: `${REVIEW_BASE_URL}/?id=${row.id}`,
     };
   } catch (err) {
     return { ok: false, error: err.message ?? 'Network error' };
