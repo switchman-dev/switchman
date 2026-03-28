@@ -30,8 +30,6 @@ switchman review
 
 `switchman review` reads every worktree, turns a parallel session into a plain-English summary, flags semantic overlap and interface mismatches, and gives an honest merge confidence outcome: `green`, `amber`, `red`, or `uncertain`. When it cannot make a trustworthy call, it says `uncertain` instead of pretending everything is fine.
 
-**When you get amber or red:** run `switchman login` (free, GitHub OAuth) to see the full issue breakdown — exactly which files conflict and why. Without login you see the score; with login you see the detail.
-
 Built for developers using Claude Code, Cursor, Windsurf, Aider, and other CLI-first coding agents on real repos.
 
 Questions or feedback? [Discord](https://discord.gg/pnT8BEC4D) · [hello@switchman.dev](mailto:hello@switchman.dev)
@@ -150,60 +148,32 @@ Git branches and worktrees solve isolation. They do not solve coordination, owne
 - Semantic flags — places where agents produced contradictory interfaces, duplicate implementations, or overlapping solutions
 - A merge confidence outcome: `green`, `amber`, `red`, or `uncertain`
 
-**Got amber or red?** Log in free to see the full breakdown:
-
-```bash
-switchman login   # GitHub OAuth, takes 60 seconds
-switchman review  # now shows full issue detail
-```
-
 ### 3. Ship through gates
 
 When the review looks good, `switchman gate ci` and `switchman queue run` land finished work cleanly onto main.
 
 ---
 
-## Pricing
+## Open source
 
-### Free — the complete individual experience
-
-Free is fully functional with no artificial limits. Run unlimited local agents, coordinate a complex session, and get a confident merge recommendation — forever, no card needed.
+Switchman is now one open source product. No login is required for the local workflow, and the core operator commands stay available out of the box.
 
 ```bash
 switchman start "goal"   →   agents run   →   switchman review
 ```
 
-**What's in Free:**
+What you get:
 
 - `switchman start` — reads the repo, creates workspaces, writes MCP config, generates `CLAUDE.md`
 - `switchman review` — full session summary, semantic overlap detection, interface mismatch flagging, merge confidence outcome
 - `switchman status --watch` — live dashboard during a session
 - `switchman scan` — lightweight pre-merge conflict check
 - `switchman demo` — proves the flow in a throwaway repo
-- Log in free → full amber / red issue breakdown (`switchman login`)
-- Log in free → 14-day session history
-
-### Pro — $19/month
-
-> 90-day history · cross-session pattern detection · team sharing · AI planning  
-> [switchman.dev/pro](https://switchman.dev/pro) · or run `switchman upgrade`
-
-Pro adds the over-time layer: searchable history, cross-session pattern detection (which parts of your repo consistently flag amber), team session sharing, and AI planning informed by your conflict history.
-
-```bash
-switchman upgrade        # open switchman.dev/pro
-switchman login          # activate after subscribing
-switchman login --status # check your plan
-```
-
-**What's in Pro:**
-
 - 90-day searchable session history — `switchman review --history`, `switchman review --history --search auth`
 - Cross-session pattern detection — `switchman insights`
-- Team session sharing — `switchman review --share` to publish, `switchman review --team` to read teammate reviews before the PR
+- Shared review publishing — `switchman review --share` to publish, `switchman review --team` to read teammate reviews before the PR
 - AI task planning — `switchman plan "Add authentication" --apply`, `switchman plan --issue 47`
 - Cost and token tracking — `switchman usage`, `switchman usage --days 30`
-- Email support within 48 hours
 
 ---
 

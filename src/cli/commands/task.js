@@ -34,7 +34,6 @@ function readTaskUsageFromEnv(source) {
 }
 
 async function maybeRecordTaskUsage({
-  checkLicence,
   chalk,
   getDb,
   recordUsageEvent,
@@ -45,9 +44,6 @@ async function maybeRecordTaskUsage({
   if (!usageInput) return;
 
   try {
-    const licence = await checkLicence();
-    if (!licence.valid) return;
-
     const db = getDb(repoRoot);
     try {
       const event = recordUsageEvent(db, {
@@ -129,7 +125,7 @@ Examples:
       try {
         ({ tasks } = await listTasksViaCoordination(repoRoot, opts.status || null));
       } catch (err) {
-        printErrorWithNext(err.message, 'switchman login --status');
+        printErrorWithNext(err.message, 'switchman status');
         process.exitCode = 1;
         return;
       }
@@ -178,7 +174,7 @@ Examples:
           reason: opts.reason || 'manual retry',
         }));
       } catch (err) {
-        printErrorWithNext(err.message, 'switchman login --status');
+        printErrorWithNext(err.message, 'switchman status');
         process.exitCode = 1;
         return;
       }
@@ -266,7 +262,6 @@ Examples:
         }
         console.log(`${chalk.green('✓')} Task ${chalk.cyan(taskId)} marked done — file claims released`);
         await maybeRecordTaskUsage({
-          checkLicence,
           chalk,
           getDb,
           recordUsageEvent,
@@ -295,7 +290,6 @@ Examples:
       await failTaskViaCoordination(repoRoot, { taskId, reason });
       console.log(`${chalk.red('✗')} Task ${chalk.cyan(taskId)} marked failed`);
       await maybeRecordTaskUsage({
-        checkLicence,
         chalk,
         getDb,
         recordUsageEvent,

@@ -8,7 +8,7 @@ If you are brand new to Switchman, start with:
 - `switchman status` when you are not sure what to do next
 - `switchman review` when you want the full session summary
 - `switchman review --history` when you want retained session history or search
-- `switchman usage` when you need Pro cost and token rollups
+- `switchman usage` when you need cost and token rollups
 - `switchman insights` when you want cross-session amber hotspot patterns
 
 ## Setup
@@ -76,18 +76,18 @@ When work feels unclear, these are the front doors:
 ### `switchman scan`
 ### `switchman status`
 ### `switchman review`
-- `--share` publishes the current review to your Pro team
+- `--share` publishes the current review to your shared team feed
 - `--team` pulls recent teammate reviews shared for this repo
 - `--history` shows retained session history
 - `--search <query>` filters retained history to matching sessions
 ### `switchman insights`
-- Pro cross-session hotspot reporting for recurring amber-or-worse areas and validation gaps
+- cross-session hotspot reporting for recurring amber-or-worse areas and validation gaps
 - useful filters: `--days 30`, `--json`
 ### `switchman usage`
-- Pro reporting for token and cost usage by session, agent, and time window
+- reporting for token and cost usage by session, agent, and time window
 - useful filters: `--days 30`, `--session <id>`, `--agent <name>`, `--task <id>`
 ### `switchman usage record`
-- Pro manual write path for agent/token/cost events when you want to backfill or integrate a custom runner
+- manual write path for agent/token/cost events when you want to backfill or integrate a custom runner
 ### `switchman worktree list`
 ### `switchman worktree sync`
 

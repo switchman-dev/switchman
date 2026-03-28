@@ -8,7 +8,6 @@ export function registerOperatorCommands(program, deps) {
     buildDoctorReport,
     buildRecoverReport,
     chalk,
-    checkLicence,
     collectStatusSnapshot,
     colorForHealth,
     createPublicReview,
@@ -44,40 +43,11 @@ export function registerOperatorCommands(program, deps) {
     statusBadge,
     summarizeTeamCoordinationState,
     buildWatchSignature,
-    PRO_PAGE_URL,
   } = deps;
-
-  const ensureProUsageAccess = async () => {
-    const licence = await checkLicence();
-    if (licence.valid) return true;
-
-    console.log('');
-    console.log(chalk.red('  ✗ switchman usage is a Pro feature'));
-    console.log(`  ${chalk.dim('Track token and cost usage by session, agent, and time window.')}`);
-    console.log(`  ${chalk.dim('Try it free for 30 days ->')} ${chalk.cyan('switchman upgrade')}`);
-    console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
-    console.log('');
-    process.exitCode = 1;
-    return false;
-  };
-
-  const ensureProReviewSharingAccess = async () => {
-    const licence = await checkLicence();
-    if (licence.valid) return true;
-
-    console.log('');
-    console.log(chalk.red('  ✗ team review sharing is a Pro feature'));
-    console.log(`  ${chalk.dim('Share one Switchman review with teammates before the PR and pull recent teammate reviews back into this repo.')}`);
-    console.log(`  ${chalk.dim('Try it free for 30 days ->')} ${chalk.cyan('switchman upgrade')}`);
-    console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
-    console.log('');
-    process.exitCode = 1;
-    return false;
-  };
 
   const usageCmd = program
     .command('usage')
-    .description('Pro: show token and cost usage per session, per agent, and over time')
+    .description('Show token and cost usage per session, per agent, and over time')
     .option('--days <n>', 'How many recent days to analyze', '90')
     .option('--session <id>', 'Filter to one session id')
     .option('--agent <name>', 'Filter to one agent name')
@@ -92,8 +62,6 @@ Examples:
   switchman usage record --session sprint-42 --task task-auth --model gpt-5 --prompt-tokens 1200 --completion-tokens 800 --cost-usd 0.04
 `)
     .action(async (opts) => {
-      if (!(await ensureProUsageAccess())) return;
-
       const repoRoot = getRepo();
       const report = await buildUsageReport(repoRoot, {
         days: Math.max(1, Number.parseInt(opts.days, 10) || 90),
@@ -150,7 +118,7 @@ Examples:
 
   usageCmd
     .command('record')
-    .description('Pro: record token and cost usage for one agent event')
+    .description('Record token and cost usage for one agent event')
     .requiredOption('--session <id>', 'Session identifier to group related usage')
     .option('--task <id>', 'Task id associated with this usage event')
     .option('--lease <id>', 'Lease id associated with this usage event')
@@ -165,8 +133,6 @@ Examples:
     .option('--source <name>', 'How this event was recorded', 'manual')
     .option('--json', 'Output raw JSON')
     .action(async (opts) => {
-      if (!(await ensureProUsageAccess())) return;
-
       const repoRoot = getRepo();
       const db = getDb(repoRoot);
       try {
@@ -261,7 +227,7 @@ Examples:
     .option('--history', 'List recent retained sessions instead of only the latest window')
     .option('--days <n>', 'How many recent days of retained history to inspect', '90')
     .option('--search <query>', 'Filter retained sessions by a text query')
-    .option('--share', 'Publish this review to your Switchman Pro team')
+    .option('--share', 'Publish this review to your shared team feed')
     .option('--public', 'Generate a public read-only review URL anyone can view')
     .option('--team', 'Show recent teammate reviews shared for this repo')
     .option('--json', 'Output raw JSON')
@@ -282,7 +248,6 @@ Examples:
       const reviewDays = Math.max(1, Number.parseInt(opts.days, 10) || 90);
 
       if (opts.team) {
-        if (!(await ensureProReviewSharingAccess())) return;
         const reviews = buildTeamReviewShareReport(await pullTeamReviewShares({
           hours: reviewHours,
           repoRoot,
@@ -341,15 +306,7 @@ Examples:
           console.log(chalk.dim(`Search: ${opts.search}`));
         }
         if (report.sessions.length === 0) {
-          const creds = readCredentials();
-          if (!creds?.access_token) {
-            console.log(chalk.dim('No sessions in the last 3 days.'));
-            console.log('');
-            console.log(chalk.dim('  → Log in free to extend history to 14 days:'));
-            console.log(`     ${chalk.cyan('switchman login')}`);
-          } else {
-            console.log(chalk.dim('No retained sessions matched this query.'));
-          }
+          console.log(chalk.dim('No retained sessions matched this query.'));
           console.log('');
           return;
         }
@@ -377,7 +334,6 @@ Examples:
       let publicShareResult = null;
 
       if (opts.share) {
-        if (!(await ensureProReviewSharingAccess())) return;
         shareResult = await pushSyncEvent('session_review_shared', {
           review: {
             generated_at: report.generated_at,
@@ -416,14 +372,6 @@ Examples:
             : chalk.yellow;
       console.log(`  ${chalk.bold('Narrative')} ${report.narrative}`);
       console.log(`  ${chalk.bold('Merge confidence')} ${confidenceColor(report.merge_confidence)}`);
-      if (report.merge_confidence === 'amber' || report.merge_confidence === 'red') {
-        const creds = readCredentials();
-        if (!creds?.access_token) {
-          console.log('');
-          console.log(chalk.dim('  → Log in free to see the full issue breakdown:'));
-          console.log(`     ${chalk.cyan('switchman login')}`);
-        }
-      }
       if ((report.semantic_conflicts?.length || 0) > 0) {
         const semanticSummary = report.semantic_conflicts
           .slice(0, 3)

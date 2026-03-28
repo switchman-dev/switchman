@@ -237,7 +237,7 @@ test('Task creation', () => {
   assert(tasks[0].title === 'Fix authentication bug', 'Highest priority task is first');
 });
 
-test('Plan command requires Pro and an explicit goal before creating planned tasks', () => {
+test('Plan command works without login and still requires an explicit goal before creating planned tasks', () => {
   const repoDir = join(tmpdir(), `sw-plan-context-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-plan-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -259,27 +259,6 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
   registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
   planDb.close();
 
-  let unpaidOutput = '';
-  try {
-    execFileSync(process.execPath, [
-      join(process.cwd(), 'src/cli/index.js'),
-      'plan',
-      'Add authentication',
-    ], {
-      cwd: repoDir,
-      encoding: 'utf8',
-      env: { ...process.env, HOME: homeDir },
-    });
-  } catch (err) {
-    unpaidOutput = err.stdout || '';
-  }
-
-  assert(unpaidOutput.includes('switchman plan is a Pro feature'), 'Plan blocks unpaid usage behind the Pro gate');
-  assert(unpaidOutput.includes('Generate parallel task plans from a goal'), 'Plan explains the Pro planning value proposition');
-  assert(unpaidOutput.includes('switchman upgrade'), 'Plan points unpaid users at the upgrade command');
-
-  writeProTestCredentials(homeDir);
-
   let missingGoalOutput = '';
   try {
     execFileSync(process.execPath, [
@@ -294,7 +273,7 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
     missingGoalOutput = err.stdout || '';
   }
 
-  assert(missingGoalOutput.includes('AI planning currently requires an explicit goal'), 'Plan requires an explicit goal even for Pro users');
+  assert(missingGoalOutput.includes('AI planning currently requires an explicit goal'), 'Plan requires an explicit goal even without login');
   assert(missingGoalOutput.includes('switchman plan "Add authentication"'), 'Plan shows the supported explicit-goal command');
   assert(missingGoalOutput.includes('switchman plan --issue 47'), 'Plan shows the supported GitHub issue command too');
 
@@ -337,7 +316,7 @@ test('Plan command requires Pro and an explicit goal before creating planned tas
   rmSync(homeDir, { recursive: true, force: true });
 });
 
-test('Usage report is Pro-gated and summarizes sessions, agents, and spend', () => {
+test('Usage report summarizes sessions, agents, and spend without login', () => {
   const repoDir = join(tmpdir(), `sw-usage-cli-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-usage-cli-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -378,23 +357,6 @@ test('Usage report is Pro-gated and summarizes sessions, agents, and spend', () 
   });
   usageDb.close();
 
-  let unpaidOutput = '';
-  try {
-    execFileSync(process.execPath, [
-      join(process.cwd(), 'src/cli/index.js'),
-      'usage',
-    ], {
-      cwd: repoDir,
-      encoding: 'utf8',
-      env: { ...process.env, HOME: homeDir },
-    });
-  } catch (err) {
-    unpaidOutput = err.stdout || '';
-  }
-
-  assert(unpaidOutput.includes('switchman usage is a Pro feature'), 'Usage blocks unpaid users behind the Pro gate');
-
-  writeProTestCredentials(homeDir);
   const jsonOutput = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
     'usage',
@@ -545,7 +507,7 @@ test('Start self-heals missing local MCP wiring and reports it', () => {
   rmSync(homeDir, { recursive: true, force: true });
 });
 
-test('Start unlocks more than three agents for Pro users', () => {
+test('Start supports more than three agents when an account is configured too', () => {
   const repoDir = join(tmpdir(), `sw-start-pro-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-start-pro-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -573,10 +535,9 @@ test('Start unlocks more than three agents for Pro users', () => {
     env: { ...process.env, HOME: homeDir },
   });
 
-  assert(output.includes('tier: Pro'), 'Start reports the Pro tier when a valid licence is present');
   const db = openDb(repoDir);
   const worktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
-  assert(worktrees.length === 4, 'Pro start can create more than three agent workspaces');
+  assert(worktrees.length === 4, 'Start can create more than three agent workspaces when an account is configured');
   db.close();
 
   cleanupSiblingAgentWorktrees(repoDir, 4);
@@ -4177,8 +4138,8 @@ test('Quickcheck gives one clear first-run path in a fresh repo', () => {
   });
 
   assert(output.includes('Quickcheck:'), 'Quickcheck prints the onboarding summary heading');
-  assert(output.includes('Login'), 'Quickcheck reports whether login is needed');
-  assert(output.includes('Not required for local start'), 'Quickcheck keeps local-first login messaging calm');
+  assert(output.includes('Account'), 'Quickcheck reports that hosted accounts are optional');
+  assert(output.includes('Not required for local start'), 'Quickcheck keeps local-first account messaging calm');
   assert(output.includes('Run this next:'), 'Quickcheck ends with one exact next command');
   assert(output.includes('switchman start "Add authentication"'), 'Quickcheck points first-time users at switchman start');
   assert(output.includes('switchman status --watch'), 'Quickcheck includes the live dashboard follow-up');
@@ -7651,7 +7612,7 @@ test('Status JSON unifies queue, lease policy, and operator attention', () => {
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Status warns free users before history expires and nudges multi-author repos toward Pro', () => {
+test('Status keeps compatibility fields without upgrade nudges in the open source flow', () => {
   const repoDir = join(tmpdir(), `sw-status-upgrade-hints-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-status-upgrade-hints-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -7698,11 +7659,10 @@ test('Status warns free users before history expires and nudges multi-author rep
     env: { ...process.env, HOME: homeDir },
   });
 
-  assert(jsonOutput.upgrade_hints.some((item) => item.kind === 'history_retention'), 'Status JSON includes a history retention upgrade hint');
-  assert(jsonOutput.upgrade_hints.some((item) => item.kind === 'team_visibility'), 'Status JSON includes a multi-author team visibility hint');
-  assert(textOutput.includes('Your task history expires in'), 'Status text warns before free history expires');
-  assert(textOutput.includes('Multiple developers are active in this repo'), 'Status text surfaces the team visibility upgrade nudge');
-  assert(textOutput.includes('switchman upgrade'), 'Status text points the operator at the upgrade command');
+  assert(Array.isArray(jsonOutput.upgrade_hints), 'Status JSON still includes the upgrade_hints field for compatibility');
+  assert(jsonOutput.upgrade_hints.length === 0, 'Status JSON no longer emits upgrade hints in the open source flow');
+  assert(!textOutput.includes('Your task history expires in'), 'Status text no longer warns about free history expiry');
+  assert(!textOutput.includes('switchman upgrade'), 'Status text no longer points operators at an upgrade command');
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
@@ -7828,7 +7788,7 @@ test('CLI help includes examples for the main entrypoint', () => {
   assert(helpOutput.includes('switchman start "Add authentication"'), 'Top-level help includes the one-command start entrypoint');
   assert(helpOutput.includes('switchman claude refresh'), 'Top-level help includes the Claude guide refresh command');
   assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the explicit first task step');
-  assert(helpOutput.includes('switchman plan "Add authentication"   (Pro)'), 'Top-level help marks planning as a Pro operator command');
+  assert(helpOutput.includes('switchman plan "Add authentication"'), 'Top-level help includes the planning command');
   assert(helpOutput.includes('switchman review'), 'Top-level help includes the review command');
   assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
 });
@@ -7857,7 +7817,7 @@ test('README install section includes the Homebrew path', () => {
   assert(readme.includes('Requirements: Node.js 22.5+ · Git 2.5+'), 'README install section includes the runtime requirements');
 });
 
-test('Review stays readable on free tier and keeps deeper counterfactuals for Pro', () => {
+test('Review stays readable in the open source flow and shows full analysis', () => {
   const repoDir = join(tmpdir(), `sw-session-summary-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-session-summary-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
@@ -7911,8 +7871,8 @@ test('Review stays readable on free tier and keeps deeper counterfactuals for Pr
   assert(output.includes('rogue write'), 'Session summary reports blocked rogue edits');
   assert(output.includes('retry / recovery handoff'), 'Session summary reports recovery activity');
   assert(output.includes('risky landing issue'), 'Session summary reports landing issues caught');
-  assert(!output.includes('Estimated coordination time saved'), 'Free session summary stays read-only and hides counterfactual time-saved analysis');
-  assert(output.includes('Want deeper counterfactual analysis?'), 'Free session summary points at Pro for deeper analysis');
+  assert(output.includes('Estimated coordination time saved'), 'Session summary includes time-saved analysis in the open source flow');
+  assert(!output.includes('Want deeper counterfactual analysis?'), 'Session summary no longer points at a paid deeper-analysis tier');
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });

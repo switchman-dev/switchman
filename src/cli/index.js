@@ -82,14 +82,13 @@ import {
   maybePromptForTelemetry,
   sendTelemetryEvent,
 } from '../core/telemetry.js';
-import { checkLicence, clearCredentials, getRetentionDaysForCurrentPlan, loginWithGitHub, PRO_PAGE_URL, readCredentials } from '../core/licence.js';
+import { checkLicence, readCredentials } from '../core/licence.js';
 import { createPublicReview } from '../core/share.js';
 import { homedir } from 'os';
-import { cleanupOldSyncEvents, getPendingQueueStatus, pullActiveTeamMembers, pullTeamReviewShares, pullTeamState, pushSyncEvent } from '../core/sync.js';
+import { cleanupOldSyncEvents, pullActiveTeamMembers, pullTeamReviewShares, pullTeamState, pushSyncEvent } from '../core/sync.js';
 import { registerClaudeCommands } from './commands/claude.js';
 import { registerMcpCommands } from './commands/mcp.js';
 import { registerAuditCommands } from './commands/audit.js';
-import { registerAccountCommands } from './commands/account.js';
 import { registerGateCommands } from './commands/gate.js';
 import { registerHomebrewCommands } from './commands/homebrew.js';
 import { registerLeaseCommands } from './commands/lease.js';
@@ -1135,8 +1134,6 @@ const ROOT_HELP_COMMANDS = new Set([
   'start',
   'setup',
   'verify-setup',
-  'login',
-  'upgrade',
   'plan',
   'task',
   'status',
@@ -1165,7 +1162,7 @@ Start here:
   switchman task add "Your task" --priority 8
   switchman status --watch
   switchman insights
-  switchman usage                 (Pro)
+  switchman usage
   switchman review
   switchman recover
   switchman scheduler status
@@ -1180,15 +1177,13 @@ For you (the operator):
   switchman task add
   switchman status
   switchman insights
-  switchman usage                 (Pro)
+  switchman usage
   switchman review
   switchman recover
   switchman scheduler status
   switchman merge
   switchman repair
-  switchman upgrade
-  switchman login
-  switchman plan "Add authentication"   (Pro)
+  switchman plan "Add authentication"
 
 For your agents (via CLAUDE.md or MCP):
   switchman lease next
@@ -1351,7 +1346,6 @@ Examples:
       }
     }
 
-    const licence = await checkLicence();
     const sharedMode = await getSharedCoordinationMode(repoRoot);
     const requestedAgentCount = String(opts.agents || 'auto').trim().toLowerCase();
     const maxTasks = Math.max(1, Number.parseInt(String(opts.maxTasks), 10) || 6);
@@ -1411,9 +1405,8 @@ Examples:
 
     console.log('');
     console.log(chalk.bold('Session plan:'));
-    console.log(`  ${chalk.dim('tier:')} ${licence.valid ? chalk.green('Pro') : chalk.yellow('Free')}`);
-    console.log(`  ${chalk.dim('coordination:')} ${sharedMode.enabled ? (licence.valid ? 'shared team queue in the cloud' : 'shared cloud coordination for one free project') : 'local coordination only'}`);
-    console.log(`  ${chalk.dim('agents:')} ${desiredAgentCount}${!sharedMode.enabled && !licence.valid ? chalk.dim(' (local unlimited)') : ''}`);
+    console.log(`  ${chalk.dim('coordination:')} ${sharedMode.enabled ? 'shared cloud coordination' : 'local coordination only'}`);
+    console.log(`  ${chalk.dim('agents:')} ${desiredAgentCount}`);
     console.log('');
 
     if (!opts.yes) {
@@ -1482,10 +1475,6 @@ Examples:
       }
       console.log(`  ${opts.scheduler ? '4' : '3'}. When the first session ends, see what Switchman coordinated:`);
       console.log(`     ${chalk.cyan('switchman session-summary')}`);
-      if (!licence.valid) {
-        console.log(`  ${opts.scheduler ? '5' : '4'}. Need deeper session analysis, more history, or full team coordination?`);
-        console.log(`     ${chalk.cyan('switchman upgrade')}`);
-      }
     } catch (err) {
       spinner.fail(err.message);
       process.exitCode = 1;
@@ -1615,10 +1604,8 @@ Use this right after install when you want one clear next command.
     const previousHome = process.env.HOME;
     if (opts.home) process.env.HOME = opts.home;
     let creds = null;
-    let licence = null;
     try {
       creds = readCredentials();
-      licence = creds?.access_token ? await checkLicence() : null;
     } finally {
       if (opts.home) process.env.HOME = previousHome;
     }
@@ -1637,14 +1624,12 @@ Use this right after install when you want one clear next command.
           detail: 'Git repo detected',
         },
         {
-          key: 'login',
+          key: 'account',
           ok: true,
-          label: 'Login',
-          detail: licence?.valid
-            ? 'Signed in with Pro — shared team coordination is ready'
-            : creds?.access_token
-              ? 'Signed in on Free — one shared cloud project is available'
-              : 'Not required for local start',
+          label: 'Account',
+          detail: creds?.access_token
+            ? 'Optional cloud account is configured'
+            : 'Not required for local start',
         },
         {
           key: 'workspaces',
@@ -1695,7 +1680,7 @@ Use this right after install when you want one clear next command.
     await maybeCaptureTelemetry('quickcheck_ran', {
       workspace_count: workspaceCount,
       has_login: Boolean(creds?.access_token),
-      pro: Boolean(licence?.valid),
+      pro: false,
     }, { homeDir: opts.home || null });
   });
 
@@ -1761,7 +1746,7 @@ registerTelemetryCommands(program, {
 
 program
   .command('plan [goal]')
-  .description('Pro: suggest a parallel task plan from an explicit goal or GitHub issue')
+  .description('Suggest a parallel task plan from an explicit goal or GitHub issue')
   .option('--issue <number>', 'Read planning context from a GitHub issue via gh')
   .option('--pr <number>', 'Post the resulting plan summary to a GitHub pull request')
   .option('--comment', 'Post a GitHub comment with the created plan summary after --apply')
@@ -1781,18 +1766,6 @@ Examples:
     const db = getOptionalDb(repoRoot);
 
     try {
-      const licence = await checkLicence();
-      if (!licence.valid) {
-        console.log('');
-        console.log(chalk.red('  ✗ switchman plan is a Pro feature'));
-        console.log(`  ${chalk.dim('Generate parallel task plans from a goal — your repo context, your codebase, structured for agents.')}`);
-        console.log(`  ${chalk.dim('Try it free for 30 days ->')} ${chalk.cyan('switchman upgrade')}`);
-        console.log(`  ${chalk.dim('Or visit:')} ${chalk.cyan(PRO_PAGE_URL)}`);
-        console.log('');
-        process.exitCode = 1;
-        return;
-      }
-
       let issueContext = null;
       if (opts.issue) {
         try {
@@ -2704,7 +2677,6 @@ registerOperatorCommands(program, {
   buildRecoverReport,
   buildWatchSignature,
   chalk,
-  checkLicence,
   collectStatusSnapshot,
   colorForHealth,
   createPublicReview,
@@ -2722,7 +2694,6 @@ registerOperatorCommands(program, {
   printRecoverSummary,
   printRepairSummary,
   pushSyncEvent,
-  PRO_PAGE_URL,
   pullActiveTeamMembers,
   pullTeamReviewShares,
   pullTeamState,
@@ -2929,20 +2900,5 @@ registerPolicyCommands(program, {
   writeEnforcementPolicy,
 });
 
-
- 
-// ── login ──────────────────────────────────────────────────────────────────────
- 
-registerAccountCommands(program, {
-  chalk,
-  checkLicence,
-  clearCredentials,
-  getPendingQueueStatus,
-  getRepo,
-  loginWithGitHub,
-  ora,
-  PRO_PAGE_URL,
-  readCredentials,
-});
 
 program.parse();

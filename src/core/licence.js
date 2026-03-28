@@ -1,13 +1,12 @@
 /**
- * switchman licence module
- * Handles Pro licence validation, credential storage, and caching.
+ * switchman account module
+ * Keeps optional hosted account credentials and legacy compatibility helpers.
  *
  * Credentials file: ~/.switchman/credentials.json
  * Cache file:       ~/.switchman/licence-cache.json
  *
- * The CLI calls checkLicence() before any Pro-gated feature.
- * It returns { valid, plan, email, cached } and never throws —
- * if anything goes wrong it returns { valid: false }.
+ * Hosted account state is now optional. The open source CLI no longer gates
+ * core features on a paid licence.
  */
 
 import { createHash } from 'crypto';
@@ -29,12 +28,11 @@ const SUPABASE_ANON = process.env.SWITCHMAN_SUPABASE_ANON
   ?? 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFmaWxib2xobGtpaW5nbnN1cGdyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1OTIzOTIsImV4cCI6MjA4OTE2ODM5Mn0.8TBfHfRB0vEyKPMWBd6i1DNwx1nS9UqprIAsJf35n88';
 const VALIDATE_URL      = `${SUPABASE_URL}/functions/v1/validate-licence`;
 const AUTH_URL          = `${SUPABASE_URL}/auth/v1`;
-const PRO_PAGE_URL      = 'https://switchman.dev/pro';
-
-const FREE_AGENT_LIMIT  = Number.POSITIVE_INFINITY;
-const FREE_RETENTION_DAYS = 3;          // unauthenticated — triggers login nudge
-const FREE_LOGGED_IN_RETENTION_DAYS = 14; // logged in, free plan
 const PRO_RETENTION_DAYS = 90;
+const PRO_PAGE_URL      = 'https://switchman.dev/pro';
+const FREE_AGENT_LIMIT  = Number.POSITIVE_INFINITY;
+const FREE_RETENTION_DAYS = PRO_RETENTION_DAYS;
+const FREE_LOGGED_IN_RETENTION_DAYS = PRO_RETENTION_DAYS;
 const FREE_CLOUD_PROJECT_LIMIT = 1;
 const CACHE_TTL_MS      = 24 * 60 * 60 * 1000;   // 24 hours
 const OFFLINE_GRACE_MS  = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -264,10 +262,7 @@ export async function checkLicence() {
 }
 
 export async function getRetentionDaysForCurrentPlan() {
-  const creds = readCredentials();
-  if (!creds?.access_token) return FREE_RETENTION_DAYS;       // not logged in → 3 days
-  const licence = await checkLicence();
-  return licence.valid ? PRO_RETENTION_DAYS : FREE_LOGGED_IN_RETENTION_DAYS; // pro → 90, free logged-in → 14
+  return PRO_RETENTION_DAYS;
 }
 
 // ─── Token refresh ────────────────────────────────────────────────────────────
