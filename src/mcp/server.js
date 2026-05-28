@@ -44,6 +44,15 @@ import {
 import { scanAllWorktrees } from '../core/detector.js';
 import { gatewayAppendFile, gatewayMakeDirectory, gatewayMovePath, gatewayRemovePath, gatewayWriteFile, monitorWorktreesOnce } from '../core/enforcement.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
+import {
+  buildAuditEntry,
+  checkToolScope,
+  detectAnomaly,
+  emitGuardEvent,
+  resolveAgentId,
+  resolveTaskId,
+  writeAuditLog,
+} from '../guard/index.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -79,6 +88,90 @@ function toolOk(text, structured = undefined) {
 const server = new McpServer({
   name: 'switchman-mcp-server',
   version: '0.1.0',
+});
+
+const registerTool = server.registerTool.bind(server);
+server.registerTool = (toolName, options, handler) => registerTool(toolName, options, async (args = {}) => {
+  let repoRoot = null;
+  let scope = { enabled: false, allowed: true, config: null, reason: null };
+
+  try {
+    repoRoot = findRepoRoot();
+    scope = checkToolScope(repoRoot, toolName, args);
+  } catch {
+    scope = { enabled: false, allowed: true, config: null, reason: null };
+  }
+
+  if (scope.enabled) {
+    emitGuardEvent('tool:before', { repoRoot, tool: toolName, args, scope });
+  }
+
+  if (scope.enabled && !scope.allowed) {
+    const entry = buildAuditEntry({
+      agentId: resolveAgentId(args),
+      taskId: resolveTaskId(args),
+      tool: toolName,
+      args,
+      result: 'blocked',
+      reason: scope.reason,
+    });
+    writeAuditLog(repoRoot, entry);
+    emitGuardEvent('tool:blocked', { repoRoot, tool: toolName, args, reason: scope.reason });
+    return toolError(scope.reason);
+  }
+
+  const response = await handler(args);
+
+  if (!scope.enabled || !repoRoot) {
+    return response;
+  }
+
+  writeAuditLog(repoRoot, buildAuditEntry({
+    agentId: resolveAgentId(args),
+    taskId: resolveTaskId(args),
+    tool: toolName,
+    args,
+    result: 'success',
+    reason: null,
+  }));
+
+  let anomaly = { anomaly: false, reason: null };
+  if (scope.config?.anomalyDetection?.enabled === true) {
+    let db = null;
+    try {
+      db = openDb(repoRoot);
+      anomaly = detectAnomaly({ db, tool: toolName, args, response });
+    } catch {
+      anomaly = detectAnomaly({ tool: toolName, args, response });
+    } finally {
+      db?.close();
+    }
+  }
+
+  if (anomaly.anomaly) {
+    if (scope.config?.anomalyDetection?.logOnAnomaly !== false) {
+      writeAuditLog(repoRoot, buildAuditEntry({
+        agentId: resolveAgentId(args),
+        taskId: resolveTaskId(args),
+        tool: toolName,
+        args,
+        result: 'anomaly',
+        reason: anomaly.reason,
+      }));
+    }
+    try {
+      process.stderr.write(`switchman guard anomaly: ${anomaly.reason}\n`);
+    } catch {
+      // Ignore console failures inside the MCP stdio process.
+    }
+    emitGuardEvent('tool:anomaly', { repoRoot, tool: toolName, args, reason: anomaly.reason });
+    if (scope.config?.anomalyDetection?.blockOnAnomaly === true) {
+      return toolError(anomaly.reason);
+    }
+  }
+
+  emitGuardEvent('tool:after', { repoRoot, tool: toolName, args, response });
+  return response;
 });
 
 // ── switchman_task_next ────────────────────────────────────────────────────────

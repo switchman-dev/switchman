@@ -1,9 +1,12 @@
+import { writeFileSync } from 'fs';
+
 export function registerOperatorCommands(program, deps) {
   const {
     buildTeamReviewShareReport,
     buildSessionHistoryReport,
     buildInsightsReport,
     buildSessionSummary,
+    buildUnmanagedReview,
     buildUsageReport,
     buildDoctorReport,
     buildRecoverReport,
@@ -44,6 +47,110 @@ export function registerOperatorCommands(program, deps) {
     summarizeTeamCoordinationState,
     buildWatchSignature,
   } = deps;
+
+  function confidenceLabel(confidence) {
+    if (confidence === 'green') return 'Green';
+    if (confidence === 'amber') return 'Amber';
+    if (confidence === 'red') return 'Red';
+    return 'Uncertain';
+  }
+
+  function renderPrReadyReview(report) {
+    const lines = [
+      '# Switchman Merge Confidence Report',
+      '',
+      `**Merge confidence:** ${confidenceLabel(report.merge_confidence)}`,
+      report.evidence_source ? `**Evidence source:** ${report.evidence_source}` : null,
+      report.base_branch ? `**Base branch:** ${report.base_branch}` : null,
+      '',
+      '## Summary',
+      '',
+      report.narrative || 'No completed parallel-agent work was found in this review window.',
+      '',
+      '## What Switchman Checked',
+      '',
+      report.mode === 'unmanaged'
+        ? `- Sources reviewed: ${report.metrics.sources_reviewed || 0}`
+        : `- Rogue writes blocked: ${report.metrics.rogue_writes_blocked || 0}`,
+      report.mode === 'unmanaged'
+        ? `- Changed files observed: ${report.metrics.changed_files || 0}`
+        : `- Retry / recovery handoffs recorded: ${report.metrics.retries_scheduled || 0}`,
+      report.mode === 'unmanaged'
+        ? `- File overlaps: ${report.metrics.file_overlaps || 0}`
+        : `- Risky landing issues caught: ${report.metrics.queue_blocks_avoided || 0}`,
+      report.mode === 'unmanaged'
+        ? `- Branch conflicts: ${report.metrics.branch_conflicts || 0}`
+        : `- Safe merges completed: ${report.metrics.queue_merges_completed || 0}`,
+    ].filter((line) => line !== null);
+
+    if ((report.sources?.length || 0) > 0) {
+      lines.push('', '## Sources');
+      for (const source of report.sources) {
+        const aheadBehind = source.ahead_behind
+          ? `, ahead ${source.ahead_behind.ahead ?? '?'}, behind ${source.ahead_behind.behind ?? '?'}`
+          : '';
+        lines.push(`- ${source.name}: ${source.ref}, ${source.changed_file_count || 0} changed file${source.changed_file_count === 1 ? '' : 's'}${aheadBehind}`);
+      }
+    }
+
+    if ((report.file_conflicts?.length || 0) > 0) {
+      lines.push('', '## Inspect First');
+      for (const conflict of report.file_conflicts.slice(0, 10)) {
+        lines.push(`- ${conflict.file}: changed by ${conflict.sources.join(', ')}`);
+      }
+      if (report.file_conflicts.length > 10) {
+        lines.push(`- ...and ${report.file_conflicts.length - 10} more overlapping files`);
+      }
+    }
+
+    if ((report.branch_conflicts?.length || 0) > 0) {
+      lines.push('', '## Branch Merge Risk');
+      for (const conflict of report.branch_conflicts.slice(0, 10)) {
+        const left = conflict.source || conflict.source_a || conflict.branch || conflict.branch_a;
+        const right = conflict.base_branch || conflict.source_b || conflict.branch_b;
+        const files = (conflict.conflicting_files || []).slice(0, 5).join(', ') || 'unknown files';
+        lines.push(`- ${conflict.type}: ${left} vs ${right} (${files})`);
+      }
+    }
+
+    if ((report.risky_areas?.length || 0) > 0) {
+      lines.push('', '## Risky Areas', '', `- ${report.risky_areas.join(', ')}`);
+    }
+
+    if ((report.semantic_conflicts?.length || 0) > 0) {
+      lines.push('', '## Semantic Risk');
+      for (const conflict of report.semantic_conflicts.slice(0, 10)) {
+        const objectName = conflict.object_name || conflict.type || 'semantic conflict';
+        const left = `${conflict.worktreeA || 'unknown'}/${conflict.fileA || 'unknown'}`;
+        const right = `${conflict.worktreeB || 'unknown'}/${conflict.fileB || 'unknown'}`;
+        lines.push(`- ${objectName}: ${left} conflicts with ${right}`);
+      }
+      if (report.semantic_conflicts.length > 10) {
+        lines.push(`- ...and ${report.semantic_conflicts.length - 10} more semantic findings`);
+      }
+    } else {
+      lines.push('', '## Semantic Risk', '', '- No live semantic conflicts found in this review window.');
+    }
+
+    lines.push('', '## Recommended Next Step', '');
+    if (report.mode === 'unmanaged' && report.merge_confidence === 'green') {
+      lines.push('Run the repo test/CI command, then merge or open PRs in the order shown above.');
+    } else if (report.merge_confidence === 'green') {
+      lines.push('Run `switchman gate ci && switchman queue run` before merging.');
+    } else if (report.merge_confidence === 'amber') {
+      lines.push('Inspect the flagged findings first, then rerun `switchman review --pr-ready`.');
+    } else if (report.merge_confidence === 'red') {
+      lines.push('Do not merge yet. Resolve the blocking conflicts and rerun `switchman review --pr-ready`.');
+    } else {
+      lines.push('Do not treat this as merge-safe. Gather more evidence or inspect the changed worktrees manually.');
+    }
+
+    if (report.depth_hint?.command) {
+      lines.push('', `Suggested command: \`${report.depth_hint.command}\``);
+    }
+
+    return `${lines.filter((line) => line !== null).join('\n')}\n`;
+  }
 
   const usageCmd = program
     .command('usage')
@@ -230,6 +337,11 @@ Examples:
     .option('--share', 'Publish this review to your shared team feed')
     .option('--public', 'Generate a public read-only review URL anyone can view')
     .option('--team', 'Show recent teammate reviews shared for this repo')
+    .option('--pr-ready', 'Print a PR-ready Markdown merge confidence report')
+    .option('--from <refs...>', 'Review existing branches, refs, or worktree names without requiring Switchman-managed tasks')
+    .option('--all-worktrees', 'Review all non-main git worktrees without requiring Switchman-managed tasks')
+    .option('--base <branch>', 'Base branch for unmanaged review mode', 'main')
+    .option('--out <path>', 'Write the PR-ready Markdown report to a file')
     .option('--json', 'Output raw JSON')
     .addHelpText('after', `
 Examples:
@@ -240,6 +352,10 @@ Examples:
   switchman review --share
   switchman review --public
   switchman review --team
+  switchman review --pr-ready
+  switchman review --pr-ready --all-worktrees
+  switchman review --pr-ready --from feature-a feature-b
+  switchman review --pr-ready --all-worktrees --out switchman-review.md
   switchman review --json
 `)
     .action(async (opts) => {
@@ -327,9 +443,16 @@ Examples:
         return;
       }
 
-      const report = await buildSessionSummary(repoRoot, {
-        hours: reviewHours,
-      });
+      const unmanagedMode = opts.allWorktrees || (opts.from?.length || 0) > 0;
+      const report = unmanagedMode
+        ? await buildUnmanagedReview(repoRoot, {
+          refs: opts.from || [],
+          allWorktrees: opts.allWorktrees === true,
+          baseBranch: opts.base || 'main',
+        })
+        : await buildSessionSummary(repoRoot, {
+          hours: reviewHours,
+        });
       let shareResult = null;
       let publicShareResult = null;
 
@@ -357,6 +480,18 @@ Examples:
           ...report,
           shared: opts.share ? shareResult : null,
         }, null, 2));
+        return;
+      }
+
+      if (opts.prReady) {
+        const markdown = renderPrReadyReview(report);
+        if (opts.out) {
+          writeFileSync(opts.out, markdown, 'utf8');
+          console.log(`${chalk.green('✓')} Wrote merge confidence report`);
+          console.log(`  ${chalk.dim(opts.out)}`);
+          return;
+        }
+        console.log(markdown);
         return;
       }
 

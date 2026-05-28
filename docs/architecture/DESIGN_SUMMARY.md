@@ -2,23 +2,28 @@
 
 ## What Switchman Solves Today
 
-Switchman is a coordination layer for the current software delivery model:
+Switchman is a merge-confidence layer for parallel AI coding sessions in the current software delivery model:
 
 - code lives on the filesystem
 - git branches and worktrees are the execution substrate
 - agents edit files directly
 - conflicts are detected at file and branch boundaries
 
-In that environment, Switchman provides:
+In that environment, Switchman helps answer the operator's highest-stakes question: is the combined agent output safe to merge?
 
+To make that answer trustworthy, Switchman provides:
+
+- unmanaged review of existing branches and worktrees
 - task routing
 - leases/sessions for active work
 - file claims before editing
 - heartbeats and stale-session recovery
 - worktree visibility
 - conflict scans before merge
+- semantic drift and interface-mismatch detection
+- PR-ready merge confidence reports
 
-This is useful now because most teams still operate on files, branches, pull requests, and merges.
+This is useful now because most teams still operate on files, branches, pull requests, and merges, even when the work was produced by several AI agents at once.
 
 ## What Survives Beyond Files
 
@@ -98,7 +103,7 @@ More likely to remain high-signal canonical surfaces:
 
 Switchman is a bridge system.
 
-It improves coordination for the current file-first era while surfacing the primitives that matter in the next one.
+It improves merge confidence for the current file-first era while surfacing the primitives that matter in the next one.
 
 What would likely carry forward into a future Switchman-like system:
 
@@ -124,6 +129,6 @@ It is useful because the industry still runs on files and git, and because it va
 
 The project should be understood as:
 
-1. a practical coordination tool for current workflows
+1. a practical merge-confidence tool for current AI-heavy workflows
 2. a proving ground for leases, ownership, and session recovery
 3. a stepping stone toward semantic, validation-aware, non-file-first coordination

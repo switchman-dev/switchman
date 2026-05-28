@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * switchman CLI
- * Conflict-aware task coordinator for parallel AI coding agents
+ * Merge confidence for parallel AI coding sessions
  *
  * Commands:
  *   switchman init               - Initialize in current repo
@@ -90,6 +90,7 @@ import { registerClaudeCommands } from './commands/claude.js';
 import { registerMcpCommands } from './commands/mcp.js';
 import { registerAuditCommands } from './commands/audit.js';
 import { registerGateCommands } from './commands/gate.js';
+import { registerGuardCommands } from './commands/guard.js';
 import { registerHomebrewCommands } from './commands/homebrew.js';
 import { registerLeaseCommands } from './commands/lease.js';
 import { registerMonitorCommands } from './commands/monitor.js';
@@ -131,6 +132,7 @@ import {
   buildSessionHistoryReport,
   buildInsightsReport,
   buildSessionSummary,
+  buildUnmanagedReview,
   buildUsageReport,
   analyzeTaskScope,
   buildClaimExplainReport,
@@ -1122,28 +1124,16 @@ function printMergeDiscovery(discovery) {
 
 program
   .name('switchman')
-  .description('Conflict-aware task coordinator for parallel AI coding agents')
+  .description('Merge confidence reports for parallel AI coding sessions')
   .version('0.1.0');
 
 program.showHelpAfterError('(run with --help for usage examples)');
 const ROOT_HELP_COMMANDS = new Set([
   'advanced',
-  'claude',
   'demo',
-  'quickcheck',
-  'start',
-  'setup',
-  'verify-setup',
-  'plan',
-  'task',
-  'status',
-  'insights',
-  'usage',
   'review',
-  'recover',
-  'merge',
-  'scheduler',
-  'repair',
+  'gate',
+  'status',
   'help',
 ]);
 program.configureHelp({
@@ -1155,46 +1145,20 @@ program.configureHelp({
 });
 program.addHelpText('after', `
 Start here:
-  switchman demo
-  switchman quickcheck
-  switchman start "Add authentication"
-  switchman setup --agents 3
-  switchman task add "Your task" --priority 8
-  switchman status --watch
-  switchman insights
-  switchman usage
-  switchman review
-  switchman recover
-  switchman scheduler status
-  switchman gate ci && switchman queue run
+  switchman review --pr-ready --all-worktrees
+  switchman review --pr-ready --from branch-a branch-b
+  switchman review --pr-ready --from branch-a branch-b --out switchman-review.md
+  switchman gate ci
 
-For you (the operator):
+Proof:
   switchman demo
-  switchman quickcheck
-  switchman start "Add authentication"
-  switchman setup
-  switchman claude refresh
-  switchman task add
+
+When Switchman manages the run:
   switchman status
-  switchman insights
-  switchman usage
-  switchman review
-  switchman recover
-  switchman scheduler status
-  switchman merge
-  switchman repair
-  switchman plan "Add authentication"
-
-For your agents (via CLAUDE.md or MCP):
-  switchman lease next
-  switchman claim
-  switchman task done
-  switchman write
-  switchman wrap
 
 Docs:
   README.md
-  docs/setup-claude-code.md
+  docs/command-reference.md
 
 Power tools:
   switchman advanced --help
@@ -1205,7 +1169,23 @@ const advancedCmd = program
   .description('Show advanced, experimental, and power-user command groups')
   .addHelpText('after', `
 Advanced operator commands:
+  switchman quickcheck
+  switchman start "Add authentication"
+  switchman setup --agents 3
+  switchman task <...>
+  switchman lease <...>
+  switchman worktree <...>
+  switchman claim <...>
+  switchman scheduler <...>
   switchman pipeline <...>
+  switchman plan <...>
+  switchman usage <...>
+  switchman insights <...>
+  switchman guard <...>
+  switchman recover
+  switchman merge
+  switchman claude refresh
+  switchman verify-setup
   switchman audit <...>
   switchman policy <...>
   switchman monitor <...>
@@ -2671,6 +2651,7 @@ registerOperatorCommands(program, {
   buildInsightsReport,
   buildSessionHistoryReport,
   buildSessionSummary,
+  buildUnmanagedReview,
   buildTeamReviewShareReport,
   buildUsageReport,
   buildDoctorReport,
@@ -2738,6 +2719,11 @@ registerGateCommands(program, {
   runCommitGate,
   scanAllWorktrees,
   writeGitHubCiStatus,
+});
+
+registerGuardCommands(program, {
+  chalk,
+  getRepo,
 });
 
 const semanticCmd = program

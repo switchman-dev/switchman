@@ -1158,8 +1158,10 @@ test('Root help keeps the front door small and points advanced users deeper', ()
     encoding: 'utf8',
   });
 
-  assert(output.includes('switchman task add "Your task" --priority 8'), 'Root help includes the task-first start path');
-  assert(output.includes('switchman merge'), 'Root help includes the one-command merge front door');
+  assert(output.includes('switchman review --pr-ready --all-worktrees'), 'Root help leads with unmanaged worktree review');
+  assert(output.includes('switchman review --pr-ready --from branch-a branch-b'), 'Root help leads with unmanaged branch review');
+  assert(output.includes('switchman gate ci'), 'Root help includes the merge gate');
+  assert(!output.includes('switchman task add "Your task" --priority 8'), 'Root help hides task-first coordination');
   assert(!output.includes('queue|land'), 'Root help hides lower-level queue commands from the day-one command list');
   assert(output.includes('switchman advanced --help'), 'Root help points power users at advanced help');
 });
@@ -7782,14 +7784,14 @@ test('CLI help includes examples for the main entrypoint', () => {
   });
 
   assert(helpOutput.includes('Start here:'), 'Top-level help includes a guided start section');
-  assert(helpOutput.includes('For you (the operator):'), 'Top-level help includes an operator section');
-  assert(helpOutput.includes('For your agents (via CLAUDE.md or MCP):'), 'Top-level help includes an agent section');
-  assert(helpOutput.includes('switchman quickcheck'), 'Top-level help includes the quick onboarding check');
-  assert(helpOutput.includes('switchman start "Add authentication"'), 'Top-level help includes the one-command start entrypoint');
-  assert(helpOutput.includes('switchman claude refresh'), 'Top-level help includes the Claude guide refresh command');
-  assert(helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help includes the explicit first task step');
-  assert(helpOutput.includes('switchman plan "Add authentication"'), 'Top-level help includes the planning command');
-  assert(helpOutput.includes('switchman review'), 'Top-level help includes the review command');
+  assert(helpOutput.includes('Proof:'), 'Top-level help keeps the demo as proof');
+  assert(helpOutput.includes('When Switchman manages the run:'), 'Top-level help separates managed coordination');
+  assert(helpOutput.includes('switchman review --pr-ready --all-worktrees'), 'Top-level help includes unmanaged worktree review');
+  assert(helpOutput.includes('switchman review --pr-ready --from branch-a branch-b'), 'Top-level help includes unmanaged branch review');
+  assert(helpOutput.includes('switchman gate ci'), 'Top-level help includes the merge gate');
+  assert(!helpOutput.includes('For your agents (via CLAUDE.md or MCP):'), 'Top-level help no longer teaches agent-facing commands first');
+  assert(!helpOutput.includes('switchman quickcheck'), 'Top-level help moves quickcheck into advanced help');
+  assert(!helpOutput.includes('switchman task add "Your task" --priority 8'), 'Top-level help moves task queues into advanced help');
   assert(helpOutput.includes('switchman advanced --help'), 'Top-level help points power users at the advanced surface');
 });
 

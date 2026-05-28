@@ -1,6 +1,8 @@
 import chalk from 'chalk';
-import { execSync } from 'child_process';
-import { posix } from 'path';
+import { execFileSync, execSync } from 'child_process';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, posix } from 'path';
 
 import { matchesPathPatterns } from '../core/ignore.js';
 import {
@@ -23,7 +25,9 @@ import {
   reapStaleLeases,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
+import { checkMergeConflicts, getWorktreeChangedFiles, listGitWorktrees } from '../core/git.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
+import { buildSemanticIndexForPath, detectSemanticConflicts } from '../core/semantic.js';
 import { PRO_RETENTION_DAYS, getRetentionDaysForCurrentPlan } from '../core/licence.js';
 import { loadChangePolicy, loadLeasePolicy } from '../core/policy.js';
 import { getPipelineLandingExplainReport, getPipelineStatus, summarizePipelinePolicyState } from '../core/pipeline.js';
@@ -1327,6 +1331,272 @@ export async function buildSessionSummary(repoRoot, { hours = 8 } = {}) {
   } finally {
     db.close();
   }
+}
+
+function gitOutput(repoRoot, args, { cwd = repoRoot } = {}) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function gitRefExists(repoRoot, ref) {
+  try {
+    gitOutput(repoRoot, ['rev-parse', '--verify', `${ref}^{commit}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveReviewBaseBranch(repoRoot, baseBranch) {
+  if (baseBranch && gitRefExists(repoRoot, baseBranch)) return baseBranch;
+  if (gitRefExists(repoRoot, 'main')) return 'main';
+  if (gitRefExists(repoRoot, 'master')) return 'master';
+  try {
+    const current = gitOutput(repoRoot, ['branch', '--show-current']);
+    if (current && gitRefExists(repoRoot, current)) return current;
+  } catch {
+    // Fall through to the requested default.
+  }
+  return baseBranch || 'main';
+}
+
+function getChangedFilesSinceBase(repoRoot, ref, baseBranch) {
+  try {
+    const mergeBase = gitOutput(repoRoot, ['merge-base', baseBranch, ref]);
+    const output = gitOutput(repoRoot, ['diff', '--name-only', mergeBase, ref]);
+    return output.split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function getAheadBehind(repoRoot, ref, baseBranch) {
+  try {
+    const output = gitOutput(repoRoot, ['rev-list', '--left-right', '--count', `${baseBranch}...${ref}`]);
+    const [behind, ahead] = output.split(/\s+/).map((value) => Number.parseInt(value, 10) || 0);
+    return { ahead, behind };
+  } catch {
+    return { ahead: null, behind: null };
+  }
+}
+
+function detectFileOverlapsForSources(sources) {
+  const fileToSources = new Map();
+  for (const source of sources) {
+    for (const file of source.changed_files || []) {
+      if (!fileToSources.has(file)) fileToSources.set(file, []);
+      fileToSources.get(file).push(source.name);
+    }
+  }
+  return [...fileToSources.entries()]
+    .filter(([, sourceNames]) => sourceNames.length > 1)
+    .map(([file, sourceNames]) => ({ file, sources: sourceNames }));
+}
+
+function riskAreasForFiles(files = []) {
+  const patterns = [
+    { area: 'auth', regex: /(^|\/)(auth|login|session|permissions?|rbac|acl)(\/|$)/i },
+    { area: 'schema', regex: /(^|\/)(schema|migrations?|db|database|sql)(\/|$)|schema\./i },
+    { area: 'config', regex: /(^|\/)(config|configs|settings)(\/|$)|(^|\/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|tsconfig.*|vite\.config.*|webpack\.config.*)$/i },
+    { area: 'api', regex: /(^|\/)(api|routes?|controllers?)(\/|$)/i },
+    { area: 'payments', regex: /(^|\/)(payments?|billing|invoice|checkout|subscription)(\/|$)/i },
+  ];
+  return [...new Set(files.flatMap((file) => patterns.filter((pattern) => pattern.regex.test(file)).map((pattern) => pattern.area)))];
+}
+
+function sourceForInput(repoRoot, input, gitWorktrees) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+  const byName = gitWorktrees.find((worktree) => worktree.name === raw);
+  const byPath = gitWorktrees.find((worktree) => worktree.path === raw);
+  const worktree = byName || byPath || gitWorktrees.find((candidate) => candidate.branch === raw);
+  if (worktree?.branch) {
+    return {
+      name: worktree.name,
+      ref: worktree.branch,
+      path: worktree.path,
+      kind: worktree.isMain ? 'main_worktree' : 'worktree',
+    };
+  }
+  if (!gitRefExists(repoRoot, raw)) {
+    throw new Error(`Could not resolve ${raw} as a local branch, ref, or git worktree.`);
+  }
+  return {
+    name: raw,
+    ref: raw,
+    path: null,
+    kind: 'branch',
+  };
+}
+
+function withSourceCheckout(repoRoot, source, fn) {
+  if (source.path) return fn(source.path);
+
+  const tempPath = mkdtempSync(join(tmpdir(), 'switchman-review-'));
+  try {
+    execFileSync('git', ['worktree', 'add', '--detach', tempPath, source.ref], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return fn(tempPath);
+  } finally {
+    try {
+      execFileSync('git', ['worktree', 'remove', tempPath, '--force'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      rmSync(tempPath, { recursive: true, force: true });
+    }
+  }
+}
+
+export async function buildUnmanagedReview(repoRoot, {
+  refs = [],
+  allWorktrees = false,
+  baseBranch = 'main',
+} = {}) {
+  const resolvedBaseBranch = resolveReviewBaseBranch(repoRoot, baseBranch);
+  const gitWorktrees = listGitWorktrees(repoRoot);
+  const explicitRefs = refs.flatMap((ref) => String(ref || '').split(',')).map((ref) => ref.trim()).filter(Boolean);
+  const requestedSources = allWorktrees
+    ? gitWorktrees.filter((worktree) => !worktree.isMain && worktree.branch).map((worktree) => ({
+      name: worktree.name,
+      ref: worktree.branch,
+      path: worktree.path,
+      kind: 'worktree',
+    }))
+    : explicitRefs.map((ref) => sourceForInput(repoRoot, ref, gitWorktrees));
+  const dedupedSources = [...new Map(requestedSources.filter(Boolean).map((source) => [`${source.ref}:${source.path || ''}`, source])).values()];
+
+  if (dedupedSources.length === 0) {
+    return {
+      generated_at: new Date().toISOString(),
+      mode: 'unmanaged',
+      evidence_source: 'observed from git',
+      base_branch: resolvedBaseBranch,
+      merge_confidence: 'uncertain',
+      narrative: 'No unmanaged branches or worktrees were selected for review.',
+      metrics: {
+        sources_reviewed: 0,
+        changed_files: 0,
+        file_overlaps: 0,
+        branch_conflicts: 0,
+        semantic_conflicts: 0,
+        risky_areas: 0,
+      },
+      sources: [],
+      file_conflicts: [],
+      branch_conflicts: [],
+      semantic_conflicts: [],
+      risky_areas: [],
+      depth_hint: { command: 'switchman review --pr-ready --all-worktrees' },
+    };
+  }
+
+  const sources = dedupedSources.map((source) => {
+    const committedFiles = getChangedFilesSinceBase(repoRoot, source.ref, resolvedBaseBranch);
+    const uncommittedFiles = source.path ? getWorktreeChangedFiles(source.path, repoRoot) : [];
+    const changedFiles = [...new Set([...committedFiles, ...uncommittedFiles])].sort();
+    return {
+      ...source,
+      changed_files: changedFiles,
+      changed_file_count: changedFiles.length,
+      ahead_behind: getAheadBehind(repoRoot, source.ref, resolvedBaseBranch),
+      risky_areas: riskAreasForFiles(changedFiles),
+    };
+  });
+
+  const fileConflicts = detectFileOverlapsForSources(sources);
+  const branchConflicts = [];
+  for (const source of sources) {
+    const baseConflict = checkMergeConflicts(repoRoot, resolvedBaseBranch, source.ref);
+    if (baseConflict.hasConflicts) {
+      branchConflicts.push({
+        type: 'base_merge_conflict',
+        source: source.name,
+        branch: source.ref,
+        base_branch: resolvedBaseBranch,
+        conflicting_files: baseConflict.conflictingFiles || [],
+        details: baseConflict.details || null,
+      });
+    }
+  }
+  for (let i = 0; i < sources.length; i++) {
+    for (let j = i + 1; j < sources.length; j++) {
+      const left = sources[i];
+      const right = sources[j];
+      const result = checkMergeConflicts(repoRoot, left.ref, right.ref);
+      if (result.hasConflicts) {
+        branchConflicts.push({
+          type: result.isOverlapOnly ? 'file_overlap' : 'pairwise_merge_conflict',
+          source_a: left.name,
+          source_b: right.name,
+          branch_a: left.ref,
+          branch_b: right.ref,
+          conflicting_files: result.conflictingFiles || [],
+          details: result.details || null,
+        });
+      }
+    }
+  }
+
+  const semanticIndexes = sources.map((source) => withSourceCheckout(repoRoot, source, (checkoutPath) => ({
+    worktree: source.name,
+    branch: source.ref,
+    objects: buildSemanticIndexForPath(checkoutPath, source.changed_files).objects,
+  })));
+  const semanticConflicts = detectSemanticConflicts(semanticIndexes);
+  const riskyAreas = [...new Set(sources.flatMap((source) => source.risky_areas || []))].sort();
+  const hasChangedFiles = sources.some((source) => source.changed_file_count > 0);
+  const hasBlockedSemantic = semanticConflicts.some((conflict) => conflict.severity === 'blocked' || conflict.type === 'semantic_object_overlap');
+  const hasWarnSemantic = semanticConflicts.some((conflict) => conflict.severity === 'warn' || conflict.type === 'semantic_name_overlap');
+  const hasHardBranchConflict = branchConflicts.some((conflict) => conflict.type !== 'file_overlap');
+  const mergeConfidence = hasHardBranchConflict || hasBlockedSemantic
+    ? 'red'
+    : branchConflicts.length > 0 || fileConflicts.length > 0 || hasWarnSemantic || riskyAreas.length > 0
+      ? 'amber'
+      : hasChangedFiles
+        ? 'green'
+        : 'uncertain';
+  const changedFileCount = sources.reduce((sum, source) => sum + source.changed_file_count, 0);
+  const narrative = sources.length === 1
+    ? `Reviewed ${sources[0].name} against ${resolvedBaseBranch} from git evidence.`
+    : `Reviewed ${sources.length} unmanaged git source${sources.length === 1 ? '' : 's'} against ${resolvedBaseBranch} from git evidence.`;
+
+  return {
+    generated_at: new Date().toISOString(),
+    mode: 'unmanaged',
+    evidence_source: 'observed from git',
+    base_branch: resolvedBaseBranch,
+    merge_confidence: mergeConfidence,
+    narrative: `${narrative} Found ${changedFileCount} changed file${changedFileCount === 1 ? '' : 's'}, ${fileConflicts.length} file overlap${fileConflicts.length === 1 ? '' : 's'}, ${branchConflicts.length} branch conflict${branchConflicts.length === 1 ? '' : 's'}, and ${semanticConflicts.length} semantic finding${semanticConflicts.length === 1 ? '' : 's'}.`,
+    metrics: {
+      sources_reviewed: sources.length,
+      changed_files: changedFileCount,
+      file_overlaps: fileConflicts.length,
+      branch_conflicts: branchConflicts.length,
+      semantic_conflicts: semanticConflicts.length,
+      risky_areas: riskyAreas.length,
+      rogue_writes_blocked: 0,
+      retries_scheduled: 0,
+      queue_blocks_avoided: 0,
+      queue_merges_completed: 0,
+    },
+    sources,
+    file_conflicts: fileConflicts,
+    branch_conflicts: branchConflicts,
+    semantic_conflicts: semanticConflicts,
+    risky_areas: riskyAreas,
+    depth_hint: mergeConfidence === 'green'
+      ? null
+      : { command: `switchman review --pr-ready --base ${resolvedBaseBranch} ${allWorktrees ? '--all-worktrees' : `--from ${explicitRefs.join(' ')}`}` },
+  };
 }
 
 function summarizeSessionWindow(

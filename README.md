@@ -1,6 +1,6 @@
 # Switchman
 
-**You ran the agents. Did they build the right thing?**
+**You ran three AI agents. Is the combined work safe to merge?**
 
 [![CI](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml/badge.svg)](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/switchman-dev.svg)](https://www.npmjs.com/package/switchman-dev)
@@ -23,12 +23,13 @@ If that's you, read on. If you're running a single agent on a single branch, you
 ## What it does
 
 ```bash
-switchman start "your goal"
-# agents run in parallel
-switchman review
+switchman review --pr-ready --all-worktrees
+switchman review --pr-ready --from feature-auth feature-api
 ```
 
-`switchman review` reads every worktree, turns a parallel session into a plain-English summary, flags semantic overlap and interface mismatches, and gives an honest merge confidence outcome: `green`, `amber`, `red`, or `uncertain`. When it cannot make a trustworthy call, it says `uncertain` instead of pretending everything is fine.
+Switchman is a merge-confidence layer for parallel AI coding sessions. It reads existing branches and worktrees, turns a messy multi-agent run into a PR-ready report, flags semantic overlap and interface mismatches, and gives an honest merge confidence outcome: `green`, `amber`, `red`, or `uncertain`.
+
+When Switchman cannot make a trustworthy call, it says `uncertain` instead of pretending everything is fine.
 
 Built for developers using Claude Code, Cursor, Windsurf, Aider, and other CLI-first coding agents on real repos.
 
@@ -64,15 +65,14 @@ Creates a throwaway repo and shows:
 
 - agent1 claiming `src/auth.js`
 - agent2 getting blocked from the same file and rerouting safely
-- both branches landing cleanly through the queue
-- a final `switchman review` session summary
+- a final merge-confidence review
 
 Then inspect it:
 
 ```bash
 cd /tmp/switchman-demo-...
 switchman status
-switchman review
+switchman review --pr-ready
 ```
 
 ---
@@ -81,46 +81,29 @@ switchman review
 
 ```bash
 cd my-project
-switchman quickcheck          # readiness check — prints one exact next command
-switchman start "your goal"   # plans the work, creates workspaces, wires MCP
-switchman status --watch      # live view while agents run
-switchman review              # what was built, what doesn't fit, safe to ship?
+switchman review --pr-ready --all-worktrees
+switchman review --pr-ready --from branch-a branch-b
+switchman review --pr-ready --from branch-a branch-b --out switchman-review.md
 ```
 
 When the review looks good:
 
 ```bash
 switchman gate ci
-switchman queue run
 ```
 
-What `switchman start` sets up:
+When you also want Switchman to coordinate the run:
 
-- repo context-aware task planning
-- linked agent workspaces, one per agent
-- shared Switchman database in `.switchman/`
-- repo-aware `CLAUDE.md` when one does not exist
-- automatic MCP coordination wiring where supported
-
-If you want full manual control instead:
-
-```bash
-switchman setup --agents 3
-switchman task add "Implement auth helper" --priority 9
-```
-
-Editor setup guides:
-
-- [Claude Code](docs/setup-claude-code.md)
-- [Cursor](docs/setup-cursor.md)
-- [Windsurf](docs/setup-windsurf.md)
-- [Aider and Cline](docs/setup-cli-agents.md)
+- `switchman start "your goal"` — plan work, create workspaces, and wire MCP
+- `switchman status --watch` — live view while agents run
+- `switchman merge` — queue finished worktrees and land safe work
+- `switchman advanced --help` — task queues, leases, scheduler, Guard, telemetry, and governance tools
 
 ---
 
 ## The problem in detail
 
-Three agents finish. You have three worktrees full of diffs and no coherent picture of what was built.
+Three agents finish. You have three worktrees full of diffs and no trustworthy answer to the question that matters: can this be merged?
 
 Git tells you what changed. It does not tell you whether parallel agent work is coherent.
 
@@ -130,50 +113,50 @@ The three things developers consistently hit:
 - **Agentic drift** — two agents independently solve the same problem in incompatible ways. No conflict. No CI failure. Just divergence that compiles, passes, and breaks later.
 - **No trustworthy answer** — "is this safe to merge?" has been yours to answer alone until `switchman review`
 
-Git branches and worktrees solve isolation. They do not solve coordination, ownership, visibility, or the question of whether a session produced something coherent. That is what Switchman adds.
+Git branches and worktrees solve isolation. They do not tell you whether AI-generated branches fit together, whether one agent drifted across an interface, or what a reviewer should inspect first. That is what Switchman adds.
 
 ---
 
 ## How it works
 
-### 1. Start with one goal
+### 1. Review existing AI branches
 
-`switchman start "Add user authentication"` reads the repo, creates agent workspaces, and keeps work aligned as agents run. File claims, task ownership, and stale recovery happen automatically through MCP — you do not need to prompt agents to coordinate manually.
+Run your agents however you already work: Claude Code worktrees, Codex branches, Cursor sessions, or hand-made git branches. Then point Switchman at the resulting branches or worktrees.
 
-### 2. Review what was built
+### 2. Generate the merge-confidence report
 
-`switchman review` produces three things:
+`switchman review --pr-ready` produces four things:
 
 - A plain-English narrative of what each agent built — not a file list, a description
 - Semantic flags — places where agents produced contradictory interfaces, duplicate implementations, or overlapping solutions
 - A merge confidence outcome: `green`, `amber`, `red`, or `uncertain`
+- A PR-ready Markdown handoff with the safest next step
 
-### 3. Ship through gates
+Use `--all-worktrees` for local worktree sessions, or `--from <branches...>` when you know the branches you want reviewed together.
 
-When the review looks good, `switchman gate ci` and `switchman queue run` land finished work cleanly onto main.
+### 3. Ship with evidence
+
+When the review looks good, run your repo tests or `switchman gate ci`, then paste the PR-ready report into the review.
 
 ---
 
 ## Open source
 
-Switchman is now one open source product. No login is required for the local workflow, and the core operator commands stay available out of the box.
+Switchman is now one open source product. No login is required for the local merge-confidence workflow.
 
 ```bash
-switchman start "goal"   →   agents run   →   switchman review
+agents run   →   switchman review --pr-ready --all-worktrees   →   merge with evidence
 ```
 
 What you get:
 
-- `switchman start` — reads the repo, creates workspaces, writes MCP config, generates `CLAUDE.md`
-- `switchman review` — full session summary, semantic overlap detection, interface mismatch flagging, merge confidence outcome
-- `switchman status --watch` — live dashboard during a session
-- `switchman scan` — lightweight pre-merge conflict check
+- `switchman review --pr-ready --all-worktrees` — review existing git worktrees without adopting Switchman coordination
+- `switchman review --pr-ready --from branch-a branch-b` — review existing branches together
+- `switchman review --pr-ready` — PR-ready merge-confidence report, semantic overlap detection, interface mismatch flagging, safest next step
+- `switchman review` — terminal session summary for recent parallel-agent work
+- `switchman gate ci` — local repo gate before merge
 - `switchman demo` — proves the flow in a throwaway repo
-- 90-day searchable session history — `switchman review --history`, `switchman review --history --search auth`
-- Cross-session pattern detection — `switchman insights`
-- Shared review publishing — `switchman review --share` to publish, `switchman review --team` to read teammate reviews before the PR
-- AI task planning — `switchman plan "Add authentication" --apply`, `switchman plan --issue 47`
-- Cost and token tracking — `switchman usage`, `switchman usage --days 30`
+- Managed coordination, leases, scheduler, Guard, telemetry, and governance tools — `switchman advanced --help`
 
 ---
 
@@ -181,10 +164,9 @@ What you get:
 
 ```bash
 switchman status          # main dashboard
-switchman status --watch  # live view
-switchman scan            # conflict scan across worktrees
+switchman review --pr-ready --all-worktrees
 switchman gate ci         # repo gate check
-switchman verify-setup    # check MCP wiring
+switchman advanced --help # deeper coordination tools
 ```
 
 Explain commands for when something is blocked:

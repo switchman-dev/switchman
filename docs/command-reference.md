@@ -3,21 +3,52 @@
 Use this page when you already know what kind of action you need.
 
 If you are brand new to Switchman, start with:
-- `switchman demo` for the shortest proof
-- `switchman start "Add authentication"` for a real repo
-- `switchman status` when you are not sure what to do next
-- `switchman review` when you want the full session summary
-- `switchman review --history` when you want retained session history or search
-- `switchman usage` when you need cost and token rollups
-- `switchman insights` when you want cross-session amber hotspot patterns
+- `switchman review --pr-ready` when you need to know whether parallel AI work is safe to merge
+- `switchman review --pr-ready --all-worktrees` when agents already ran in local git worktrees
+- `switchman review --pr-ready --from branch-a branch-b` when agents already ran on branches
+- `switchman review --pr-ready --from branch-a branch-b --out switchman-review.md` when you want a PR handoff file
+- `switchman gate ci` when the review looks good and you want a local merge gate
+- `switchman demo` for the shortest proof before trying it on a real repo
 
-## Setup
+## Review and merge confidence
+
+### `switchman review`
+- `--pr-ready` prints a PR-ready Markdown merge confidence report
+- `--all-worktrees` reviews all non-main git worktrees from git evidence, even if Switchman did not manage them
+- `--from <refs...>` reviews existing branches, refs, or worktree names from git evidence
+- `--base <branch>` chooses the base branch for unmanaged review mode
+- `--out <path>` writes the PR-ready Markdown report to a file
+- `--share` publishes the current review to your shared team feed
+- `--team` pulls recent teammate reviews shared for this repo
+- `--history` shows retained session history
+- `--search <query>` filters retained history to matching sessions
+
+### `switchman gate ci`
+- runs the repo-level merge gate locally or in CI
+- checks file conflicts, semantic conflicts, stale leases, unclaimed changes, and boundary validation state
+
+### `switchman gate install-ci`
+- installs a GitHub Actions workflow with a named Switchman PR check
+- keeps the Switchman summary visible before the workflow fails the check
+
+### `switchman status`
+- use this when Switchman managed the run and you are not sure what needs attention next
 
 ### `switchman demo`
 - creates a self-contained demo repo
 - proves an overlapping claim gets blocked
 - lands the demo work safely through the queue
 - best first command if you want to see the product work before wiring a real repo
+
+## Advanced managed coordination
+
+Use these when you want Switchman to create workspaces, assign tasks, manage leases, or govern agents through MCP.
+
+### `switchman quickcheck`
+- checks whether the current repo is ready for a managed Switchman run
+
+### `switchman start "Add authentication"`
+- plans work, creates agent workspaces, writes MCP config, and starts the managed run
 
 ### `switchman setup`
 - creates agent workspaces
@@ -31,18 +62,6 @@ Useful options:
 
 ### `switchman init`
 - initialise in the current git repo without creating extra workspaces
-
-## Tasks and leases
-
-Plain-English note:
-- `lease` means “this task is currently checked out by an agent”
-- `worktree` in command names means the agent workspace folder
-
-Most-used first-run commands:
-- `switchman task add <title>`
-- `switchman task next --worktree <name>`
-- `switchman task done <taskId>`
-- `switchman task retry-stale --pipeline <pipelineId>`
 
 ### `switchman task add <title>`
 ### `switchman task list`
@@ -58,28 +77,14 @@ Most-used first-run commands:
 ### `switchman lease reap`
 ### `switchman lease policy`
 ### `switchman lease policy set`
-
-## Coordination
-
-When work feels unclear, these are the front doors:
-- `switchman status`
-- `switchman usage`
-- `switchman explain claim <path>`
-- `switchman explain queue <itemId>`
-- `switchman explain stale --pipeline <pipelineId>`
-
 ### `switchman claim <taskId> <worktree> [files...]`
-- use this before editing shared files
+- use this before editing shared files in a managed run
 - `--force` is for operator-led recovery only, not normal agent flow
-- only use `--force` after checking `switchman status` or `switchman explain claim <path>` and confirming the existing claim is stale or wrong
 ### `switchman release <taskId>`
 ### `switchman scan`
-### `switchman status`
-### `switchman review`
-- `--share` publishes the current review to your shared team feed
-- `--team` pulls recent teammate reviews shared for this repo
-- `--history` shows retained session history
-- `--search <query>` filters retained history to matching sessions
+
+## Reports and history
+
 ### `switchman insights`
 - cross-session hotspot reporting for recurring amber-or-worse areas and validation gaps
 - useful filters: `--days 30`, `--json`
@@ -130,13 +135,9 @@ Useful explain and recovery commands in this area:
 - `switchman pipeline land <pipelineId> --recover`
 - `switchman pipeline land <pipelineId> --resume`
 
-## MCP and CI
+## MCP, policy, and audit
 
 ### `switchman mcp install --windsurf`
-### `switchman gate ci`
-### `switchman gate install-ci`
-- installs a GitHub Actions workflow with a named Switchman PR check
-- keeps the Switchman summary visible before the workflow fails the check
 ### `switchman policy init-change`
 ### `switchman policy show-change`
 ### `switchman audit verify`

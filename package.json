@@ -1,7 +1,7 @@
 {
   "name": "switchman-dev",
   "version": "0.1.29",
-  "description": "Coordinate parallel AI coding agents — file locking, task queues, and merge confidence reviews for Claude Code, Cursor, Codex, Windsurf, and Aider. Run multiple agents on the same repo without conflicts.",
+  "description": "Merge confidence reports for parallel AI coding sessions in Claude Code, Cursor, Codex, Windsurf, and Aider.",
   "type": "module",
   "main": "src/index.js",
   "bin": {
