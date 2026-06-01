@@ -20,7 +20,7 @@ That's agentic drift. Switchman catches it before you merge.
 
 When Switchman cannot make a trustworthy call, it reports `uncertain` instead of pretending the merge is safe.
 
-Questions or feedback? [Discord](https://discord.gg/pnT8BEC4D) · [hello@switchman.dev](mailto:hello@switchman.dev)
+Questions or feedback? [Discord](https://discord.gg/vnHgSW3RNc) · [hello@switchman.dev](mailto:hello@switchman.dev)
 
 ---
 
