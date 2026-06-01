@@ -1,6 +1,6 @@
 {
   "name": "switchman-dev",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Merge confidence reports for parallel AI coding sessions in Claude Code, Cursor, Codex, Windsurf, and Aider.",
   "type": "module",
   "main": "src/index.js",
