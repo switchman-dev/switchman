@@ -4,9 +4,9 @@
 
 [![CI](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml/badge.svg)](https://github.com/switchman-dev/switchman/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/switchman-dev.svg)](https://www.npmjs.com/package/switchman-dev)
-[![1000+ installs](https://img.shields.io/badge/installs-800%2B-5CF2C7)](https://www.npmjs.com/package/switchman-dev)
+[![1000+ installs](https://img.shields.io/badge/installs-1000%2B-5CF2C7)](https://www.npmjs.com/package/switchman-dev)
 
-<img src="docs/demo.png" width="600" alt="Switchman demo - agent2 blocked from src/auth.js, rerouted safely, both branches landed cleanly">
+<img src="docs/demo.png" width="600" alt="Switchman catching agentic drift — amber confidence, interface mismatch detected between agent-1 and agent-2">
 
 You're running Claude Code, Cursor, Codex, or another coding agent across multiple worktrees. Each agent finishes clean. Git says no conflicts. You merge, and something breaks in prod.
 
@@ -34,10 +34,6 @@ npm install -g switchman-dev
 
 > Switchman uses the built-in `node:sqlite` runtime. No extra database to install or manage.
 
-## Which mode is right for me?
-
-Use **zero-setup review** if your agents already ran in worktrees and you just want to know whether the result is safe to merge. Use **full coordination mode** when you want Switchman to create agent workspaces, expose MCP tools, and stop conflicts before agents write incompatible changes.
-
 ---
 
 ## Try it in 2 minutes
@@ -46,19 +42,7 @@ Use **zero-setup review** if your agents already ran in worktrees and you just w
 switchman demo
 ```
 
-Creates a throwaway repo and shows:
-
-- agent1 claiming `src/auth.js`
-- agent2 getting blocked from the same file and rerouting safely
-- a final merge-confidence review
-
-Then inspect it:
-
-```bash
-cd /tmp/switchman-demo-...
-switchman status
-switchman review --pr-ready
-```
+Creates a throwaway repo with two agents that conflict and shows Switchman catching the drift before merge — no setup required.
 
 ---
 
@@ -81,13 +65,6 @@ Add CI protection when you want Switchman on every PR:
 
 ```bash
 switchman gate install-ci
-```
-
-Full coordination mode is optional:
-
-```bash
-switchman init
-switchman start "your goal"
 ```
 
 ---
@@ -113,13 +90,13 @@ Use `--all-worktrees` for local worktree sessions, or `--from <branches...>` whe
 
 ### Claude Code
 
-Install the Stop hook once per repo. Switchman runs when a Claude Code session ends.
+Install the Stop hook once per repo. Switchman runs silently every time a Claude Code session ends.
 
 ```bash
 switchman claude hooks install
 ```
 
-This writes a hook into `.claude/settings.local.json` that fires `switchman agent-complete` automatically on session end. The first three clean runs print a short green confirmation so you know the hook is alive; after that, clean runs stay quiet and issues still print.
+This writes a hook into `.claude/settings.local.json` that fires `switchman agent-complete` automatically on session end. The first three clean runs print a short green confirmation so you know the hook is alive — after that, clean runs stay quiet and issues still print.
 
 ### Watch mode
 
@@ -220,43 +197,6 @@ switchman gate install-ci
 
 ---
 
-## MCP server
-
-Switchman ships an MCP server for direct integration with Claude Code and other MCP-compatible agents.
-
-```bash
-switchman mcp
-```
-
-This is the proactive layer. `switchman review` catches drift after agents finish; the MCP server lets agents claim files, pick tasks, use guarded writes, and coordinate before they conflict.
-
----
-
-## Repo health
-
-```bash
-# Quick check: fastest next step for your current state
-switchman quickcheck
-
-# Full status across all worktrees and pipelines
-switchman status
-
-# Verify your setup is ready
-switchman verify-setup
-
-# Generate a repo-aware CLAUDE.md
-switchman claude refresh
-```
-
-More help:
-
-- [Status and recovery](docs/status-and-recovery.md)
-- [Merge queue](docs/merge-queue.md)
-- [Pipelines and PRs](docs/pipelines.md)
-- [Command reference](docs/command-reference.md)
-
----
-
 ## Badge
 
 Add to your README to signal that your repo uses Switchman:
@@ -269,6 +209,28 @@ Add to your README to signal that your repo uses Switchman:
 
 ---
 
+## Advanced: full coordination mode
+
+Want agents to coordinate *before* they conflict rather than catching drift after? Switchman ships an MCP server that lets agents claim files, pick tasks from a shared queue, and use guarded writes — so conflicts are prevented, not just detected.
+
+```bash
+# Initialise coordination mode
+switchman init
+switchman start "your goal"
+
+# Start the MCP server
+switchman mcp
+```
+
+More help:
+
+- [Status and recovery](docs/status-and-recovery.md)
+- [Merge queue](docs/merge-queue.md)
+- [Pipelines and PRs](docs/pipelines.md)
+- [Command reference](docs/command-reference.md)
+
+---
+
 ## Feedback
 
 Building this in public. If you hit something broken or missing, I'd love to hear about it.
@@ -276,6 +238,8 @@ Building this in public. If you hit something broken or missing, I'd love to hea
 - [GitHub Issues](https://github.com/switchman-dev/switchman/issues)
 - [hello@switchman.dev](mailto:hello@switchman.dev)
 - [Discord](https://discord.gg/vnHgSW3RNc)
+
+---
 
 ## License
 
