@@ -28,7 +28,6 @@ import { scanAllWorktrees } from '../core/detector.js';
 import { checkMergeConflicts, getWorktreeChangedFiles, listGitWorktrees } from '../core/git.js';
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { buildSemanticIndexForPath, detectSemanticConflicts } from '../core/semantic.js';
-import { PRO_RETENTION_DAYS, getRetentionDaysForCurrentPlan } from '../core/licence.js';
 import { loadChangePolicy, loadLeasePolicy } from '../core/policy.js';
 import { getPipelineLandingExplainReport, getPipelineStatus, summarizePipelinePolicyState } from '../core/pipeline.js';
 import { buildQueueStatusSummary, resolveQueueSource } from '../core/queue.js';
@@ -45,6 +44,12 @@ import {
   renderSignalStrip,
   statusBadge,
 } from './ui.js';
+
+const RETENTION_DAYS = 90;
+
+async function getRetentionDaysForCurrentPlan() {
+  return RETENTION_DAYS;
+}
 
 function listRecentGitAuthors(repoRoot, limit = 30) {
   try {
@@ -1472,6 +1477,19 @@ export async function buildUnmanagedReview(repoRoot, {
       kind: 'worktree',
     }))
     : explicitRefs.map((ref) => sourceForInput(repoRoot, ref, gitWorktrees));
+  if (allWorktrees && requestedSources.length === 0) {
+    const currentWorktree = gitWorktrees.find((worktree) => worktree.path === repoRoot)
+      || gitWorktrees.find((worktree) => !worktree.isMain && worktree.branch)
+      || gitWorktrees.find((worktree) => worktree.branch);
+    if (currentWorktree?.branch && currentWorktree.branch !== resolvedBaseBranch) {
+      requestedSources.push({
+        name: currentWorktree.name,
+        ref: currentWorktree.branch,
+        path: currentWorktree.path,
+        kind: currentWorktree.isMain ? 'current_worktree' : 'worktree',
+      });
+    }
+  }
   const dedupedSources = [...new Map(requestedSources.filter(Boolean).map((source) => [`${source.ref}:${source.path || ''}`, source])).values()];
 
   if (dedupedSources.length === 0) {
@@ -1604,7 +1622,7 @@ function summarizeSessionWindow(
   queueEvents = [],
   {
     hours = null,
-    retentionDays = PRO_RETENTION_DAYS,
+    retentionDays = RETENTION_DAYS,
     liveSemanticConflicts = [],
     agentSummaries = [],
   } = {},
@@ -2367,46 +2385,14 @@ export function renderUnifiedStatusReport(report, { teamActivity = [], teamSumma
     console.log(chalk.dim(`coordination source: shared team queue • ${report.shared_summary.team_id || 'team'} • ${report.shared_summary.repo_key || 'repo'}`));
   }
   if ((report.sync_state?.pending || 0) > 0) {
-    const retryNote = report.sync_state.next_retry_at
-      ? ` • next retry ${report.sync_state.next_retry_at}`
-      : '';
-    console.log(chalk.yellow(`shared sync buffered locally: ${report.sync_state.pending} event(s) pending${retryNote}`));
+    console.log(chalk.yellow(`local sync buffer: ${report.sync_state.pending} event(s) pending`));
   }
   if (report.merge_readiness.policy_state?.active) {
     console.log(chalk.dim(`change policy: ${report.merge_readiness.policy_state.domains.join(', ')} • ${report.merge_readiness.policy_state.enforcement} • missing ${report.merge_readiness.policy_state.missing_task_types.join(', ') || 'none'}`));
   }
 
-  // ── Team activity (Pro cloud sync) ──────────────────────────────────────────
-  if (teamSummary && teamSummary.members > 0) {
-    console.log('');
-    console.log(chalk.bold('Shared cloud state:'));
-    console.log(`  ${chalk.dim('members:')} ${teamSummary.members}  ${chalk.dim('leases:')} ${teamSummary.lease_events}  ${chalk.dim('claims:')} ${teamSummary.claim_events}  ${chalk.dim('queue:')} ${teamSummary.queue_events}`);
-    if (teamSummary.latest_queue_event) {
-      console.log(`  ${chalk.dim('latest queue event:')} ${chalk.cyan(teamSummary.latest_queue_event.event_type)} ${chalk.dim(teamSummary.latest_queue_event.payload?.source_ref || teamSummary.latest_queue_event.payload?.item_id || '')}`.trim());
-    }
-  }
-  if (teamActivity.length > 0) {
-    console.log('');
-    console.log(chalk.bold('Team activity:'));
-    for (const member of teamActivity) {
-      const email = member.payload?.email ?? chalk.dim(member.user_id?.slice(0, 8) ?? 'unknown');
-      const worktree = chalk.cyan(member.worktree ?? 'unknown');
-      const eventLabel = {
-        task_added:     'added a task',
-        task_done:      'completed a task',
-        task_failed:    'failed a task',
-        task_retried:   'retried a task',
-        lease_acquired: `working on: ${chalk.dim(member.payload?.title ?? '')}`,
-        claim_added:    `claimed ${chalk.dim(member.payload?.file_count ?? 0)} file(s)`,
-        claim_released: 'released file claims',
-        queue_added:    `queued ${chalk.dim(member.payload?.source_ref ?? member.payload?.item_id ?? 'work')}`,
-        queue_merged:   `landed ${chalk.dim(member.payload?.source_ref ?? member.payload?.item_id ?? 'work')}`,
-        queue_blocked:  `blocked ${chalk.dim(member.payload?.source_ref ?? member.payload?.item_id ?? 'work')}`,
-        status_ping:    'active',
-      }[member.event_type] ?? member.event_type;
-      console.log(`  ${chalk.dim('○')} ${email} · ${worktree} · ${eventLabel}`);
-    }
-  }
+  void teamSummary;
+  void teamActivity;
 
   const runningLines = report.active_work.length > 0
     ? report.active_work.slice(0, 5).map((item) => {
@@ -2689,22 +2675,11 @@ export function renderLiveWatchDashboard(report, {
     queueLines.push(chalk.dim('No active landing queue pressure.'));
   }
 
-  const teamLines = [];
-  if (teamMembers > 0) {
-    teamLines.push(`${chalk.white(teamMembers)} teammate${teamMembers === 1 ? '' : 's'} active in shared coordination`);
-  }
-  if ((teamSummary?.queue_events || 0) > 0) {
-    teamLines.push(`${chalk.white(teamSummary.queue_events)} recent queue event${teamSummary.queue_events === 1 ? '' : 's'}`);
-  }
-  if ((teamSummary?.lease_events || 0) > 0) {
-    teamLines.push(`${chalk.white(teamSummary.lease_events)} recent lease / task handoff${teamSummary.lease_events === 1 ? '' : 's'}`);
-  }
-  if ((teamSummary?.claim_events || 0) > 0) {
-    teamLines.push(`${chalk.white(teamSummary.claim_events)} recent claim change${teamSummary.claim_events === 1 ? '' : 's'}`);
-  }
-  if (teamLines.length === 0) {
-    teamLines.push(chalk.dim('No remote team activity visible in this cycle.'));
-  }
+  const runtimeLines = [
+    syncPending > 0
+      ? `${chalk.yellow('local sync buffer:')} ${syncPending} event(s) pending`
+      : chalk.green('No hosted account sync is configured.'),
+  ];
 
   console.log('');
   console.log(healthColor('='.repeat(72)));
@@ -2717,8 +2692,6 @@ export function renderLiveWatchDashboard(report, {
     renderChip('leases', report.counts.active_leases, report.counts.active_leases > 0 ? chalk.blue : chalk.green),
     renderChip('claims', report.counts.active_claims, report.counts.active_claims > 0 ? chalk.cyan : chalk.green),
     renderChip('queue', queueLoad, queueLoad > 0 ? chalk.blue : chalk.green),
-    renderChip('sync', syncPending, syncPending > 0 ? chalk.yellow : chalk.green),
-    renderChip('team', teamMembers, teamMembers > 0 ? chalk.cyan : chalk.green),
   ]));
   console.log(renderMetricRow([
     { label: 'health', value: healthLabel(report.health), color: healthColor },
@@ -2734,12 +2707,7 @@ export function renderLiveWatchDashboard(report, {
     renderPanel('Agents', agentLines, report.active_work.length > 0 ? chalk.cyan : chalk.green),
     renderPanel('Focus', focusLines, blockedItems.length > 0 ? chalk.red : warningItems.length > 0 ? chalk.yellow : chalk.green),
     renderPanel('Queue', queueLines, queueCounts.blocked > 0 ? chalk.red : queueLoad > 0 ? chalk.blue : chalk.green),
-    renderPanel('Team + sync', [
-      ...teamLines,
-      syncPending > 0
-        ? `${chalk.yellow('buffered sync:')} ${syncPending} event(s) waiting to flush`
-        : chalk.green('Cloud sync is current.'),
-    ], syncPending > 0 ? chalk.yellow : chalk.green),
+    renderPanel('Runtime', runtimeLines, syncPending > 0 ? chalk.yellow : chalk.green),
   ];
 
   for (const block of panelBlocks) {

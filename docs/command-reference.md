@@ -3,6 +3,7 @@
 Use this page when you already know what kind of action you need.
 
 If you are brand new to Switchman, start with:
+- `switchman review` for a zero-config first read of local git worktrees
 - `switchman review --pr-ready` when you need to know whether parallel AI work is safe to merge
 - `switchman review --pr-ready --all-worktrees` when agents already ran in local git worktrees
 - `switchman review --pr-ready --from branch-a branch-b` when agents already ran on branches
@@ -13,23 +14,24 @@ If you are brand new to Switchman, start with:
 ## Review and merge confidence
 
 ### `switchman review`
+- works without `switchman init`; if no Switchman database exists, it reviews local git worktrees from git evidence
 - `--pr-ready` prints a PR-ready Markdown merge confidence report
 - `--all-worktrees` reviews all non-main git worktrees from git evidence, even if Switchman did not manage them
 - `--from <refs...>` reviews existing branches, refs, or worktree names from git evidence
 - `--base <branch>` chooses the base branch for unmanaged review mode
 - `--out <path>` writes the PR-ready Markdown report to a file
-- `--share` publishes the current review to your shared team feed
-- `--team` pulls recent teammate reviews shared for this repo
 - `--history` shows retained session history
 - `--search <query>` filters retained history to matching sessions
 
 ### `switchman gate ci`
 - runs the repo-level merge gate locally or in CI
 - checks file conflicts, semantic conflicts, stale leases, unclaimed changes, and boundary validation state
+- `--github-comment --pr-from-env` posts or updates the PR comment with the green/amber/red merge-confidence summary
 
 ### `switchman gate install-ci`
 - installs a GitHub Actions workflow with a named Switchman PR check
 - keeps the Switchman summary visible before the workflow fails the check
+- grants `pull-requests: write` so GitHub Actions can post the Switchman PR comment
 
 ### `switchman status`
 - use this when Switchman managed the run and you are not sure what needs attention next
@@ -62,6 +64,7 @@ Useful options:
 
 ### `switchman init`
 - initialise in the current git repo without creating extra workspaces
+- useful when you want full coordination mode; for existing agent worktrees, start with `switchman review --all-worktrees`
 
 ### `switchman task add <title>`
 ### `switchman task list`

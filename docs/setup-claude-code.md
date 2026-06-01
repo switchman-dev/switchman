@@ -37,9 +37,12 @@ Project-local MCP config is still the preferred path because it travels with the
 
 ```bash
 switchman claude refresh
+switchman claude hooks install
 ```
 
-This generates a repo-aware guide in the repo root so your agents know how to use Switchman, which commands to prefer, and which repo conventions to follow. Keep it in the repo root and do not let agents talk to `.switchman/switchman.db` directly.
+This generates a repo-aware guide in the repo root and installs a Claude Code `Stop` hook in `.claude/settings.local.json`. When an agent session ends, Claude Code runs `switchman agent-complete --source claude-code --quiet --confirm-clean 3`, so the merge-confidence scan happens without anyone remembering to type it. The first three clean runs still print a short green confirmation so you know the hook is alive.
+
+Keep `CLAUDE.md` in the repo root and do not let agents talk to `.switchman/switchman.db` directly.
 
 ## 4. Add your tasks
 
@@ -59,3 +62,11 @@ Open a separate Claude Code window in each workspace folder that `switchman setu
 switchman status
 switchman gate ci
 ```
+
+For non-Claude agents or plain terminal sessions, keep the automatic quiet watcher running:
+
+```bash
+switchman watch
+```
+
+It observes worktrees and triggers a Switchman scan once edits have gone quiet.

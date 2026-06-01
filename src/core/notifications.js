@@ -22,21 +22,15 @@ export function readNotificationsConfig() {
     if (!existsSync(path)) {
       return {
         desktop_enabled: false,
-        slack_enabled: false,
-        slack_webhook_url: null,
       };
     }
     return {
       desktop_enabled: false,
-      slack_enabled: false,
-      slack_webhook_url: null,
       ...JSON.parse(readFileSync(path, 'utf8')),
     };
   } catch {
     return {
       desktop_enabled: false,
-      slack_enabled: false,
-      slack_webhook_url: null,
     };
   }
 }
@@ -99,50 +93,16 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml);
   });
 }
 
-async function postSlackNotification(webhookUrl, title, message) {
-  if (!webhookUrl) return { ok: false, channel: 'slack', error: 'missing_webhook' };
-  if (writeTestSink({ channel: 'slack', title, message, webhook: 'configured' })) {
-    return { ok: true, channel: 'slack', simulated: true };
-  }
-
-  try {
-    const response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text: `*${title}*\n${message}`,
-      }),
-    });
-    return {
-      ok: response.ok,
-      channel: 'slack',
-      error: response.ok ? null : `http_${response.status}`,
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      channel: 'slack',
-      error: err?.message || 'network_error',
-    };
-  }
-}
-
 export async function sendSwitchmanNotification({
   title,
   message,
   allowDesktop = true,
-  allowSlack = true,
-  checkLicence = async () => ({ valid: false }),
 } = {}) {
   const config = readNotificationsConfig();
   const attempts = [];
 
   if (allowDesktop && config.desktop_enabled) {
     attempts.push(postDesktopNotification(title, message));
-  }
-
-  if (allowSlack && config.slack_enabled && config.slack_webhook_url) {
-    attempts.push(postSlackNotification(config.slack_webhook_url, title, message));
   }
 
   if (attempts.length === 0) {

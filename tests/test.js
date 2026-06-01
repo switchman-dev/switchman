@@ -3,7 +3,7 @@
  * Tests core DB and git functions without needing a real git repo
  */
 
-import { execFileSync, execSync } from 'child_process';
+import { execFileSync, execSync, spawn } from 'child_process';
 import { mkdirSync, rmSync, existsSync, realpathSync, readFileSync, writeFileSync, statSync, chmodSync, utimesSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -32,10 +32,10 @@ import { getPipelineStatus, runPipeline, startPipeline } from '../src/core/pipel
 import { buildTaskSpec, planPipelineTasks } from '../src/core/planner.js';
 import { DEFAULT_CHANGE_POLICY, DEFAULT_LEASE_POLICY, loadChangePolicy, loadLeasePolicy, writeChangePolicy, writeLeasePolicy } from '../src/core/policy.js';
 import { describeQueueError, resolveQueueSource, runMergeQueue } from '../src/core/queue.js';
-import { getPendingQueueStatus, pullTeamReviewShares, pullTeamState, pushSyncEvent } from '../src/core/sync.js';
+import { getPendingQueueStatus, pullTeamState, pushSyncEvent } from '../src/core/sync.js';
 import { disableTelemetry, enableTelemetry, getTelemetryConfigPath, loadTelemetryConfig, sendTelemetryEvent } from '../src/core/telemetry.js';
-import { loginWithGitHub } from '../src/core/licence.js';
-import { buildSessionHistoryReport, buildSessionSummary, buildTeamReviewShareReport } from '../src/cli/reports.js';
+import { formatCiGatePrComment } from '../src/core/ci.js';
+import { buildSessionHistoryReport, buildSessionSummary } from '../src/cli/reports.js';
 
 const TEST_DIR = join(tmpdir(), `switchman-test-${Date.now()}`);
 const TEST_ZDOTDIR = join(tmpdir(), `switchman-zdotdir-${Date.now()}`);
@@ -126,42 +126,6 @@ async function testAsync(name, fn) {
     console.log(`  ✗ THREW: ${err.message}`);
     failed++;
   }
-}
-
-function writeProTestCredentials(homeDir, email = 'pro@test.com', { userId = 'user-pro-1', teamId = null } = {}) {
-  const switchmanDir = join(homeDir, '.switchman');
-  mkdirSync(switchmanDir, { recursive: true });
-  writeFileSync(join(switchmanDir, 'credentials.json'), JSON.stringify({
-    access_token: 'test-access-token',
-    refresh_token: 'test-refresh-token',
-    email,
-    user_id: userId,
-    team_id: teamId,
-  }, null, 2));
-  writeFileSync(join(switchmanDir, 'licence-cache.json'), JSON.stringify({
-    valid: true,
-    plan: 'pro',
-    email,
-    cached_at: Date.now(),
-  }, null, 2));
-}
-
-function writeFreeLoggedInCredentials(homeDir, email = 'free@test.com', { userId = 'user-free-1', teamId = null } = {}) {
-  const switchmanDir = join(homeDir, '.switchman');
-  mkdirSync(switchmanDir, { recursive: true });
-  writeFileSync(join(switchmanDir, 'credentials.json'), JSON.stringify({
-    access_token: 'test-access-token',
-    refresh_token: 'test-refresh-token',
-    email,
-    user_id: userId,
-    team_id: teamId,
-  }, null, 2));
-  writeFileSync(join(switchmanDir, 'licence-cache.json'), JSON.stringify({
-    valid: false,
-    plan: 'free',
-    email,
-    cached_at: Date.now(),
-  }, null, 2));
 }
 
 function setupPipelineExecRepo(prefix, branchName) {
@@ -507,9 +471,9 @@ test('Start self-heals missing local MCP wiring and reports it', () => {
   rmSync(homeDir, { recursive: true, force: true });
 });
 
-test('Start supports more than three agents when an account is configured too', () => {
-  const repoDir = join(tmpdir(), `sw-start-pro-${Date.now()}`);
-  const homeDir = join(tmpdir(), `sw-start-pro-home-${Date.now()}`);
+test('Start supports more than three agents without any account setup', () => {
+  const repoDir = join(tmpdir(), `sw-start-open-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-start-open-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   mkdirSync(homeDir, { recursive: true });
   execSync('git init -b main', { cwd: repoDir });
@@ -518,7 +482,6 @@ test('Start supports more than three agents when an account is configured too', 
   writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init repo context"', { cwd: repoDir });
-  writeProTestCredentials(homeDir);
 
   const output = execFileSync(process.execPath, [
     join(process.cwd(), 'src/cli/index.js'),
@@ -537,7 +500,7 @@ test('Start supports more than three agents when an account is configured too', 
 
   const db = openDb(repoDir);
   const worktrees = listWorktrees(db).filter((worktree) => worktree.name !== 'main');
-  assert(worktrees.length === 4, 'Start can create more than three agent workspaces when an account is configured');
+  assert(worktrees.length === 4, 'Start can create more than three agent workspaces without an account');
   db.close();
 
   cleanupSiblingAgentWorktrees(repoDir, 4);
@@ -545,258 +508,25 @@ test('Start supports more than three agents when an account is configured too', 
   rmSync(homeDir, { recursive: true, force: true });
 });
 
-await testAsync('Free logged-in users can use shared coordination for one real project', async () => {
-  const sharedState = {
-    tasks: [],
-    claims: new Map(),
-    leases: [],
-  };
-  const repoADir = join(tmpdir(), `sw-shared-a-${Date.now()}`);
-  const repoBDir = join(tmpdir(), `sw-shared-b-${Date.now()}`);
-  const homeADir = join(tmpdir(), `sw-shared-home-a-${Date.now()}`);
-  const homeBDir = join(tmpdir(), `sw-shared-home-b-${Date.now()}`);
-  const originalFetch = global.fetch;
-  const originalHome = process.env.HOME;
-  process.env.SWITCHMAN_SHARED_QUEUE_URL = 'https://shared.test/functions/v1/shared-coordination';
+await testAsync('Hosted shared coordination is disabled in the open source CLI', async () => {
+  const mode = await getSharedCoordinationMode(process.cwd());
+  const created = await createSharedTaskRemote(process.cwd(), { id: 'shared-task-1', title: 'Shared auth task' });
+  const leased = await acquireSharedNextLease(process.cwd(), { worktree: 'agent2', agent: 'codex' });
+  const claimed = await claimSharedFilesRemote(process.cwd(), {
+    taskId: 'shared-task-1',
+    worktree: 'agent2',
+    files: ['src/auth.js'],
+    agent: 'codex',
+  });
+  const tasks = await listSharedTasks(process.cwd(), {});
+  const leases = await listSharedLeases(process.cwd(), { status: 'active' });
+  const status = await getSharedStatusSnapshot(process.cwd());
+  const retried = await retrySharedTask(process.cwd(), { taskId: 'shared-task-1', reason: 'manual retry' });
 
-  try {
-    global.fetch = async (_url, options = {}) => {
-      const payload = JSON.parse(options.body || '{}');
-      const operation = payload.operation;
-      const opPayload = payload.payload || {};
-
-      if (operation === 'create_task') {
-        const task = {
-          id: opPayload.task.id,
-          title: opPayload.task.title,
-          description: opPayload.task.description || null,
-          priority: opPayload.task.priority || 5,
-          status: 'pending',
-          worktree: null,
-        };
-        sharedState.tasks.push(task);
-        sharedState.tasks.sort((a, b) => b.priority - a.priority || a.id.localeCompare(b.id));
-        return new Response(JSON.stringify({ task }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      if (operation === 'acquire_next') {
-        const task = sharedState.tasks.find((entry) => entry.status === 'pending');
-        if (!task) {
-          return new Response(JSON.stringify({ task: null, lease: null, exhausted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        }
-        task.status = 'in_progress';
-        task.worktree = opPayload.worktree;
-        const lease = {
-          id: `lease-${task.id}`,
-          task_id: task.id,
-          worktree: opPayload.worktree,
-          status: 'active',
-        };
-        sharedState.leases.push(lease);
-        return new Response(JSON.stringify({ task, lease, exhausted: false }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      if (operation === 'claim_files') {
-        const conflicts = [];
-        for (const file of opPayload.files || []) {
-          const owner = sharedState.claims.get(file);
-          if (owner && owner.task_id !== opPayload.task_id) {
-            conflicts.push({ file, claimedBy: owner });
-          }
-        }
-        if (conflicts.length > 0 && !opPayload.force) {
-          return new Response(JSON.stringify({ reason: 'claim_conflict', conflicts }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-        }
-        for (const file of opPayload.files || []) {
-          sharedState.claims.set(file, {
-            task_id: opPayload.task_id,
-            worktree: opPayload.worktree,
-            task_title: sharedState.tasks.find((entry) => entry.id === opPayload.task_id)?.title || opPayload.task_id,
-          });
-        }
-        return new Response(JSON.stringify({
-          lease: {
-            id: `lease-${opPayload.task_id}`,
-            task_id: opPayload.task_id,
-            worktree: opPayload.worktree,
-          },
-          conflicts: [],
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      if (operation === 'list_tasks') {
-        const tasks = sharedState.tasks
-          .filter((task) => !opPayload.status || task.status === opPayload.status)
-          .map((task) => ({ ...task }));
-        return new Response(JSON.stringify({ tasks }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      if (operation === 'list_leases') {
-        const leases = sharedState.leases
-          .filter((lease) => !opPayload.status || lease.status === opPayload.status)
-          .map((lease) => ({
-            ...lease,
-            task_title: sharedState.tasks.find((task) => task.id === lease.task_id)?.title || lease.task_id,
-          }));
-        return new Response(JSON.stringify({ leases }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      if (operation === 'retry_task') {
-        const task = sharedState.tasks.find((entry) => entry.id === opPayload.task_id);
-        if (!task || !['failed', 'done', 'in_progress'].includes(task.status)) {
-          return new Response(JSON.stringify({ reason: 'not_retryable' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
-        }
-        task.status = 'pending';
-        task.worktree = null;
-        sharedState.leases = sharedState.leases.filter((lease) => lease.task_id !== task.id);
-        for (const [file, owner] of sharedState.claims.entries()) {
-          if (owner.task_id === task.id) sharedState.claims.delete(file);
-        }
-        return new Response(JSON.stringify({ task: { ...task } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      if (operation === 'status_snapshot') {
-        return new Response(JSON.stringify({
-          tasks: sharedState.tasks.map((task) => ({ ...task })),
-          active_leases: sharedState.leases.filter((lease) => lease.status === 'active').map((lease) => ({
-            ...lease,
-            task_title: sharedState.tasks.find((task) => task.id === lease.task_id)?.title || lease.task_id,
-          })),
-          stale_leases: [],
-          claims: [...sharedState.claims.entries()].map(([file_path, owner]) => ({
-            file_path,
-            task_id: owner.task_id,
-            task_title: owner.task_title,
-            worktree: owner.worktree,
-          })),
-          summary: {
-            mode: 'shared',
-            team_id: payload.team_id,
-            repo_key: payload.repo_key,
-          },
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      return new Response(JSON.stringify({ reason: 'unknown_operation' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-    };
-
-    for (const repoDir of [repoADir, repoBDir]) {
-      mkdirSync(repoDir, { recursive: true });
-      execSync('git init -b main', { cwd: repoDir });
-      execSync('git config user.email "test@test.com"', { cwd: repoDir });
-      execSync('git config user.name "Test"', { cwd: repoDir });
-      execSync('git remote add origin https://github.com/acme/shared-repo.git', { cwd: repoDir });
-      writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
-      execSync('git add README.md', { cwd: repoDir });
-      execSync('git commit -m "init repo context"', { cwd: repoDir });
-    }
-
-    mkdirSync(homeADir, { recursive: true });
-    mkdirSync(homeBDir, { recursive: true });
-    writeFreeLoggedInCredentials(homeADir, 'a@test.com', { userId: 'user-a' });
-    writeFreeLoggedInCredentials(homeBDir, 'b@test.com', { userId: 'user-b' });
-
-    process.env.HOME = homeADir;
-    await createSharedTaskRemote(repoADir, {
-      id: 'shared-task-1',
-      title: 'Shared auth task',
-      priority: 9,
-    });
-
-    process.env.HOME = homeBDir;
-    const nextResult = await acquireSharedNextLease(repoBDir, {
-      worktree: 'agent2',
-      agent: 'codex',
-    });
-    assert(nextResult.task.id === 'shared-task-1', 'Free shared coordination lets a second repo lease work created elsewhere on the same project');
-
-    const firstClaim = await claimSharedFilesRemote(repoBDir, {
-      taskId: 'shared-task-1',
-      worktree: 'agent2',
-      files: ['src/auth.js'],
-      agent: 'codex',
-    });
-    assert(firstClaim.ok, 'Shared claims can be recorded against the leased task');
-
-    process.env.HOME = homeADir;
-    const secondClaim = await claimSharedFilesRemote(repoADir, {
-      taskId: 'other-task',
-      worktree: 'agent1',
-      files: ['src/auth.js'],
-      agent: 'codex',
-    });
-    const sharedTasks = await listSharedTasks(repoADir, {});
-    const sharedLeases = await listSharedLeases(repoBDir, { status: 'active' });
-    const sharedStatus = await getSharedStatusSnapshot(repoADir);
-
-    assert(secondClaim.ok === false, 'Shared claims reject cross-repo conflicts on the same free shared project');
-    assert(secondClaim.conflicts[0].claimedBy.worktree === 'agent2', 'Shared claim conflicts name the owning remote worktree');
-    assert(sharedTasks.tasks.length === 1 && sharedTasks.tasks[0].status === 'in_progress', 'Shared task listing reads the team task state from the shared queue');
-    assert(sharedLeases.leases.length === 1 && sharedLeases.leases[0].worktree === 'agent2', 'Shared lease listing reads the team lease state from the shared queue');
-    assert(sharedStatus.summary.mode === 'shared', 'Shared status snapshot reports the shared queue mode');
-    assert(sharedStatus.claims.length === 1 && sharedStatus.claims[0].file_path === 'src/auth.js', 'Shared status snapshot includes active team file claims');
-
-    sharedState.tasks[0].status = 'failed';
-    const retried = await retrySharedTask(repoADir, { taskId: 'shared-task-1', reason: 'manual retry' });
-    const afterRetry = await getSharedStatusSnapshot(repoADir);
-    assert(retried.task?.status === 'pending', 'Shared retry resets a shared task back to pending');
-    assert(afterRetry.active_leases.length === 0, 'Shared retry clears active team leases');
-    assert(afterRetry.claims.length === 0, 'Shared retry clears active shared claims');
-  } finally {
-    global.fetch = originalFetch;
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    delete process.env.SWITCHMAN_SHARED_QUEUE_URL;
-    rmSync(repoADir, { recursive: true, force: true });
-    rmSync(repoBDir, { recursive: true, force: true });
-    rmSync(homeADir, { recursive: true, force: true });
-    rmSync(homeBDir, { recursive: true, force: true });
-  }
-});
-
-await testAsync('Free shared coordination stays limited to one project key per logged-in user', async () => {
-  const repoADir = join(tmpdir(), `sw-free-cloud-limit-a-${Date.now()}`);
-  const repoBDir = join(tmpdir(), `sw-free-cloud-limit-b-${Date.now()}`);
-  const homeDir = join(tmpdir(), `sw-free-cloud-limit-home-${Date.now()}`);
-  const originalHome = process.env.HOME;
-
-  try {
-    for (const [repoDir, remoteUrl] of [
-      [repoADir, 'https://github.com/acme/project-a.git'],
-      [repoBDir, 'https://github.com/acme/project-b.git'],
-    ]) {
-      mkdirSync(repoDir, { recursive: true });
-      execSync('git init -b main', { cwd: repoDir });
-      execSync('git config user.email "test@test.com"', { cwd: repoDir });
-      execSync('git config user.name "Test"', { cwd: repoDir });
-      execSync(`git remote add origin ${remoteUrl}`, { cwd: repoDir });
-      writeFileSync(join(repoDir, 'README.md'), '# Demo repo\n');
-      execSync('git add README.md', { cwd: repoDir });
-      execSync('git commit -m "init repo context"', { cwd: repoDir });
-    }
-
-    mkdirSync(homeDir, { recursive: true });
-    writeFreeLoggedInCredentials(homeDir, 'free@test.com', { userId: 'user-free-limit' });
-    process.env.HOME = homeDir;
-
-    const firstMode = await getSharedCoordinationMode(repoADir);
-    const secondMode = await getSharedCoordinationMode(repoBDir);
-
-    assert(firstMode.enabled === true, 'Free shared coordination allows one logged-in project');
-    assert(secondMode.enabled === false, 'Free shared coordination blocks a second distinct project');
-    assert(secondMode.reason === 'free_project_limit', 'Second free shared project reports the project limit reason');
-  } finally {
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    rmSync(repoADir, { recursive: true, force: true });
-    rmSync(repoBDir, { recursive: true, force: true });
-    rmSync(homeDir, { recursive: true, force: true });
+  assert(mode.enabled === false, 'Hosted shared coordination mode is disabled');
+  for (const result of [created, leased, claimed, tasks, leases, status, retried]) {
+    assert(result.ok === false, 'Hosted shared coordination operation reports unavailable');
+    assert(result.reason === 'hosted_accounts_removed', 'Hosted shared coordination gives the removal reason');
   }
 });
 
@@ -902,8 +632,6 @@ test('Plan command can read a GitHub issue through gh and create planned tasks f
   registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
   planDb.close();
 
-  writeProTestCredentials(homeDir);
-
   const ghCapturePath = join(repoDir, 'gh-issue-invocation.json');
   const fakeGhPath = join(repoDir, 'fake-gh-issue');
   writeFileSync(fakeGhPath, `#!/bin/sh
@@ -979,8 +707,6 @@ test('Plan issue mode can post a summary comment back to the GitHub issue after 
   registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
   planDb.close();
 
-  writeProTestCredentials(homeDir);
-
   const ghCapturePath = join(repoDir, 'gh-issue-comment-invocation.json');
   const fakeGhPath = join(repoDir, 'fake-gh-issue-comment');
   writeFileSync(fakeGhPath, `#!/bin/sh
@@ -1040,8 +766,6 @@ test('Plan apply can post a summary comment to a GitHub pull request', () => {
   registerWorktree(planDb, { name: 'agent1', path: join(repoDir, '.agent1'), branch: 'switchman/agent1' });
   registerWorktree(planDb, { name: 'agent2', path: join(repoDir, '.agent2'), branch: 'switchman/agent2' });
   planDb.close();
-
-  writeProTestCredentials(homeDir);
 
   const ghCapturePath = join(repoDir, 'gh-pr-comment-invocation.json');
   const fakeGhPath = join(repoDir, 'fake-gh-pr-comment');
@@ -4141,7 +3865,7 @@ test('Quickcheck gives one clear first-run path in a fresh repo', () => {
 
   assert(output.includes('Quickcheck:'), 'Quickcheck prints the onboarding summary heading');
   assert(output.includes('Account'), 'Quickcheck reports that hosted accounts are optional');
-  assert(output.includes('Not required for local start'), 'Quickcheck keeps local-first account messaging calm');
+  assert(output.includes('Not required'), 'Quickcheck keeps local-first account messaging calm');
   assert(output.includes('Run this next:'), 'Quickcheck ends with one exact next command');
   assert(output.includes('switchman start "Add authentication"'), 'Quickcheck points first-time users at switchman start');
   assert(output.includes('switchman status --watch'), 'Quickcheck includes the live dashboard follow-up');
@@ -4192,12 +3916,11 @@ test('Fix 1c: CLI task done succeeds while a transient SQLite write lock is pres
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('CLI task done records Pro usage metadata from the environment when provided', () => {
+test('CLI task done records usage metadata from the environment when provided', () => {
   const repoDir = join(tmpdir(), `sw-task-done-usage-${Date.now()}`);
   const homeDir = join(tmpdir(), `sw-task-done-usage-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   mkdirSync(homeDir, { recursive: true });
-  writeProTestCredentials(homeDir);
   execSync('git init', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
@@ -4725,69 +4448,16 @@ test('Telemetry send reports not-configured and disabled states clearly', async 
   rmSync(fakeHome, { recursive: true, force: true });
 });
 
-await testAsync('Shared sync buffers retryable cloud failures locally and flushes them on the next successful contact', async () => {
-  const fakeHome = join(tmpdir(), `sw-sync-buffer-home-${Date.now()}`);
-  mkdirSync(fakeHome, { recursive: true });
-  writeProTestCredentials(fakeHome, 'sync@test.com', { userId: 'sync-user-1' });
+await testAsync('Hosted shared sync is disabled and does not buffer cloud events', async () => {
+  const queued = await pushSyncEvent('task_added', { task_id: 'task-sync-1' }, { worktree: 'agent1' });
+  const teamState = await pullTeamState();
+  const status = getPendingQueueStatus();
 
-  const originalHome = process.env.HOME;
-  const originalFetch = global.fetch;
-  let allowSyncPost = false;
-  let syncPostAttempts = 0;
-
-  try {
-    process.env.HOME = fakeHome;
-    global.fetch = async (url, options = {}) => {
-      const requestUrl = String(url);
-      const method = String(options.method || 'GET').toUpperCase();
-
-      if (requestUrl.includes('/rest/v1/team_members')) {
-        return new Response(JSON.stringify([{ team_id: 'team-sync-1' }]), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      if (requestUrl.includes('/rest/v1/sync_state') && method === 'POST') {
-        syncPostAttempts += 1;
-        if (!allowSyncPost) {
-          return new Response(JSON.stringify({ reason: 'upstream_unavailable' }), {
-            status: 503,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        return new Response('', { status: 201 });
-      }
-
-      if (requestUrl.includes('/rest/v1/sync_state') && method === 'GET') {
-        return new Response(JSON.stringify([]), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      return new Response(JSON.stringify({ reason: 'unexpected_request' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    };
-
-    const queued = await pushSyncEvent('task_added', { task_id: 'task-sync-1' }, { worktree: 'agent1' });
-    assert(queued.ok === false, 'Shared sync reports a failed cloud push when the upstream is unavailable');
-    assert(queued.queued === true, 'Shared sync queues retryable failures locally');
-    assert(getPendingQueueStatus().pending === 1, 'Retryable shared sync failures are buffered on disk');
-
-    allowSyncPost = true;
-    await pullTeamState();
-
-    const status = getPendingQueueStatus();
-    assert(status.pending === 0, 'Buffered shared sync events flush after the next successful cloud contact');
-    assert(syncPostAttempts >= 2, 'Shared sync retries the buffered event on the next contact');
-  } finally {
-    global.fetch = originalFetch;
-    process.env.HOME = originalHome;
-    rmSync(fakeHome, { recursive: true, force: true });
-  }
+  assert(queued.ok === false, 'Hosted shared sync reports unavailable');
+  assert(queued.queued === false, 'Hosted shared sync does not buffer cloud events');
+  assert(queued.reason === 'hosted_accounts_removed', 'Hosted shared sync gives the removal reason');
+  assert(teamState.length === 0, 'Hosted shared sync pulls no team state');
+  assert(status.pending === 0, 'Hosted shared sync has no pending buffer');
 });
 
 test('Stale lease reaping releases claims and re-queues the task', () => {
@@ -6121,8 +5791,106 @@ test('Fix 22b: gate ci writes GitHub Actions summary and outputs', () => {
   const stepSummary = readFileSync(stepSummaryPath, 'utf8');
   const output = readFileSync(outputPath, 'utf8');
   assert(stepSummary.includes('# Switchman CI Gate'), 'gate ci writes a GitHub step summary markdown file');
+  assert(stepSummary.includes('Merge confidence: green'), 'gate ci summary includes merge confidence');
   assert(output.includes('switchman_ok=true'), 'gate ci writes GitHub Actions outputs');
+  assert(output.includes('switchman_merge_confidence=green'), 'gate ci writes merge-confidence output');
   rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Gate CI can post a merge-confidence PR comment from GitHub Actions env', () => {
+  const repoDir = join(tmpdir(), `sw-ci-pr-comment-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
+
+  initDb(repoDir).close();
+
+  const ghDir = join(tmpdir(), `sw-ci-pr-comment-gh-${Date.now()}`);
+  mkdirSync(ghDir, { recursive: true });
+  const ghLogPath = join(ghDir, 'gh-log.txt');
+  const ghBodyPath = join(ghDir, 'gh-body.md');
+  const ghScriptPath = join(ghDir, 'gh-stub.sh');
+  writeFileSync(ghScriptPath, `#!/bin/sh
+echo "$@" >> "${ghLogPath}"
+body=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--body-file" ]; then
+    body="$arg"
+  fi
+  prev="$arg"
+done
+if [ -n "$body" ]; then
+  cat "$body" > "${ghBodyPath}"
+fi
+`, 'utf8');
+  chmodSync(ghScriptPath, 0o755);
+
+  const eventPath = join(ghDir, 'github-event.json');
+  writeFileSync(eventPath, `${JSON.stringify({ pull_request: { number: 42 } }, null, 2)}\n`);
+
+  const result = JSON.parse(execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'gate',
+    'ci',
+    '--github-comment',
+    '--pr-from-env',
+    '--gh-command',
+    ghScriptPath,
+    '--json',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GITHUB_EVENT_PATH: eventPath,
+    },
+  }));
+
+  const ghLog = readFileSync(ghLogPath, 'utf8');
+  const body = readFileSync(ghBodyPath, 'utf8');
+  assert(result.pr_comment.pr_number === '42', 'gate ci reports the PR comment target');
+  assert(ghLog.includes('pr comment 42'), 'gate ci posts a GitHub PR comment');
+  assert(ghLog.includes('--edit-last') && ghLog.includes('--create-if-none'), 'gate ci updates the existing Switchman PR comment when possible');
+  assert(body.includes('# Switchman Merge Confidence'), 'gate ci PR comment uses the merge-confidence heading');
+  assert(body.includes('**Green**'), 'gate ci PR comment includes the green/amber/red result');
+  assert(body.includes('| Merge confidence | green |'), 'gate ci PR comment includes a visible confidence table');
+  assert(!body.includes('Star us on GitHub'), 'gate ci PR comment skips the star ask on green results');
+
+  rmSync(repoDir, { recursive: true, force: true });
+  rmSync(ghDir, { recursive: true, force: true });
+});
+
+test('Gate CI PR comment shows the star ask only on amber or red catches', () => {
+  const baseResult = {
+    ok: true,
+    summary: 'Repo gate passed with review warnings across 3 worktree(s).',
+    compliance: { non_compliant: 0, stale: 0 },
+    unclaimed_changes: [],
+    file_conflicts: [],
+    ownership_conflicts: [],
+    semantic_conflicts: [],
+    branch_conflicts: [],
+    boundary_validations: [],
+    dependency_invalidations: [],
+    ai_gate_status: 'warn',
+  };
+  const amber = formatCiGatePrComment({ ...baseResult, merge_confidence: 'amber' });
+  const red = formatCiGatePrComment({
+    ...baseResult,
+    ok: false,
+    merge_confidence: 'red',
+    summary: 'Repo gate rejected unmanaged changes.',
+    unclaimed_changes: [{ worktree: 'agent1', files: ['src/auth.js'] }],
+  });
+  const green = formatCiGatePrComment({ ...baseResult, merge_confidence: 'green', ai_gate_status: 'pass' });
+
+  assert(amber.includes('Star us on GitHub'), 'Amber PR comments include the star ask');
+  assert(red.includes('Star us on GitHub'), 'Red PR comments include the star ask');
+  assert(green.includes('**Green**'), 'Green PR comments still render the green result');
+  assert(!green.includes('Star us on GitHub'), 'Green PR comments do not include the star ask');
 });
 
 test('Fix 22c: gate install-ci writes a GitHub Actions workflow', () => {
@@ -6144,8 +5912,9 @@ test('Fix 22c: gate install-ci writes a GitHub Actions workflow', () => {
   const workflowPath = join(repoDir, '.github', 'workflows', 'switchman-gate.yml');
   const workflow = readFileSync(workflowPath, 'utf8');
   assert(existsSync(workflowPath), 'gate install-ci writes the GitHub Actions workflow file');
-  assert(workflow.includes('switchman gate ci --github'), 'Installed workflow runs the Switchman CI gate in GitHub Actions');
+  assert(workflow.includes('switchman gate ci --github --github-comment --pr-from-env'), 'Installed workflow runs the Switchman CI gate and posts the PR comment in GitHub Actions');
   assert(workflow.includes('id: switchman_gate'), 'Installed workflow exposes the gate step outputs for follow-up workflow logic');
+  assert(workflow.includes('pull-requests: write'), 'Installed workflow grants permission to write the PR comment');
   assert(workflow.includes('continue-on-error: true'), 'Installed workflow keeps running long enough to publish a readable result');
   assert(workflow.includes('Enforce Switchman gate'), 'Installed workflow includes an explicit enforcement step for the PR check');
   assert(workflow.includes("if: github.event_name == 'pull_request'"), 'Installed workflow only syncs PR state on pull request events');
@@ -7764,7 +7533,7 @@ test('Status watch renders the compact live terminal dashboard', () => {
   assert(output.includes('Agents'), 'Watch mode includes the live agent panel');
   assert(output.includes('Focus'), 'Watch mode includes the live focus panel');
   assert(output.includes('Queue'), 'Watch mode includes the live queue panel');
-  assert(output.includes('Team + sync'), 'Watch mode includes the team and sync panel');
+  assert(output.includes('Runtime'), 'Watch mode includes the local runtime panel');
   assert(output.includes('Summary:'), 'Watch mode includes a repo-level summary line');
   assert(output.includes('Attention now:'), 'Watch mode includes an at-a-glance focus line');
   assert(output.includes('Run next:'), 'Watch mode includes one exact next command');
@@ -7813,10 +7582,51 @@ test('Advanced Homebrew formula command renders a release-ready formula', () => 
   assert(output.includes('bin.install_symlink libexec/"bin/switchman"'), 'Homebrew formula links the main Switchman binary');
 });
 
-test('README install section includes the Homebrew path', () => {
+test('README install section keeps npm as the supported install path', () => {
   const readme = readFileSync(join(process.cwd(), 'README.md'), 'utf8');
-  assert(readme.includes('brew install switchman-dev/tap/switchman-dev'), 'README includes the Homebrew install command');
+  assert(readme.includes('npm install -g switchman-dev'), 'README includes the npm install command');
+  assert(!readme.includes('brew install switchman-dev/tap/switchman-dev'), 'README does not advertise Homebrew until the tap is verified');
   assert(readme.includes('Requirements: Node.js 22.5+ · Git 2.5+'), 'README install section includes the runtime requirements');
+});
+
+test('Review works zero-config on a fresh repo with git worktrees', () => {
+  const repoDir = join(tmpdir(), `sw-zero-config-review-${Date.now()}`);
+  const agentPath = join(tmpdir(), `sw-zero-config-review-agent-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m "init"', { cwd: repoDir });
+  execSync(`git worktree add -b feature/zero-config "${agentPath}"`, { cwd: repoDir });
+  writeFileSync(join(agentPath, 'README.md'), 'init\nzero config change\n');
+
+  const plainOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'review',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+  const prReadyOutput = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'review',
+    '--pr-ready',
+  ], {
+    cwd: repoDir,
+    encoding: 'utf8',
+  });
+
+  assert(!existsSync(join(repoDir, '.switchman', 'switchman.db')), 'Zero-config review does not create a Switchman database');
+  assert(plainOutput.includes('zero-config mode'), 'Plain review falls back to zero-config git evidence');
+  assert(plainOutput.includes('1 source reviewed'), 'Plain zero-config review detects the git worktree');
+  assert(prReadyOutput.includes('# Switchman Merge Confidence Report'), 'PR-ready zero-config review prints the merge confidence report');
+  assert(prReadyOutput.includes('**Evidence source:** observed from git'), 'PR-ready zero-config review uses git evidence');
+  assert(prReadyOutput.includes('Sources reviewed: 1'), 'PR-ready zero-config review reports the detected worktree');
+
+  execSync(`git worktree remove "${agentPath}" --force`, { cwd: repoDir });
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Review stays readable in the open source flow and shows full analysis', () => {
@@ -8007,7 +7817,6 @@ await testAsync('Searchable session history groups retained sessions and filters
   const homeDir = join(tmpdir(), `sw-session-history-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   mkdirSync(homeDir, { recursive: true });
-  writeProTestCredentials(homeDir);
   const originalHome = process.env.HOME;
   process.env.HOME = homeDir;
   try {
@@ -8063,121 +7872,6 @@ await testAsync('Searchable session history groups retained sessions and filters
     process.env.HOME = originalHome;
     rmSync(repoDir, { recursive: true, force: true });
     rmSync(homeDir, { recursive: true, force: true });
-  }
-});
-
-await testAsync('Team review sharing pulls only shared reviews for this repo and formats them for teammates', async () => {
-  const repoDir = join(tmpdir(), `sw-team-review-${Date.now()}`);
-  const fakeHome = join(tmpdir(), `sw-team-review-home-${Date.now()}`);
-  mkdirSync(repoDir, { recursive: true });
-  mkdirSync(fakeHome, { recursive: true });
-  const originalHome = process.env.HOME;
-  const originalFetch = global.fetch;
-  process.env.HOME = fakeHome;
-  writeProTestCredentials(fakeHome, 'owner@test.com', { userId: 'user-self' });
-
-  try {
-    global.fetch = async (url) => {
-      const requestUrl = String(url);
-      if (requestUrl.includes('/rest/v1/team_members')) {
-        return new Response(JSON.stringify([{ team_id: 'team-review-1' }]), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-      if (requestUrl.includes('/rest/v1/sync_state')) {
-        return new Response(JSON.stringify([
-          {
-            team_id: 'team-review-1',
-            user_id: 'user-other',
-            worktree: 'agent-auth',
-            event_type: 'session_review_shared',
-            created_at: '2026-03-21T10:00:00.000Z',
-            payload: {
-              email: 'lead@test.com',
-              repo_key: repoDir.split('/').pop(),
-              review: {
-                merge_confidence: 'amber',
-                hours: 24,
-                metrics: {
-                  tasks_completed: 2,
-                  retries_scheduled: 1,
-                  rogue_writes_blocked: 1,
-                },
-                narrative: 'Completed 2 tasks and caught one risky overlap before review.',
-              },
-            },
-          },
-          {
-            team_id: 'team-review-1',
-            user_id: 'user-self',
-            worktree: 'agent-self',
-            event_type: 'session_review_shared',
-            created_at: '2026-03-21T11:00:00.000Z',
-            payload: {
-              email: 'owner@test.com',
-              repo_key: repoDir.split('/').pop(),
-              review: {
-                merge_confidence: 'green',
-                hours: 24,
-                metrics: { tasks_completed: 1 },
-                narrative: 'My own review should be filtered by default.',
-              },
-            },
-          },
-          {
-            team_id: 'team-review-1',
-            user_id: 'user-third',
-            worktree: 'agent-other-repo',
-            event_type: 'session_review_shared',
-            created_at: '2026-03-21T09:00:00.000Z',
-            payload: {
-              email: 'other@test.com',
-              repo_key: 'different-repo',
-              review: {
-                merge_confidence: 'red',
-                hours: 24,
-                metrics: { tasks_completed: 3 },
-                narrative: 'Different repo review should be filtered out.',
-              },
-            },
-          },
-          {
-            team_id: 'team-review-1',
-            user_id: 'user-four',
-            worktree: 'agent-noise',
-            event_type: 'task_done',
-            created_at: '2026-03-21T08:00:00.000Z',
-            payload: {
-              email: 'noise@test.com',
-              repo_key: repoDir.split('/').pop(),
-            },
-          },
-        ]), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      }
-
-      return new Response(JSON.stringify({ reason: 'unexpected_request' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    };
-
-    const reviews = await pullTeamReviewShares({ hours: 24, repoRoot: repoDir });
-    const report = buildTeamReviewShareReport(reviews);
-
-    assert(reviews.length === 1, 'Team review sharing filters to teammate reviews for the current repo');
-    assert(report.length === 1, 'Team review share report formats the filtered teammate reviews');
-    assert(report[0].email === 'lead@test.com', 'Team review share report keeps the teammate identity');
-    assert(report[0].merge_confidence === 'amber', 'Team review share report keeps the shared merge confidence');
-    assert(report[0].narrative.includes('Completed 2 tasks'), 'Team review share report keeps the shared narrative');
-  } finally {
-    global.fetch = originalFetch;
-    process.env.HOME = originalHome;
-    rmSync(repoDir, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
   }
 });
 
@@ -8340,10 +8034,9 @@ test('Desktop notifications on free tier fire for finished tasks and blocked cla
   rmSync(sinkPath, { force: true });
 });
 
-test('Slack notifications are available on free tier and can be delivered for failed tasks', () => {
-  const repoDir = join(tmpdir(), `sw-notify-slack-free-${Date.now()}`);
-  const homeDir = join(tmpdir(), `sw-notify-slack-free-home-${Date.now()}`);
-  const sinkPath = join(tmpdir(), `sw-notify-slack-free-sink-${Date.now()}.jsonl`);
+test('Slack notification setup no longer exists in the open source CLI', () => {
+  const repoDir = join(tmpdir(), `sw-notify-slack-removed-${Date.now()}`);
+  const homeDir = join(tmpdir(), `sw-notify-slack-removed-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   mkdirSync(homeDir, { recursive: true });
   execSync('git init', { cwd: repoDir });
@@ -8353,97 +8046,63 @@ test('Slack notifications are available on free tier and can be delivered for fa
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init"', { cwd: repoDir });
 
-  execFileSync(process.execPath, [
-    join(process.cwd(), 'src/cli/index.js'),
-    'notifications',
-    'slack',
-    '--webhook',
-    'https://hooks.slack.test/services/T000/B000/XXX',
-  ], {
-    cwd: repoDir,
-    encoding: 'utf8',
-    env: { ...process.env, HOME: homeDir },
-  });
+  let output = '';
+  let failed = false;
+  try {
+    execFileSync(process.execPath, [
+      join(process.cwd(), 'src/cli/index.js'),
+      'notifications',
+      'slack',
+      '--webhook',
+      'https://hooks.slack.test/services/T000/B000/XXX',
+    ], {
+      cwd: repoDir,
+      encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    failed = true;
+    output = `${err.stdout || ''}${err.stderr || ''}`;
+  }
 
-  const db = initDb(repoDir);
-  registerWorktree(db, { name: 'agent1', path: repoDir, branch: 'main' });
-  const failedTask = createTask(db, { title: 'Handle payments retry', priority: 9 });
-  db.close();
-
-  execFileSync(process.execPath, [
-    join(process.cwd(), 'src/cli/index.js'),
-    'task',
-    'fail',
-    failedTask,
-    'webhook exploded',
-  ], {
-    cwd: repoDir,
-    encoding: 'utf8',
-    env: { ...process.env, HOME: homeDir, SWITCHMAN_NOTIFICATION_TEST_SINK: sinkPath },
-  });
-
-  const notifications = readFileSync(sinkPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-  assert(notifications.some((entry) => entry.channel === 'slack' && entry.title === 'Agent hit a failed task'), 'Free Slack notifications fire when an agent fails a task');
+  assert(failed, 'Slack notification setup is no longer a runnable command');
+  assert(output.includes('unknown command') || output.includes("Invalid command"), 'CLI reports the Slack notification command as unavailable');
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(homeDir, { recursive: true, force: true });
-  rmSync(sinkPath, { force: true });
 });
 
-await testAsync('Login reports a clear manual fallback when the browser cannot be opened', async () => {
-  const requests = [];
-  const result = await loginWithGitHub({
-    fetchImpl: async (url, options = {}) => {
-      requests.push({ url, method: options.method || 'GET' });
-      return {
-        ok: true,
-        async json() { return []; },
-      };
-    },
-    openBrowser: async () => {
-      throw new Error('open failed');
-    },
-    sleep: async () => {},
-    maxWaitMs: 10,
-    pollIntervalMs: 1,
-  });
+test('Login and upgrade commands no longer exist in the open source CLI', () => {
+  const repoDir = join(tmpdir(), `sw-login-removed-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git commit --allow-empty -m "init"', { cwd: repoDir });
 
-  assert(result.success === false, 'Login fails cleanly when the browser cannot be opened');
-  assert(result.reason === 'browser_open_failed', 'Login classifies browser launch failures explicitly');
-  assert(result.error.includes('could not open your browser automatically'), 'Login explains the browser-open problem plainly');
-  assert(result.activate_url?.includes('switchman.dev/activate?code='), 'Login returns the manual activate URL');
-  assert(result.code && /^[A-Z]+-\d{4}$/.test(result.code), 'Login returns the short manual authorization code');
-  assert(requests.some((entry) => entry.method === 'POST' && entry.url.includes('/rest/v1/cli_auth_codes')), 'Login still creates the auth session before reporting the browser problem');
-});
+  for (const command of ['login', 'logout', 'upgrade']) {
+    let output = '';
+    let failed = false;
+    try {
+      execFileSync(process.execPath, [
+        join(process.cwd(), 'src/cli/index.js'),
+        command,
+      ], {
+        cwd: repoDir,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      failed = true;
+      output = `${err.stdout || ''}${err.stderr || ''}`;
+    }
 
-await testAsync('Login times out with the exact manual recovery information still visible', async () => {
-  let pollCount = 0;
-  const result = await loginWithGitHub({
-    fetchImpl: async (url, options = {}) => {
-      if ((options.method || 'GET') === 'POST') {
-        return {
-          ok: true,
-          async json() { return {}; },
-        };
-      }
-      pollCount += 1;
-      return {
-        ok: true,
-        async json() { return [{ status: 'pending' }]; },
-      };
-    },
-    openBrowser: async () => {},
-    sleep: async () => {},
-    maxWaitMs: 1,
-    pollIntervalMs: 0,
-  });
+    assert(failed, `${command} is no longer a runnable command`);
+    assert(output.includes('unknown command') || output.includes("Invalid command"), `${command} is reported as unavailable`);
+  }
 
-  assert(result.success === false, 'Login fails cleanly after the authorization timeout');
-  assert(result.reason === 'timeout', 'Login classifies authorization timeouts explicitly');
-  assert(result.error.includes('Timed out waiting for GitHub authorization'), 'Login explains the timeout plainly');
-  assert(result.activate_url?.includes('switchman.dev/activate?code='), 'Login keeps the activate URL on timeout');
-  assert(result.code && /^[A-Z]+-\d{4}$/.test(result.code), 'Login keeps the sign-in code on timeout');
-  assert(pollCount >= 1, 'Login polls the pending auth session before timing out');
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Claude refresh writes a repo-aware CLAUDE.md from local repo signals', () => {
@@ -8577,9 +8236,9 @@ test('Status on a fresh setup gives first-run guidance instead of generic health
   rmSync(repoDir, { recursive: true, force: true });
 });
 
-test('Status JSON surfaces buffered shared sync state when cloud events are pending', () => {
-  const repoDir = join(tmpdir(), `sw-status-sync-buffer-${Date.now()}`);
-  const fakeHome = join(tmpdir(), `sw-status-sync-buffer-home-${Date.now()}`);
+test('Status JSON keeps shared sync state empty when hosted accounts are removed', () => {
+  const repoDir = join(tmpdir(), `sw-status-sync-disabled-${Date.now()}`);
+  const fakeHome = join(tmpdir(), `sw-status-sync-disabled-home-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
   mkdirSync(join(fakeHome, '.switchman'), { recursive: true });
   execSync('git init', { cwd: repoDir });
@@ -8588,18 +8247,6 @@ test('Status JSON surfaces buffered shared sync state when cloud events are pend
   writeFileSync(join(repoDir, 'README.md'), 'init\n');
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init"', { cwd: repoDir });
-  writeFileSync(join(fakeHome, '.switchman', 'sync-queue.json'), JSON.stringify([{
-    team_id: 'team-1',
-    user_id: 'user-1',
-    worktree: 'agent1',
-    event_type: 'task_added',
-    payload: { task_id: 'task-1' },
-    queued_at: new Date().toISOString(),
-    attempts: 2,
-    last_error: 'timeout',
-    next_retry_at: new Date(Date.now() + 60 * 1000).toISOString(),
-  }], null, 2));
-
   const db = initDb(repoDir);
   registerWorktree(db, { name: 'main', path: repoDir, branch: 'main' });
   db.close();
@@ -8614,79 +8261,28 @@ test('Status JSON surfaces buffered shared sync state when cloud events are pend
     env: { ...process.env, HOME: fakeHome },
   }));
 
-  assert(jsonOutput.sync_state.pending === 1, 'Status JSON includes the buffered shared sync count');
-  assert(jsonOutput.team_sync.pending_buffer.pending === 1, 'Status JSON carries the buffered shared sync state in the team panel');
-  assert(jsonOutput.sync_state.last_error === 'timeout', 'Status JSON includes the last buffered shared sync error');
+  assert(jsonOutput.sync_state.pending === 0, 'Status JSON reports no buffered shared sync events');
+  assert(jsonOutput.team_sync.pending_buffer.pending === 0, 'Team panel carries the empty shared sync state');
+  assert(jsonOutput.sync_state.last_error === null, 'Status JSON reports no shared sync error');
 
   rmSync(repoDir, { recursive: true, force: true });
   rmSync(fakeHome, { recursive: true, force: true });
 });
 
-await testAsync('Shared coordination can recover abandoned team work through the shared queue', async () => {
-  const repoDir = join(tmpdir(), `sw-shared-recover-${Date.now()}`);
-  const fakeHome = join(tmpdir(), `sw-shared-recover-home-${Date.now()}`);
+await testAsync('Hosted shared coordination recovery is unavailable after account removal', async () => {
+  const repoDir = join(tmpdir(), `sw-shared-recover-disabled-${Date.now()}`);
   mkdirSync(repoDir, { recursive: true });
-  mkdirSync(fakeHome, { recursive: true });
   execSync('git init', { cwd: repoDir });
   execSync('git config user.email "test@test.com"', { cwd: repoDir });
   execSync('git config user.name "Test"', { cwd: repoDir });
   writeFileSync(join(repoDir, 'README.md'), 'init\n');
   execSync('git add README.md', { cwd: repoDir });
   execSync('git commit -m "init"', { cwd: repoDir });
-  writeProTestCredentials(fakeHome, 'recover@test.com', { userId: 'recover-user', teamId: 'team-recover' });
+  const result = await recoverSharedAbandonedWork(repoDir, { staleAfterMinutes: 20 });
+  assert(result.ok === false, 'Hosted shared recover is no longer available');
+  assert(result.reason === 'hosted_accounts_removed', 'Hosted shared recover gives the removal reason');
 
-  const originalHome = process.env.HOME;
-  const originalFetch = global.fetch;
-  process.env.SWITCHMAN_SHARED_QUEUE_URL = 'https://shared.test/functions/v1/shared-coordination';
-
-  try {
-    process.env.HOME = fakeHome;
-    global.fetch = async (_url, options = {}) => {
-      const payload = JSON.parse(options.body || '{}');
-      if (payload.operation === 'recover_abandoned') {
-        return new Response(JSON.stringify({
-          report: {
-            stale_after_minutes: payload.payload.stale_after_minutes,
-            requeue_task_on_reap: true,
-            stale_leases: [{
-              kind: 'stale_lease',
-              task_id: 'shared-task-1',
-              task_title: 'Recover auth work',
-              worktree: 'agent2',
-              changed_files: ['src/auth.js'],
-              claimed_files: ['src/auth.js'],
-              recovered_to: 'pending',
-            }],
-            stranded_tasks: [],
-            repair: { repaired: false, actions: [], warnings: [], notes: [], summary: { auto_fixed: [], manual_review: [], skipped: [], counts: { auto_fixed: 0, manual_review: 0, skipped: 0 } } },
-            recovered: {
-              stale_leases: 1,
-              stranded_tasks: 0,
-              repo_actions: 0,
-            },
-            next_steps: ['switchman status', 'switchman task list --status pending'],
-          },
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-
-      return new Response(JSON.stringify({ reason: 'unknown_operation' }), {
-        status: 400,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    };
-
-    const result = await recoverSharedAbandonedWork(repoDir, { staleAfterMinutes: 20 });
-    assert(result.ok === true, 'Shared recover can request abandoned-work recovery from the shared queue');
-    assert(result.report.recovered.stale_leases === 1, 'Shared recover reports recovered stale leases from team state');
-    assert(result.report.stale_leases[0].claimed_files.includes('src/auth.js'), 'Shared recover carries claimed files from the abandoned shared work');
-  } finally {
-    global.fetch = originalFetch;
-    if (originalHome == null) delete process.env.HOME;
-    else process.env.HOME = originalHome;
-    delete process.env.SWITCHMAN_SHARED_QUEUE_URL;
-    rmSync(repoDir, { recursive: true, force: true });
-    rmSync(fakeHome, { recursive: true, force: true });
-  }
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
 test('Recover command resets stale leases and stranded tasks while summarizing abandoned changes', () => {
@@ -13086,6 +12682,149 @@ test('Fix 53b: audit verification detects tampering and CLI exits non-zero', () 
     assert(output.includes('entry_hash_mismatch'), 'CLI audit verify surfaces the tamper reason code');
   }
   assert(cliFailed, 'CLI audit verify exits non-zero when the audit trail has been tampered with');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Claude hook installer writes an automatic Stop review hook idempotently', () => {
+  const repoDir = join(tmpdir(), `switchman-claude-hook-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  initDb(repoDir).close();
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const first = JSON.parse(execFileSync(process.execPath, [
+    cliPath,
+    'claude',
+    'hooks',
+    'install',
+    '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const second = JSON.parse(execFileSync(process.execPath, [
+    cliPath,
+    'claude',
+    'hooks',
+    'install',
+    '--json',
+  ], { cwd: repoDir, encoding: 'utf8' }));
+  const settings = JSON.parse(readFileSync(join(repoDir, '.claude', 'settings.local.json'), 'utf8'));
+
+  assert(first.changed === true, 'Claude hook install reports the initial write');
+  assert(second.changed === false, 'Claude hook install is idempotent');
+  assert(settings.hooks.Stop.length === 1, 'Claude Stop hook is not duplicated');
+  assert(settings.hooks.Stop[0].hooks[0].command.includes('switchman agent-complete'), 'Claude Stop hook runs the Switchman completion review');
+  assert(settings.hooks.Stop[0].hooks[0].command.includes('--confirm-clean 3'), 'Claude Stop hook confirms the first clean runs');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Agent completion command runs a review scan and reports safety JSON', () => {
+  const repoDir = join(tmpdir(), `switchman-agent-complete-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m init', { cwd: repoDir });
+  const reviewDb = initDb(repoDir);
+  registerWorktree(reviewDb, { name: 'main', path: repoDir, branch: 'main' });
+  reviewDb.close();
+
+  const output = execFileSync(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'agent-complete',
+    '--source',
+    'test-agent',
+    '--json',
+  ], { cwd: repoDir, encoding: 'utf8' });
+  const payload = JSON.parse(output);
+
+  assert(payload.event === 'agent_complete', 'Agent completion command reports the completion event');
+  assert(payload.source === 'test-agent', 'Agent completion command preserves the source');
+  assert(payload.safe_to_proceed === true, 'Agent completion command marks a clean repo safe');
+  assert(payload.scan.summary.includes('Less than 2 worktrees'), 'Agent completion command includes the scan summary');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+test('Agent completion quiet mode confirms the first clean runs when requested', () => {
+  const repoDir = join(tmpdir(), `switchman-agent-complete-confirm-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m init', { cwd: repoDir });
+  const reviewDb = initDb(repoDir);
+  registerWorktree(reviewDb, { name: 'main', path: repoDir, branch: 'main' });
+  reviewDb.close();
+
+  const cliPath = join(process.cwd(), 'src/cli/index.js');
+  const outputs = [];
+  for (let i = 0; i < 4; i += 1) {
+    outputs.push(execFileSync(process.execPath, [
+      cliPath,
+      'agent-complete',
+      '--source',
+      'test-agent',
+      '--quiet',
+      '--confirm-clean',
+      '3',
+    ], { cwd: repoDir, encoding: 'utf8' }));
+  }
+
+  assert(outputs[0].includes('Switchman checked — green (1/3)'), 'First clean quiet run confirms the hook is alive');
+  assert(outputs[1].includes('Switchman checked — green (2/3)'), 'Second clean quiet run confirms the hook is alive');
+  assert(outputs[2].includes('Switchman checked — green (3/3)'), 'Third clean quiet run confirms the hook is alive');
+  assert(outputs[3].trim() === '', 'Fourth clean quiet run returns to silent mode');
+
+  rmSync(repoDir, { recursive: true, force: true });
+});
+
+await testAsync('Watch mode triggers a quiet scan after live worktree activity', async () => {
+  const repoDir = join(tmpdir(), `switchman-watch-quiet-${Date.now()}`);
+  mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.email "test@test.com"', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  writeFileSync(join(repoDir, 'README.md'), 'init\n');
+  execSync('git add README.md', { cwd: repoDir });
+  execSync('git commit -m init', { cwd: repoDir });
+  const watchDb = initDb(repoDir);
+  registerWorktree(watchDb, { name: 'main', path: repoDir, branch: 'main' });
+  monitorWorktreesOnce(watchDb, repoDir, [{ name: 'main', path: repoDir, branch: 'main' }]);
+  watchDb.close();
+
+  const child = spawn(process.execPath, [
+    join(process.cwd(), 'src/cli/index.js'),
+    'watch',
+    '--interval-ms',
+    '100',
+    '--quiet-ms',
+    '0',
+    '--max-cycles',
+    '5',
+    '--json',
+  ], { cwd: repoDir });
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  writeFileSync(join(repoDir, 'live-change.txt'), 'agent output\n');
+
+  const code = await new Promise((resolve) => {
+    child.on('exit', resolve);
+  });
+
+  assert(code === 0, `Watch mode exits cleanly${stderr ? ` (${stderr})` : ''}`);
+  assert(stdout.includes('"event": "quiet_scan"'), 'Watch mode emits a quiet scan after activity settles');
 
   rmSync(repoDir, { recursive: true, force: true });
 });

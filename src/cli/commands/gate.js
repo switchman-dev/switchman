@@ -5,10 +5,13 @@ export function registerGateCommands(program, {
   installGateHooks,
   installGitHubActionsWorkflow,
   maybeCaptureTelemetry,
+  postGitHubPrComment,
   resolveGitHubOutputTargets,
+  resolvePrNumberFromEnv,
   runAiMergeGate,
   runCommitGate,
   scanAllWorktrees,
+  formatCiGatePrComment,
   writeGitHubCiStatus,
 }) {
   const gateCmd = program.command('gate').description('Safety checks for edits, merges, and CI');
@@ -85,6 +88,10 @@ Examples:
     .option('--github', 'Write GitHub Actions step summary/output when GITHUB_* env vars are present')
     .option('--github-step-summary <path>', 'Path to write GitHub Actions step summary markdown')
     .option('--github-output <path>', 'Path to write GitHub Actions outputs')
+    .option('--github-comment', 'Post or update the Switchman merge-confidence PR comment')
+    .option('--pr <number>', 'Pull request number for --github-comment')
+    .option('--pr-from-env', 'Read the pull request number from GitHub Actions environment variables')
+    .option('--gh-command <command>', 'Executable to use for GitHub CLI', 'gh')
     .option('--json', 'Output raw JSON')
     .action(async (opts) => {
       const repoRoot = getRepo();
@@ -103,11 +110,17 @@ Examples:
         && aiGate.status !== 'blocked'
         && aiGate.status !== 'uncertain'
         && (aiGate.dependency_invalidations?.filter((item) => item.severity === 'blocked').length || 0) === 0;
+      const mergeConfidence = ok
+        ? (aiGate.status === 'warn' ? 'amber' : 'green')
+        : 'red';
 
       const result = {
         ok,
+        merge_confidence: mergeConfidence,
         summary: ok
-          ? `Repo gate passed for ${report.worktrees.length} worktree(s).`
+          ? (mergeConfidence === 'amber'
+            ? `Repo gate passed with review warnings across ${report.worktrees.length} worktree(s).`
+            : `Repo gate passed for ${report.worktrees.length} worktree(s).`)
           : 'Repo gate rejected unmanaged changes, stale leases, ownership conflicts, stale dependency invalidations, or boundary validation failures.',
         compliance: report.complianceSummary,
         unclaimed_changes: report.unclaimedChanges,
@@ -129,10 +142,34 @@ Examples:
         });
       }
 
+      let prComment = null;
+      if (opts.githubComment) {
+        const prNumber = opts.pr || (opts.prFromEnv ? resolvePrNumberFromEnv() : null);
+        if (!prNumber) {
+          console.error(chalk.yellow('Switchman could not resolve a pull request number for the PR comment.'));
+          console.error(chalk.dim('Pass --pr <number> or --pr-from-env in a pull_request GitHub Actions event.'));
+        } else {
+          try {
+            prComment = postGitHubPrComment({
+              repoRoot,
+              prNumber,
+              ghCommand: opts.ghCommand,
+              markdown: formatCiGatePrComment(result),
+              updateExisting: true,
+            });
+          } catch (err) {
+            console.error(chalk.yellow(`Switchman PR comment failed: ${err.message}`));
+          }
+        }
+      }
+
       if (opts.json) {
-        console.log(JSON.stringify(result, null, 2));
+        console.log(JSON.stringify(prComment ? { ...result, pr_comment: prComment } : result, null, 2));
       } else if (ok) {
         console.log(`${chalk.green('✓')} ${result.summary}`);
+        if (prComment) {
+          console.log(`  ${chalk.dim('pr comment:')} #${prComment.pr_number}`);
+        }
       } else {
         console.log(chalk.red(`✗ ${result.summary}`));
         if (result.unclaimed_changes.length > 0) {
@@ -180,6 +217,9 @@ Examples:
           for (const invalidation of result.dependency_invalidations) {
             console.log(`    ${chalk.yellow(invalidation.affected_task_id)} ${chalk.dim(invalidation.stale_area)}`);
           }
+        }
+        if (prComment) {
+          console.log(`  ${chalk.dim('pr comment:')} #${prComment.pr_number}`);
         }
       }
 

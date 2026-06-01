@@ -8,5 +8,6 @@
 | `switchman_task_done` | Mark task complete and release file claims |
 | `switchman_task_fail` | Mark task failed and release file claims |
 | `switchman_lease_heartbeat` | Check in for long-running work |
+| `switchman_agent_complete` | Fire the end-of-session review scan automatically |
 | `switchman_scan` | Scan all workspaces for conflicts |
 | `switchman_status` | Full system overview |

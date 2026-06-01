@@ -1,5 +1,7 @@
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
+import { tmpdir } from 'os';
+import { spawnSync } from 'child_process';
 
 function summarizeUnclaimedChanges(result) {
   if (!result.unclaimed_changes?.length) return ['- None'];
@@ -17,9 +19,11 @@ function summarizeBranchConflicts(result) {
 }
 
 export function formatCiGateMarkdown(result) {
+  const mergeConfidence = result.merge_confidence || (result.ok ? 'green' : 'red');
   return [
     '# Switchman CI Gate',
     '',
+    `- Merge confidence: ${mergeConfidence}`,
     `- Status: ${result.ok ? 'pass' : 'blocked'}`,
     `- Summary: ${result.summary}`,
     '',
@@ -38,6 +42,120 @@ export function formatCiGateMarkdown(result) {
     '## Branch Conflicts',
     ...summarizeBranchConflicts(result),
   ].join('\n');
+}
+
+function confidenceTitle(confidence) {
+  if (confidence === 'green') return 'Green';
+  if (confidence === 'amber') return 'Amber';
+  return 'Red';
+}
+
+export function formatCiGatePrComment(result) {
+  const confidence = result.merge_confidence || (result.ok ? 'green' : 'red');
+  const check = result.ok ? 'pass' : 'blocked';
+  const issueLines = [];
+  const starPromptLines = ['amber', 'red'].includes(confidence)
+    ? [
+      '',
+      '---',
+      '',
+      '⭐ Switchman caught something useful? Star us on GitHub: https://github.com/switchman-dev/switchman',
+    ]
+    : [];
+
+  if ((result.unclaimed_changes?.length || 0) > 0) {
+    issueLines.push(`- Unclaimed changes: ${result.unclaimed_changes.length}`);
+  }
+  if ((result.file_conflicts?.length || 0) > 0) {
+    issueLines.push(`- File conflicts: ${result.file_conflicts.length}`);
+  }
+  if ((result.ownership_conflicts?.length || 0) > 0) {
+    issueLines.push(`- Ownership conflicts: ${result.ownership_conflicts.length}`);
+  }
+  if ((result.semantic_conflicts?.length || 0) > 0) {
+    issueLines.push(`- Semantic conflicts: ${result.semantic_conflicts.length}`);
+  }
+  if ((result.branch_conflicts?.length || 0) > 0) {
+    issueLines.push(`- Branch conflicts: ${result.branch_conflicts.length}`);
+  }
+  if ((result.boundary_validations?.length || 0) > 0) {
+    issueLines.push(`- Boundary validations: ${result.boundary_validations.length}`);
+  }
+  if ((result.dependency_invalidations?.length || 0) > 0) {
+    issueLines.push(`- Stale dependency invalidations: ${result.dependency_invalidations.length}`);
+  }
+
+  return [
+    '<!-- switchman-ci-gate-comment -->',
+    '# Switchman Merge Confidence',
+    '',
+    `**${confidenceTitle(confidence)}** - ${result.summary}`,
+    '',
+    '| Signal | Value |',
+    '| --- | --- |',
+    `| Merge confidence | ${confidence} |`,
+    `| Gate status | ${check} |`,
+    `| AI gate | ${result.ai_gate_status || 'unknown'} |`,
+    `| Non-compliant worktrees | ${result.compliance?.non_compliant ?? 0} |`,
+    `| Stale worktrees | ${result.compliance?.stale ?? 0} |`,
+    '',
+    '## Review Signals',
+    ...(issueLines.length ? issueLines : ['- No blocking review signals found.']),
+    '',
+    '## Next Step',
+    result.ok
+      ? '- Continue with normal PR review. Switchman found no blocking merge-confidence issues.'
+      : '- Review the flagged worktrees locally with `switchman review --pr-ready --all-worktrees` before merging.',
+    ...starPromptLines,
+  ].join('\n');
+}
+
+export function postGitHubPrComment({
+  repoRoot,
+  prNumber,
+  markdown,
+  ghCommand = 'gh',
+  updateExisting = true,
+}) {
+  if (!prNumber) {
+    throw new Error('A pull request number is required.');
+  }
+
+  const tmpDir = mkdtempSync(join(tmpdir(), 'switchman-pr-comment-'));
+  const bodyPath = join(tmpDir, 'body.md');
+  writeFileSync(bodyPath, `${markdown}\n`, 'utf8');
+
+  try {
+    const args = [
+      'pr',
+      'comment',
+      String(prNumber),
+      '--body-file',
+      bodyPath,
+    ];
+    if (updateExisting) {
+      args.push('--edit-last', '--create-if-none');
+    }
+
+    const result = spawnSync(ghCommand, args, {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    });
+    const ok = !result.error && result.status === 0;
+    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+
+    if (!ok) {
+      throw new Error(result.error?.message || output || `gh pr comment failed with status ${result.status}`);
+    }
+
+    return {
+      pr_number: String(prNumber),
+      updated_existing: updateExisting,
+      output,
+    };
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
 }
 
 function getPipelineLandingCheckInfo(result) {
@@ -110,6 +228,7 @@ export function writeGitHubCiStatus({ result, stepSummaryPath = null, outputPath
   if (outputPath) {
     const lines = [
       `switchman_ok=${result.ok ? 'true' : 'false'}`,
+      `switchman_merge_confidence=${result.merge_confidence || (result.ok ? 'green' : 'red')}`,
       `switchman_summary=${JSON.stringify(result.summary)}`,
       `switchman_non_compliant=${result.compliance?.non_compliant ?? 0}`,
       `switchman_stale=${result.compliance?.stale ?? 0}`,
@@ -266,6 +385,9 @@ jobs:
   switchman-gate:
     name: Switchman Gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -281,7 +403,7 @@ jobs:
       - name: Run Switchman CI gate
         id: switchman_gate
         continue-on-error: true
-        run: switchman gate ci --github
+        run: switchman gate ci --github --github-comment --pr-from-env
 
       - name: Summarize Switchman result
         if: always()

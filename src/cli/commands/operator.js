@@ -1,8 +1,33 @@
-import { writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { dirname, join } from 'path';
+
+function readAgentCompleteConfirmationState(repoRoot) {
+  const path = join(repoRoot, '.switchman', 'agent-complete-confirmations.json');
+  try {
+    if (!existsSync(path)) return { path, clean_confirmations: 0 };
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    return {
+      path,
+      clean_confirmations: Number.isFinite(parsed?.clean_confirmations) ? parsed.clean_confirmations : 0,
+    };
+  } catch {
+    return { path, clean_confirmations: 0 };
+  }
+}
+
+function recordAgentCompleteCleanConfirmation(repoRoot) {
+  const state = readAgentCompleteConfirmationState(repoRoot);
+  const next = {
+    clean_confirmations: state.clean_confirmations + 1,
+    updated_at: new Date().toISOString(),
+  };
+  mkdirSync(dirname(state.path), { recursive: true });
+  writeFileSync(state.path, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  return next.clean_confirmations;
+}
 
 export function registerOperatorCommands(program, deps) {
   const {
-    buildTeamReviewShareReport,
     buildSessionHistoryReport,
     buildInsightsReport,
     buildSessionSummary,
@@ -13,7 +38,6 @@ export function registerOperatorCommands(program, deps) {
     chalk,
     collectStatusSnapshot,
     colorForHealth,
-    createPublicReview,
     formatClockTime,
     getDb,
     getRepo,
@@ -28,9 +52,7 @@ export function registerOperatorCommands(program, deps) {
     printRepairSummary,
     pushSyncEvent,
     pullActiveTeamMembers,
-    pullTeamReviewShares,
     pullTeamState,
-    readCredentials,
     recoverWorkViaCoordination,
     renderChip,
     renderLiveWatchDashboard,
@@ -150,6 +172,37 @@ export function registerOperatorCommands(program, deps) {
     }
 
     return `${lines.filter((line) => line !== null).join('\n')}\n`;
+  }
+
+  function isMissingSwitchmanDbError(err) {
+    return String(err?.message || '').includes('No switchman database found');
+  }
+
+  async function buildReviewReport(repoRoot, opts, reviewHours) {
+    const unmanagedMode = opts.allWorktrees || (opts.from?.length || 0) > 0;
+    if (unmanagedMode) {
+      return buildUnmanagedReview(repoRoot, {
+        refs: opts.from || [],
+        allWorktrees: opts.allWorktrees === true,
+        baseBranch: opts.base || 'main',
+      });
+    }
+
+    try {
+      return await buildSessionSummary(repoRoot, {
+        hours: reviewHours,
+      });
+    } catch (err) {
+      if (!isMissingSwitchmanDbError(err)) throw err;
+      return {
+        ...(await buildUnmanagedReview(repoRoot, {
+          refs: [],
+          allWorktrees: true,
+          baseBranch: opts.base || 'main',
+        })),
+        zero_config: true,
+      };
+    }
   }
 
   const usageCmd = program
@@ -327,6 +380,76 @@ Examples:
     });
 
   program
+    .command('agent-complete')
+    .description('Run Switchman automatically when an agent session finishes')
+    .option('--source <name>', 'Agent or integration source name', 'agent')
+    .option('--json', 'Output raw JSON')
+    .option('--quiet', 'Only print when Switchman finds review issues')
+    .option('--confirm-clean <n>', 'When used with --quiet, print a clean confirmation for the first n clean runs', '0')
+    .action(async (opts) => {
+      const repoRoot = getRepo();
+      const db = getDb(repoRoot);
+      const scanReport = await scanAllWorktrees(db, repoRoot);
+      db.close();
+
+      const hasIssues = scanReport.conflicts.length > 0
+        || scanReport.fileConflicts.length > 0
+        || (scanReport.ownershipConflicts?.length || 0) > 0
+        || (scanReport.semanticConflicts?.length || 0) > 0
+        || scanReport.unclaimedChanges.length > 0;
+      const review = await buildUnmanagedReview(repoRoot, {
+        refs: [],
+        allWorktrees: true,
+        baseBranch: 'main',
+      });
+      const payload = {
+        event: 'agent_complete',
+        source: opts.source,
+        generated_at: new Date().toISOString(),
+        safe_to_proceed: !hasIssues,
+        scan: {
+          summary: scanReport.summary,
+          conflicts: scanReport.conflicts,
+          file_conflicts: scanReport.fileConflicts,
+          ownership_conflicts: scanReport.ownershipConflicts || [],
+          semantic_conflicts: scanReport.semanticConflicts || [],
+          unclaimed_changes: scanReport.unclaimedChanges,
+        },
+        review: {
+          merge_confidence: review.merge_confidence,
+          narrative: review.narrative,
+          safest_next_step: review.safest_next_step,
+          metrics: review.metrics,
+        },
+      };
+
+      if (opts.json) {
+        console.log(JSON.stringify(payload, null, 2));
+        return;
+      }
+
+      if (opts.quiet && !hasIssues) {
+        const confirmLimit = Math.max(0, Number.parseInt(opts.confirmClean, 10) || 0);
+        if (confirmLimit > 0) {
+          const state = readAgentCompleteConfirmationState(repoRoot);
+          if (state.clean_confirmations < confirmLimit) {
+            const count = recordAgentCompleteCleanConfirmation(repoRoot);
+            console.log(chalk.green(`✓ Switchman checked — green (${count}/${confirmLimit})`));
+          }
+        }
+        return;
+      }
+
+      const color = hasIssues ? chalk.yellow : chalk.green;
+      console.log(color(`✓ Switchman reviewed completed ${opts.source} session`));
+      console.log(`  ${chalk.dim(scanReport.summary)}`);
+      console.log(`  ${chalk.dim('merge confidence:')} ${review.merge_confidence}`);
+      if (hasIssues) {
+        console.log(`  ${chalk.yellow('next:')} ${review.safest_next_step || 'Run switchman review --pr-ready --all-worktrees'}`);
+      }
+    });
+
+  program
     .command('review')
     .alias('session-summary')
     .description('Show the full Switchman session review for recent work')
@@ -334,9 +457,6 @@ Examples:
     .option('--history', 'List recent retained sessions instead of only the latest window')
     .option('--days <n>', 'How many recent days of retained history to inspect', '90')
     .option('--search <query>', 'Filter retained sessions by a text query')
-    .option('--share', 'Publish this review to your shared team feed')
-    .option('--public', 'Generate a public read-only review URL anyone can view')
-    .option('--team', 'Show recent teammate reviews shared for this repo')
     .option('--pr-ready', 'Print a PR-ready Markdown merge confidence report')
     .option('--from <refs...>', 'Review existing branches, refs, or worktree names without requiring Switchman-managed tasks')
     .option('--all-worktrees', 'Review all non-main git worktrees without requiring Switchman-managed tasks')
@@ -349,9 +469,6 @@ Examples:
   switchman review --hours 24
   switchman review --history
   switchman review --history --search auth
-  switchman review --share
-  switchman review --public
-  switchman review --team
   switchman review --pr-ready
   switchman review --pr-ready --all-worktrees
   switchman review --pr-ready --from feature-a feature-b
@@ -362,47 +479,6 @@ Examples:
       const repoRoot = getRepo();
       const reviewHours = Math.max(1, Number.parseInt(opts.hours, 10) || 8);
       const reviewDays = Math.max(1, Number.parseInt(opts.days, 10) || 90);
-
-      if (opts.team) {
-        const reviews = buildTeamReviewShareReport(await pullTeamReviewShares({
-          hours: reviewHours,
-          repoRoot,
-        }));
-
-        if (opts.json) {
-          console.log(JSON.stringify({
-            generated_at: new Date().toISOString(),
-            hours: reviewHours,
-            reviews,
-          }, null, 2));
-          return;
-        }
-
-        console.log('');
-        console.log(chalk.bold('Shared team reviews'));
-        console.log(chalk.dim(`Last ${reviewHours} hour(s)`));
-        if (reviews.length === 0) {
-          console.log(chalk.dim('No teammate reviews have been shared for this repo yet.'));
-          console.log(`  ${chalk.cyan('switchman review --share')}`);
-          console.log('');
-          return;
-        }
-
-        for (const review of reviews) {
-          const confidenceColor = review.merge_confidence === 'green'
-            ? chalk.green
-            : review.merge_confidence === 'amber'
-              ? chalk.yellow
-              : review.merge_confidence === 'red'
-                ? chalk.red
-                : chalk.yellow;
-          console.log(`  ${chalk.cyan(review.email)} ${confidenceColor(review.merge_confidence)} ${chalk.dim(review.shared_at || '')}`);
-          console.log(`  ${review.narrative}`);
-          console.log(`  ${chalk.dim(`tasks ${review.metrics.tasks_completed || 0} • retries ${review.metrics.retries_scheduled || 0} • blocked writes ${review.metrics.rogue_writes_blocked || 0}`)}`);
-          console.log('');
-        }
-        return;
-      }
 
       if (opts.history) {
         const report = await buildSessionHistoryReport(repoRoot, {
@@ -443,43 +519,9 @@ Examples:
         return;
       }
 
-      const unmanagedMode = opts.allWorktrees || (opts.from?.length || 0) > 0;
-      const report = unmanagedMode
-        ? await buildUnmanagedReview(repoRoot, {
-          refs: opts.from || [],
-          allWorktrees: opts.allWorktrees === true,
-          baseBranch: opts.base || 'main',
-        })
-        : await buildSessionSummary(repoRoot, {
-          hours: reviewHours,
-        });
-      let shareResult = null;
-      let publicShareResult = null;
-
-      if (opts.share) {
-        shareResult = await pushSyncEvent('session_review_shared', {
-          review: {
-            generated_at: report.generated_at,
-            hours: report.hours,
-            merge_confidence: report.merge_confidence,
-            metrics: report.metrics,
-            narrative: report.narrative,
-          },
-        }, { repoRoot });
-      }
-
-      if (opts.public) {
-        const { default: ora } = await import('ora');
-        const spinner = ora('Generating public review URL...').start();
-        publicShareResult = await createPublicReview(report);
-        spinner.stop();
-      }
-
+      const report = await buildReviewReport(repoRoot, opts, reviewHours);
       if (opts.json) {
-        console.log(JSON.stringify({
-          ...report,
-          shared: opts.share ? shareResult : null,
-        }, null, 2));
+        console.log(JSON.stringify(report, null, 2));
         return;
       }
 
@@ -497,7 +539,9 @@ Examples:
 
       console.log('');
       console.log(chalk.bold('Switchman review'));
-      console.log(chalk.dim(`Last ${report.hours} hour(s)`));
+      console.log(chalk.dim(report.mode === 'unmanaged'
+        ? `${report.evidence_source || 'observed from git'}${report.zero_config ? ' • zero-config mode' : ''}`
+        : `Last ${report.hours} hour(s)`));
       const confidenceColor = report.merge_confidence === 'green'
         ? chalk.green
         : report.merge_confidence === 'amber'
@@ -522,26 +566,16 @@ Examples:
           .join(', ');
         console.log(`  ${chalk.bold('Live semantic scan')} ${report.semantic_conflicts.length} conflict${report.semantic_conflicts.length === 1 ? '' : 's'} (${semanticSummary})`);
       }
-      console.log(`  ${chalk.green('✓')} ${report.metrics.rogue_writes_blocked} rogue write${report.metrics.rogue_writes_blocked === 1 ? '' : 's'} blocked`);
-      console.log(`  ${chalk.green('✓')} ${report.metrics.retries_scheduled} retry / recovery handoff${report.metrics.retries_scheduled === 1 ? '' : 's'} recorded`);
-      console.log(`  ${chalk.green('✓')} ${report.metrics.queue_blocks_avoided} risky landing issue${report.metrics.queue_blocks_avoided === 1 ? '' : 's'} caught`);
-      console.log(`  ${chalk.green('✓')} ${report.metrics.queue_merges_completed} safe merge${report.metrics.queue_merges_completed === 1 ? '' : 's'} completed`);
-      if (opts.share) {
-        console.log('');
-        if (shareResult?.ok) console.log(`${chalk.green('✓')} Shared this review with your team`);
-        else if (shareResult?.queued) console.log(`${chalk.yellow('!')} Review sharing queued locally until sync comes back`);
-        else console.log(`${chalk.yellow('!')} Review sharing did not complete${shareResult?.reason ? ` (${shareResult.reason})` : ''}`);
-      }
-      if (opts.public) {
-        console.log('');
-        if (publicShareResult?.ok) {
-          console.log(`${chalk.green('✓')} Public review URL generated`);
-          console.log(`  ${chalk.cyan(publicShareResult.url)}`);
-          console.log(chalk.dim('  Anyone with this link can view the session summary. No source code is shared.'));
-        } else {
-          console.log(`${chalk.yellow('!')} Could not generate public URL${publicShareResult?.error ? ` (${publicShareResult.error})` : ''}`);
-          console.log(chalk.dim('  Check your connection and try again.'));
-        }
+      if (report.mode === 'unmanaged') {
+        console.log(`  ${chalk.green('✓')} ${report.metrics.sources_reviewed || 0} source${report.metrics.sources_reviewed === 1 ? '' : 's'} reviewed`);
+        console.log(`  ${chalk.green('✓')} ${report.metrics.changed_files || 0} changed file${report.metrics.changed_files === 1 ? '' : 's'} observed`);
+        console.log(`  ${chalk.green('✓')} ${report.metrics.file_overlaps || 0} file overlap${report.metrics.file_overlaps === 1 ? '' : 's'} found`);
+        console.log(`  ${chalk.green('✓')} ${report.metrics.branch_conflicts || 0} branch conflict${report.metrics.branch_conflicts === 1 ? '' : 's'} found`);
+      } else {
+        console.log(`  ${chalk.green('✓')} ${report.metrics.rogue_writes_blocked} rogue write${report.metrics.rogue_writes_blocked === 1 ? '' : 's'} blocked`);
+        console.log(`  ${chalk.green('✓')} ${report.metrics.retries_scheduled} retry / recovery handoff${report.metrics.retries_scheduled === 1 ? '' : 's'} recorded`);
+        console.log(`  ${chalk.green('✓')} ${report.metrics.queue_blocks_avoided} risky landing issue${report.metrics.queue_blocks_avoided === 1 ? '' : 's'} caught`);
+        console.log(`  ${chalk.green('✓')} ${report.metrics.queue_merges_completed} safe merge${report.metrics.queue_merges_completed === 1 ? '' : 's'} completed`);
       }
       if (report.estimated_minutes_saved > 0) {
         console.log('');
@@ -549,8 +583,8 @@ Examples:
       }
       if (report.depth_hint) {
         console.log('');
-        console.log(chalk.yellow(report.depth_hint.title));
-        console.log(`  ${chalk.dim(report.depth_hint.detail)}`);
+        if (report.depth_hint.title) console.log(chalk.yellow(report.depth_hint.title));
+        if (report.depth_hint.detail) console.log(`  ${chalk.dim(report.depth_hint.detail)}`);
         console.log(`  ${chalk.cyan(report.depth_hint.command)}`);
       }
       console.log('');
@@ -718,8 +752,8 @@ Use this first when the repo feels stuck.
           pullActiveTeamMembers(),
           pullTeamState(),
         ]);
-        const myUserId = readCredentials()?.user_id;
-        const otherMembers = teamActivity.filter((e) => e.user_id !== myUserId);
+        const myUserId = null;
+        const otherMembers = teamActivity;
         const teamSummary = summarizeTeamCoordinationState(teamState, myUserId);
         cycles += 1;
 

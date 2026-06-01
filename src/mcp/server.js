@@ -12,6 +12,7 @@
  *   switchman_task_done    — mark a task complete + release file claims
  *   switchman_task_fail    — mark a task failed + release file claims
  *   switchman_lease_heartbeat — refresh a lease heartbeat
+ *   switchman_agent_complete — signal that an agent session ended and run review signals
  *   switchman_scan         — scan all worktrees for conflicts right now
  *   switchman_status       — full system overview (tasks, claims, worktrees)
  */
@@ -935,6 +936,73 @@ Examples:
       return toolOk(JSON.stringify(result, null, 2), result);
     } catch (err) {
       return toolError(`Scan failed: ${err.message}. Ensure switchman is initialised ('switchman init').`);
+    }
+  },
+);
+
+// ── switchman_agent_complete ─────────────────────────────────────────────────
+
+server.registerTool(
+  'switchman_agent_complete',
+  {
+    title: 'Agent Session Complete',
+    description: `Signals that an agent session has ended and immediately runs Switchman's review scan.
+
+Use this as the MCP completion event for agents that can call a final tool before stopping. It returns the same safety signals a human would otherwise have to remember to request manually.
+
+Args:
+  - source (string, optional): Agent or integration name, e.g. "claude-code", "cursor", "codex".
+
+Returns JSON:
+  {
+    "event": "agent_complete",
+    "source": string,
+    "safe_to_proceed": boolean,
+    "summary": string,
+    "file_conflicts": [],
+    "branch_conflicts": [],
+    "unclaimed_changes": []
+  }`,
+    inputSchema: z.object({
+      source: z.string().optional().describe('Agent or integration source name'),
+    }),
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ source }) => {
+    try {
+      const { repoRoot, db } = getContext();
+      const report = await scanAllWorktrees(db, repoRoot);
+      db.close();
+
+      const result = {
+        event: 'agent_complete',
+        source: source || 'mcp',
+        generated_at: new Date().toISOString(),
+        safe_to_proceed: report.conflicts.length === 0
+          && report.fileConflicts.length === 0
+          && (report.ownershipConflicts?.length || 0) === 0
+          && (report.semanticConflicts?.length || 0) === 0
+          && report.unclaimedChanges.length === 0,
+        summary: report.summary,
+        worktrees: report.worktrees.map((wt) => ({
+          name: wt.name,
+          branch: wt.branch ?? 'unknown',
+          changed_files: (report.fileMap?.[wt.name] ?? []).length,
+        })),
+        file_conflicts: report.fileConflicts,
+        ownership_conflicts: report.ownershipConflicts || [],
+        semantic_conflicts: report.semanticConflicts || [],
+        branch_conflicts: report.conflicts,
+        unclaimed_changes: report.unclaimedChanges,
+      };
+      return toolOk(JSON.stringify(result, null, 2), result);
+    } catch (err) {
+      return toolError(`Agent completion review failed: ${err.message}. Ensure switchman is initialised ('switchman init').`);
     }
   },
 );

@@ -7,7 +7,7 @@ export function registerNotificationCommands(program, {
 }) {
   const notificationsCmd = program
     .command('notifications')
-    .description('Configure desktop and Slack notifications for agent progress');
+    .description('Configure desktop notifications for agent progress');
 
   notificationsCmd
     .command('status')
@@ -27,10 +27,6 @@ export function registerNotificationCommands(program, {
       console.log(chalk.bold('Switchman notifications'));
       console.log(`  ${chalk.dim('config:')} ${payload.path}`);
       console.log(`  ${chalk.dim('desktop:')} ${config.desktop_enabled ? chalk.green('enabled') : chalk.dim('disabled')}`);
-      console.log(`  ${chalk.dim('slack:')} ${config.slack_enabled ? chalk.green('enabled') : chalk.dim('disabled')}`);
-      if (config.slack_webhook_url) {
-        console.log(`  ${chalk.dim('webhook:')} ${chalk.dim('configured')}`);
-      }
       console.log('');
     });
 
@@ -41,27 +37,6 @@ export function registerNotificationCommands(program, {
       const enabled = ['on', 'enable', 'enabled', 'true'].includes(String(state).toLowerCase());
       const config = writeNotificationsConfig({ desktop_enabled: enabled });
       console.log(`${chalk.green('✓')} Desktop notifications ${config.desktop_enabled ? 'enabled' : 'disabled'}`);
-    });
-
-  notificationsCmd
-    .command('slack')
-    .description('Configure Slack webhook notifications')
-    .requiredOption('--webhook <url>', 'Incoming Slack webhook URL')
-    .option('--disable', 'Disable Slack notifications after saving the webhook')
-    .action(async (opts) => {
-      const config = writeNotificationsConfig({
-        slack_enabled: !opts.disable,
-        slack_webhook_url: opts.webhook,
-      });
-      console.log(`${chalk.green('✓')} Slack notifications ${config.slack_enabled ? 'enabled' : 'saved but disabled'}`);
-    });
-
-  notificationsCmd
-    .command('disable-slack')
-    .description('Disable Slack notifications while keeping the saved webhook')
-    .action(() => {
-      writeNotificationsConfig({ slack_enabled: false });
-      console.log(`${chalk.green('✓')} Slack notifications disabled`);
     });
 
   notificationsCmd

@@ -42,6 +42,7 @@ import {
   upsertTaskSpec,
   listAuditEvents, pruneDatabaseMaintenance, recordUsageEvent, verifyAuditTrail,
   getLeaseExecutionContext, getActiveLeaseForTask,
+  getWorktreeSnapshotState,
 } from '../core/db.js';
 import { scanAllWorktrees } from '../core/detector.js';
 import { ensureProjectLocalMcpGitExcludes, getWindsurfMcpConfigPath, upsertAllProjectMcpConfigs, upsertWindsurfMcpConfig } from '../core/mcp.js';
@@ -49,7 +50,7 @@ import { evaluateRepoCompliance, gatewayAppendFile, gatewayMakeDirectory, gatewa
 import { runAiMergeGate } from '../core/merge-gate.js';
 import { clearMonitorState, getMonitorStatePath, isProcessRunning, readMonitorState, writeMonitorState } from '../core/monitor.js';
 import { buildPipelinePrSummary, cleanupPipelineLandingRecovery, commentPipelinePr, createPipelineFollowupTasks, evaluatePipelinePolicyGate, executePipeline, exportPipelinePrBundle, getPipelineLandingBranchStatus, getPipelineLandingExplainReport, getPipelineStatus, inferPipelineIdFromBranch, materializePipelineLandingBranch, preparePipelineLandingRecovery, preparePipelineLandingTarget, publishPipelinePr, repairPipelineState, resumePipelineLandingRecovery, runPipeline, startPipeline, summarizePipelinePolicyState, syncPipelinePr } from '../core/pipeline.js';
-import { installGitHubActionsWorkflow, resolveGitHubOutputTargets, writeGitHubCiStatus, writeGitHubPipelineLandingStatus } from '../core/ci.js';
+import { formatCiGatePrComment, installGitHubActionsWorkflow, postGitHubPrComment, resolveGitHubOutputTargets, writeGitHubCiStatus, writeGitHubPipelineLandingStatus } from '../core/ci.js';
 import { buildHomebrewFormula, writeHomebrewFormula } from '../core/homebrew.js';
 import { importCodeObjectsToStore, listCodeObjects, materializeCodeObjects, materializeSemanticIndex, updateCodeObjectSource } from '../core/semantic.js';
 import { buildQueueStatusSummary, evaluateQueueRepoGate, resolveQueueSource, runMergeQueue } from '../core/queue.js';
@@ -82,10 +83,8 @@ import {
   maybePromptForTelemetry,
   sendTelemetryEvent,
 } from '../core/telemetry.js';
-import { checkLicence, readCredentials } from '../core/licence.js';
-import { createPublicReview } from '../core/share.js';
 import { homedir } from 'os';
-import { cleanupOldSyncEvents, pullActiveTeamMembers, pullTeamReviewShares, pullTeamState, pushSyncEvent } from '../core/sync.js';
+import { cleanupOldSyncEvents, pullActiveTeamMembers, pullTeamState, pushSyncEvent } from '../core/sync.js';
 import { registerClaudeCommands } from './commands/claude.js';
 import { registerMcpCommands } from './commands/mcp.js';
 import { registerAuditCommands } from './commands/audit.js';
@@ -1281,9 +1280,9 @@ program
       }
       console.log('');
       console.log(`Next steps:`);
-      console.log(`  ${chalk.cyan('switchman task add "Fix the login bug"')}  — add a task`);
-      console.log(`  ${chalk.cyan('switchman scan')}                         — check for conflicts`);
-      console.log(`  ${chalk.cyan('switchman status')}                       — view full status`);
+      console.log(`  ${chalk.cyan('switchman review --all-worktrees')}       — review existing agent worktrees`);
+      console.log(`  ${chalk.cyan('switchman start "your goal"')}            — enter full coordination mode`);
+      console.log(`  ${chalk.cyan('switchman status')}                       — view full coordination status`);
     } catch (err) {
       spinner.fail(err.message);
       process.exit(1);
@@ -1581,14 +1580,6 @@ Use this right after install when you want one clear next command.
   .action(async (opts) => {
     const repoRoot = getRepo();
     const verification = collectSetupVerification(repoRoot, { homeDir: opts.home || null });
-    const previousHome = process.env.HOME;
-    if (opts.home) process.env.HOME = opts.home;
-    let creds = null;
-    try {
-      creds = readCredentials();
-    } finally {
-      if (opts.home) process.env.HOME = previousHome;
-    }
     const workspaceCount = verification.workspaces.filter((entry) => entry.name !== 'main').length;
     const mcpCheck = verification.checks.find((item) => item.key === 'claude_mcp');
     const cursorCheck = verification.checks.find((item) => item.key === 'cursor_mcp');
@@ -1607,9 +1598,7 @@ Use this right after install when you want one clear next command.
           key: 'account',
           ok: true,
           label: 'Account',
-          detail: creds?.access_token
-            ? 'Optional cloud account is configured'
-            : 'Not required for local start',
+          detail: 'Not required',
         },
         {
           key: 'workspaces',
@@ -1659,7 +1648,7 @@ Use this right after install when you want one clear next command.
     renderQuickcheck(report);
     await maybeCaptureTelemetry('quickcheck_ran', {
       workspace_count: workspaceCount,
-      has_login: Boolean(creds?.access_token),
+      has_login: false,
       pro: false,
     }, { homeDir: opts.home || null });
   });
@@ -1900,7 +1889,6 @@ registerTaskCommands(program, {
   sendSwitchmanNotification,
   retryStaleTasks,
   retryTaskViaCoordination,
-  checkLicence,
   startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
@@ -2468,7 +2456,6 @@ Only use --force for operator-led recovery after checking switchman status or sw
         sendSwitchmanNotification({
           title: 'Agent blocked by a file claim',
           message: `${worktree} could not claim ${conflicts[0].file} because it is already owned by ${conflicts[0].claimedBy.worktree}.`,
-          checkLicence,
         }).catch(() => {});
         process.exitCode = 1;
         return;
@@ -2660,7 +2647,6 @@ registerOperatorCommands(program, {
   chalk,
   collectStatusSnapshot,
   colorForHealth,
-  createPublicReview,
   formatClockTime,
   getDb,
   getRepo,
@@ -2676,9 +2662,7 @@ registerOperatorCommands(program, {
   printRepairSummary,
   pushSyncEvent,
   pullActiveTeamMembers,
-  pullTeamReviewShares,
   pullTeamState,
-  readCredentials,
   recordUsageEvent,
   recoverWorkViaCoordination,
   renderChip,
@@ -2714,10 +2698,13 @@ registerGateCommands(program, {
   installGateHooks,
   installGitHubActionsWorkflow,
   maybeCaptureTelemetry,
+  postGitHubPrComment,
   resolveGitHubOutputTargets,
+  resolvePrNumberFromEnv,
   runAiMergeGate,
   runCommitGate,
   scanAllWorktrees,
+  formatCiGatePrComment,
   writeGitHubCiStatus,
 });
 
@@ -2838,8 +2825,10 @@ registerMonitorCommands(program, {
   readMonitorState,
   renderMonitorEvent,
   resolveMonitoredWorktrees,
+  scanAllWorktrees,
   spawn,
   startBackgroundMonitor,
+  getWorktreeSnapshotState,
 });
 
 registerSchedulerCommands(program, {
@@ -2862,7 +2851,6 @@ registerHomebrewCommands(advancedCmd, {
 
 registerNotificationCommands(program, {
   chalk,
-  checkLicence,
   getNotificationsConfigPath,
   readNotificationsConfig,
   sendSwitchmanNotification,

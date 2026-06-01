@@ -78,7 +78,6 @@ export function registerTaskCommands(program, {
   startTaskLeaseViaCoordination,
   statusBadge,
   taskJsonWithLease,
-  checkLicence,
   recordUsageEvent,
 }) {
   const taskCmd = program.command('task').description('Manage the task list');
@@ -273,7 +272,6 @@ Examples:
         sendSwitchmanNotification({
           title: 'Agent finished a task',
           message: `Task ${taskId} completed successfully.`,
-          checkLicence,
         }).catch(() => {});
       } catch (err) {
         console.error(chalk.red(err.message));
@@ -301,7 +299,6 @@ Examples:
       sendSwitchmanNotification({
         title: 'Agent hit a failed task',
         message: reason ? `Task ${taskId} failed: ${reason}` : `Task ${taskId} failed and needs review.`,
-        checkLicence,
       }).catch(() => {});
     });
 
