@@ -60,7 +60,7 @@
   "scripts": {
     "start": "node src/cli/index.js",
     "mcp": "node src/mcp/server.js",
-    "test": "NODE_NO_WARNINGS=1 node tests/test.js"
+    "test": "NODE_NO_WARNINGS=1 node tests/test.js && node --test tests/board-registry.test.js tests/board-discovery.test.js"
   },
   "engines": {
     "node": ">=22.5.0"

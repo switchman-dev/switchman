@@ -67,6 +67,19 @@ Add CI protection when you want Switchman on every PR:
 switchman gate install-ci
 ```
 
+**Desktop board (optional):** install once, then keep it in the menu bar — it stays hidden until a live file overlap appears:
+
+```bash
+git clone https://github.com/switchman-dev/switchman.git
+cd switchman/desktop && npm install && npm run build
+switchman board install
+
+# Start from any project — lanes auto-register from git worktrees you already use
+switchman board
+```
+
+See [Desktop board](#desktop-board) for details.
+
 ---
 
 ## How it works
@@ -113,6 +126,60 @@ switchman monitor stop
 ```
 
 The `--quiet-ms` flag controls how long worktrees must be idle before a scan fires. The default is 5000ms.
+
+---
+
+## Desktop board
+
+The repo includes a local desktop app in [`desktop/`](desktop/) — a menu-bar companion for parallel agent sessions. It stays **hidden until a live file overlap appears**, then opens the board with agent + file + task context.
+
+Git worktrees you already create are **auto-registered** — no need to route agent launches through Switchman unless you want it to create the worktree for you.
+
+The CLI and desktop share a session registry at `~/.switchman/sessions.json`. Repos you open the board from are remembered in `~/.switchman/board-roots.json`.
+
+<img src="docs/desktop-board.png" width="720" alt="Switchman desktop board catching a live file overlap between two parallel agent lanes">
+
+### One-time install (macOS)
+
+```bash
+cd desktop
+npm install
+npm run build
+switchman board install
+```
+
+### Daily use
+
+```bash
+# From any project repo — launches menu-bar app in the background
+switchman board
+
+# Your existing worktree workflow — lanes appear automatically
+git worktree add ../myapp-feature-auth -b feature/auth
+
+# Optional: let Switchman create the worktree and launch an agent
+switchman board start "refactor cart total" --agent claude-code
+
+switchman board list
+```
+
+### Merge and lifecycle
+
+```bash
+switchman board done <session-id>
+switchman board pause <session-id>
+switchman board merge <session-id>
+switchman board merge <session-id> --force
+```
+
+### Development
+
+```bash
+switchman board --dev    # run from source instead of ~/Applications/Switchman.app
+cd desktop && npm run build
+```
+
+See [desktop/README.md](desktop/README.md) for architecture notes.
 
 ---
 

@@ -85,6 +85,7 @@ import {
 } from '../core/telemetry.js';
 import { homedir } from 'os';
 import { cleanupOldSyncEvents, pullActiveTeamMembers, pullTeamState, pushSyncEvent } from '../core/sync.js';
+import { registerBoardCommands } from './commands/board.js';
 import { registerClaudeCommands } from './commands/claude.js';
 import { registerMcpCommands } from './commands/mcp.js';
 import { registerAuditCommands } from './commands/audit.js';
@@ -2847,6 +2848,11 @@ registerHomebrewCommands(advancedCmd, {
   buildHomebrewFormula,
   chalk,
   writeHomebrewFormula,
+});
+
+registerBoardCommands(program, {
+  chalk,
+  spawn,
 });
 
 registerNotificationCommands(program, {

@@ -2,3 +2,8 @@ node_modules/
 .switchman/switchman.db
 *.log
 .DS_Store
+
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/node_modules/
